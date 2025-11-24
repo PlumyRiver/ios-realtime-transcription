@@ -238,6 +238,9 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
     /// 發送計數器
     private var sendCount = 0
 
+    /// Google Speech API 最大 chunk 大小
+    private let maxChunkSize = 25600
+
     /// 清空並發送緩衝區
     private func flushBuffer() {
         guard !audioBufferCollector.isEmpty else { return }
@@ -249,12 +252,21 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
         }
         audioBufferCollector.removeAll()
 
-        sendCount += 1
-        // 只在第 1 次和每 20 次輸出 log
-        if sendCount == 1 || sendCount % 20 == 0 {
-            print("📤 發送音頻 #\(sendCount): \(combinedData.count) bytes")
+        // 分割成最大 25600 bytes 的 chunks
+        var offset = 0
+        while offset < combinedData.count {
+            let chunkSize = min(maxChunkSize, combinedData.count - offset)
+            let chunk = combinedData.subdata(in: offset..<(offset + chunkSize))
+
+            sendCount += 1
+            // 只在第 1 次和每 20 次輸出 log
+            if sendCount == 1 || sendCount % 20 == 0 {
+                print("📤 發送音頻 #\(sendCount): \(chunk.count) bytes")
+            }
+            audioDataSubject.send(chunk)
+
+            offset += chunkSize
         }
-        audioDataSubject.send(combinedData)
     }
 
     /// 建立 WebM 格式音頻數據
