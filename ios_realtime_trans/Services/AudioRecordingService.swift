@@ -155,8 +155,15 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
     /// 設定音頻 Session
     private func configureAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+
+        // ⭐️ 使用 .voiceChat mode 啟用回音消除
+        // - Echo Cancellation: 消除揚聲器播放的聲音被麥克風收音
+        // - Noise Suppression: 抑制背景噪音
+        // - Automatic Gain Control: 自動調整麥克風增益
+        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
         try session.setActive(true)
+
+        print("🔇 [Audio Session] Echo Cancellation enabled (mode: .voiceChat)")
     }
 
     /// 重設音頻 Session
