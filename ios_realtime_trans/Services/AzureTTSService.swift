@@ -26,21 +26,17 @@ class AzureTTSService {
     // 音頻播放器（使用 AVAudioEngine 來支持音量放大）
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
-    private var mixerNode: AVAudioMixerNode?
+    private var eqNode: AVAudioUnitEQ?
     private var audioFile: AVAudioFile?
 
-    // Audio Session 原始設置（用於恢復）
-    private var savedCategory: AVAudioSession.Category?
-    private var savedMode: AVAudioSession.Mode?
-    private var savedOptions: AVAudioSession.CategoryOptions?
-
-    // ⭐️ 音量增益（可調整）
-    // 1.0 = 正常音量
-    // 2.0 = 2 倍音量
-    // 3.0 = 3 倍音量
-    // 5.0 = 5 倍音量（默認 - 非常大聲）
-    // 建議範圍：1.0 ~ 10.0（太大會失真）
-    var volumeBoost: Float = 5.0
+    // ⭐️ 音量增益（dB）
+    // 0 dB = 正常音量
+    // +6 dB ≈ 2 倍音量
+    // +12 dB ≈ 4 倍音量
+    // +18 dB ≈ 8 倍音量
+    // +24 dB ≈ 16 倍音量（默認 - 非常大聲）
+    // 建議範圍：0 ~ 40 dB
+    var volumeBoostDB: Float = 24.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
@@ -372,23 +368,9 @@ class AzureTTSService {
         return nil
     }
 
-    /// 播放合成的語音（使用 AVAudioEngine 支持音量放大）
+    /// 播放合成的語音（使用 AVAudioUnitEQ 支持音量放大）
     /// - Parameter audioData: 音頻數據（MP3 格式）
     func play(audioData: Data) throws {
-        // ⭐️ 臨時切換到 moviePlayback mode（無 AGC 限制，支持高音量）
-        let session = AVAudioSession.sharedInstance()
-
-        // 保存當前設置，稍後恢復
-        savedCategory = session.category
-        savedMode = session.mode
-        savedOptions = session.categoryOptions
-
-        // 切換到 moviePlayback 模式（關鍵：無 AGC）
-        try? session.setCategory(.playAndRecord, mode: .moviePlayback, options: [.defaultToSpeaker, .allowBluetooth])
-        try? session.setActive(true, options: [])
-        print("🔊 [Audio Session] Switched to moviePlayback mode (no AGC) for TTS")
-        print("   Previous: \(savedMode?.rawValue ?? "unknown"), New: \(session.mode.rawValue)")
-
         // 停止舊的播放
         stop()
 
@@ -406,52 +388,36 @@ class AzureTTSService {
         print("📦 [Azure TTS] Audio file length: \(audioFile.length) frames")
         print("📦 [Azure TTS] Format: \(audioFile.processingFormat)")
 
-        // 3. 創建 AVAudioEngine 和 PlayerNode
+        // 3. 創建 AVAudioEngine、PlayerNode 和 EQ
         audioEngine = AVAudioEngine()
         playerNode = AVAudioPlayerNode()
-        mixerNode = AVAudioMixerNode()
+
+        // ⭐️ 關鍵：創建 AVAudioUnitEQ 用於音量放大
+        eqNode = AVAudioUnitEQ(numberOfBands: 0)  // 0 bands = 只使用 globalGain
 
         guard let audioEngine = audioEngine,
               let playerNode = playerNode,
-              let mixerNode = mixerNode else {
+              let eqNode = eqNode else {
             throw TTSError.serverError("Failed to create audio engine")
         }
 
-        // 4. 連接節點：PlayerNode → MixerNode → MainMixerNode → Output
+        // 4. 連接節點：PlayerNode → EQ → MainMixerNode → Output
         audioEngine.attach(playerNode)
-        audioEngine.attach(mixerNode)
+        audioEngine.attach(eqNode)
 
         let format = audioFile.processingFormat
-        audioEngine.connect(playerNode, to: mixerNode, format: format)
-        audioEngine.connect(mixerNode, to: audioEngine.mainMixerNode, format: format)
+        audioEngine.connect(playerNode, to: eqNode, format: format)
+        audioEngine.connect(eqNode, to: audioEngine.mainMixerNode, format: format)
 
-        // ⭐️ 關鍵：使用 installTap 實時放大音頻
-        let tapFormat = mixerNode.outputFormat(forBus: 0)
-        mixerNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, time in
-            guard let self = self else { return }
-
-            // 實時放大音頻樣本
-            guard let floatChannelData = buffer.floatChannelData else { return }
-            let channelCount = Int(buffer.format.channelCount)
-            let frameLength = Int(buffer.frameLength)
-
-            for channel in 0..<channelCount {
-                let samples = floatChannelData[channel]
-                for frame in 0..<frameLength {
-                    // 放大並限制在 [-1.0, 1.0]
-                    let amplified = samples[frame] * self.volumeBoost
-                    samples[frame] = min(max(amplified, -1.0), 1.0)
-                }
-            }
-        }
-
-        print("🔊 [Audio Engine] Installed tap for real-time amplification (gain: \(volumeBoost)x)")
+        // ⭐️ 設置 EQ 的 globalGain（這個方法在錄音時也有效！）
+        eqNode.globalGain = volumeBoostDB
+        print("🔊 [Audio EQ] Global gain set to \(volumeBoostDB) dB")
 
         // 5. 啟動引擎
         try audioEngine.start()
         print("🎵 [Audio Engine] Started")
 
-        // 6. 直接播放文件（不需要預先讀取到 buffer）
+        // 6. 直接播放文件
         playerNode.scheduleFile(audioFile, at: nil) {
             print("✅ [Azure TTS] Playback completed")
             DispatchQueue.main.async { [weak self] in
@@ -461,18 +427,12 @@ class AzureTTSService {
         playerNode.play()
 
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(audioFile.length) frames, duration: \(String(format: "%.2f", duration))s, volume boost: \(volumeBoost)x)")
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(audioFile.length) frames, duration: \(String(format: "%.2f", duration))s, volume boost: +\(volumeBoostDB) dB)")
     }
 
     /// 清理播放資源
     private func cleanupPlayback() {
         print("🧹 [Azure TTS] Cleaning up playback resources")
-
-        // 移除 tap
-        if let mixer = mixerNode {
-            mixer.removeTap(onBus: 0)
-            print("   🔇 Removed tap")
-        }
 
         if let node = playerNode, node.isPlaying {
             node.stop()
@@ -491,24 +451,9 @@ class AzureTTSService {
         }
 
         playerNode = nil
-        mixerNode = nil
+        eqNode = nil
         audioEngine = nil
         audioFile = nil
-
-        // ⭐️ 恢復原始 Audio Session 設置（重新啟用 echo cancellation）
-        if let category = savedCategory,
-           let mode = savedMode,
-           let options = savedOptions {
-            let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(category, mode: mode, options: options)
-            try? session.setActive(true, options: [])
-            print("   🔄 Restored Audio Session to mode: \(mode.rawValue)")
-
-            // 清空保存的設置
-            savedCategory = nil
-            savedMode = nil
-            savedOptions = nil
-        }
 
         print("✅ [Azure TTS] Cleanup completed")
     }
