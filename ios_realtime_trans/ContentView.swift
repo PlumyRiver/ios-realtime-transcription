@@ -337,15 +337,15 @@ struct ConversationBubbleView: View {
             }
 
             // ⭐️ 監聽播放結束（獨立 Task，不阻塞）
-            Task.detached { [weak self] in
-                guard let self = self else { return }
-
-                while self.ttsService.isPlaying {
+            // Capture ttsService 的引用，避免 struct 的 weak 問題
+            let ttsServiceRef = ttsService
+            Task {
+                while ttsServiceRef.isPlaying {
                     try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
                 }
 
                 await MainActor.run {
-                    self.isPlaying = false
+                    isPlaying = false
                 }
             }
 
