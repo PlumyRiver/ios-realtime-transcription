@@ -20,14 +20,27 @@ struct ContentView: View {
                         LazyVStack(spacing: 12) {
                             // 最終結果（從舊到新，從上到下）
                             ForEach(viewModel.transcripts) { transcript in
-                                ConversationBubbleView(transcript: transcript, targetLang: viewModel.targetLang)
-                                    .id(transcript.id)
+                                ConversationBubbleView(
+                                    transcript: transcript,
+                                    targetLang: viewModel.targetLang,
+                                    onPlayTTS: { text, langCode in
+                                        // ⭐️ 使用統一的 AudioManager 播放（啟用 AEC）
+                                        viewModel.enqueueTTS(text: text, languageCode: langCode)
+                                    }
+                                )
+                                .id(transcript.id)
                             }
 
                             // Interim 結果（最新的，在最下面）
                             if let interim = viewModel.interimTranscript {
-                                ConversationBubbleView(transcript: interim, targetLang: viewModel.targetLang)
-                                    .id("interim")
+                                ConversationBubbleView(
+                                    transcript: interim,
+                                    targetLang: viewModel.targetLang,
+                                    onPlayTTS: { text, langCode in
+                                        viewModel.enqueueTTS(text: text, languageCode: langCode)
+                                    }
+                                )
+                                .id("interim")
                             }
                         }
                         .padding()
@@ -171,9 +184,8 @@ struct ContentView: View {
 struct ConversationBubbleView: View {
     let transcript: TranscriptMessage
     let targetLang: Language
-    @State private var ttsService = AzureTTSService()
-    @State private var isPlaying = false
-    @State private var isSynthesizing = false
+    /// ⭐️ 使用 ViewModel 的統一播放方法（通過 AudioManager，啟用 AEC）
+    var onPlayTTS: ((String, String) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -215,23 +227,17 @@ struct ConversationBubbleView: View {
                 }
 
                 // TTS 播放按鈕（只在 final 結果且有翻譯時顯示）
+                // ⭐️ 使用統一的 AudioManager 播放，確保 AEC 正常工作
                 if transcript.isFinal && transcript.translation != nil {
                     Button {
-                        Task {
-                            // 播放翻譯內容（使用目標語言）
-                            await playTTS(text: transcript.translation!, language: targetLang.rawValue)
-                        }
+                        // 使用 ViewModel 的統一播放方法
+                        let langCode = mapLanguageCode(targetLang.rawValue)
+                        onPlayTTS?(transcript.translation!, langCode)
                     } label: {
-                        if isSynthesizing {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                        } else {
-                            Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                                .font(.title3)
-                                .foregroundStyle(.blue)
-                        }
+                        Image(systemName: "play.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.blue)
                     }
-                    .disabled(isSynthesizing)
                 }
             }
             .padding()
@@ -297,65 +303,6 @@ struct ConversationBubbleView: View {
         return mapping[lang] ?? "zh-TW"
     }
 
-    private func playTTS(text: String, language: String) async {
-        if isPlaying {
-            // 停止播放
-            ttsService.stop()
-            isPlaying = false
-            return
-        }
-
-        // ⭐️ 立即更新 UI 狀態（不阻塞用戶操作）
-        await MainActor.run {
-            isSynthesizing = true
-        }
-
-        do {
-            // 映射語言代碼到 Azure TTS 格式
-            let langCode = mapLanguageCode(language)
-
-            print("🔊 [TTS] 播放翻譯: \(text.prefix(30))... (語言: \(langCode))")
-
-            // ⭐️ 合成語音（在後台執行，不阻塞轉錄）
-            let audioData = try await ttsService.synthesize(
-                text: text,
-                languageCode: langCode,
-                gender: "female",
-                useMultilingual: true
-            )
-
-            // ⭐️ 合成完成，更新 UI 並播放
-            await MainActor.run {
-                isSynthesizing = false
-            }
-
-            // 播放
-            try ttsService.play(audioData: audioData)
-
-            await MainActor.run {
-                isPlaying = true
-            }
-
-            // ⭐️ 監聽播放結束（獨立 Task，不阻塞）
-            // Capture ttsService 的引用，避免 struct 的 weak 問題
-            let ttsServiceRef = ttsService
-            Task {
-                while ttsServiceRef.isPlaying {
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
-                }
-
-                await MainActor.run {
-                    isPlaying = false
-                }
-            }
-
-        } catch {
-            print("❌ TTS Error: \(error.localizedDescription)")
-            await MainActor.run {
-                isSynthesizing = false
-            }
-        }
-    }
 }
 
 // MARK: - Settings View

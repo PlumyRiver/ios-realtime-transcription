@@ -10,21 +10,24 @@
 		526BD19E2ED2D7FD004C76F6 /* ios_realtime_trans.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ios_realtime_trans.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedRootGroup section */
-		526BD1A02ED2D7FD004C76F6 /* ios_realtime_trans */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				526BD1AC2ED2D7FF004C76F6 /* Info.plist */,
-			);
-			path = ios_realtime_trans;
-			sourceTree = "<group>";
-		};
-		526BD1AC2ED2D7FF004C76F6 /* Info.plist */ = {
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		526BD1AC2ED2D7FF004C76F6 /* Exceptions for "ios_realtime_trans" folder in "ios_realtime_trans" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
 			target = 526BD19D2ED2D7FD004C76F6 /* ios_realtime_trans */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		526BD1A02ED2D7FD004C76F6 /* ios_realtime_trans */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				526BD1AC2ED2D7FF004C76F6 /* Exceptions for "ios_realtime_trans" folder in "ios_realtime_trans" target */,
+			);
+			path = ios_realtime_trans;
+			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 

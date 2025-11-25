@@ -25,6 +25,8 @@ protocol AudioRecordingServiceProtocol {
     func requestPermission() async -> Bool
     func startRecording() throws
     func stopRecording()
+    func pauseRecording()
+    func resumeRecording()
 }
 
 /// 音頻錄製服務實作
@@ -148,6 +150,42 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
         print("⏹️ 停止錄音 (總計發送 \(sendCount) 次)")
         sendCount = 0
         recordingState = .idle
+    }
+
+    /// 暫停錄音
+    func pauseRecording() {
+        guard recordingState == .recording else { return }
+
+        // 停止定時器
+        stopBufferTimer()
+
+        // 發送剩餘緩衝區
+        flushBuffer()
+
+        // 暫停音頻引擎
+        audioEngine.pause()
+
+        print("⏸️ 暫停錄音")
+        recordingState = .idle
+    }
+
+    /// 恢復錄音
+    func resumeRecording() {
+        guard recordingState != .recording else { return }
+
+        do {
+            // 恢復音頻引擎
+            try audioEngine.start()
+
+            // 重啟定時器
+            startBufferTimer()
+
+            recordingState = .recording
+            print("▶️ 恢復錄音")
+        } catch {
+            print("❌ 恢復錄音失敗: \(error.localizedDescription)")
+            recordingState = .error(error.localizedDescription)
+        }
     }
 
     /// 切換擴音模式
