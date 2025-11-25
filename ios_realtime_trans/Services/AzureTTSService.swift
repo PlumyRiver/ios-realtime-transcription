@@ -28,6 +28,7 @@ class AzureTTSService {
     private var playerNode: AVAudioPlayerNode?
     private var eqNode: AVAudioUnitEQ?
     private var audioFile: AVAudioFile?
+    private var playbackTimer: Timer?
 
     // ⭐️ 音量增益（dB）
     // 0 dB = 正常音量
@@ -430,30 +431,62 @@ class AzureTTSService {
         audioEngine.mainMixerNode.outputVolume = 1.0
 
         // 5. 啟動引擎
-        try audioEngine.start()
-        print("🎵 [Audio Engine] Started")
+        do {
+            try audioEngine.start()
+            print("🎵 [Audio Engine] Started successfully")
+        } catch {
+            print("❌ [Audio Engine] Failed to start: \(error)")
+            throw error
+        }
 
         // 讀取並驗證設置
         print("✅ [Verification] EQ globalGain = \(eqNode.globalGain) dB")
         print("✅ [Verification] PlayerNode volume = \(playerNode.volume)")
         print("✅ [Verification] MainMixer volume = \(audioEngine.mainMixerNode.outputVolume)")
+        print("✅ [Verification] Engine running: \(audioEngine.isRunning)")
 
         // 6. 直接播放文件
-        playerNode.scheduleFile(audioFile, at: nil) {
-            print("✅ [Azure TTS] Playback completed")
-            DispatchQueue.main.async { [weak self] in
-                self?.cleanupPlayback()
-            }
+        print("📋 [Scheduling] About to schedule file with \(audioFile.length) frames")
+        playerNode.scheduleFile(audioFile, at: nil, completionCallbackType: .dataPlayedBack) { _ in
+            print("✅ [Callback] Schedule completion triggered")
         }
+
+        print("▶️ [Playing] Starting playback...")
         playerNode.play()
 
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
         print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(audioFile.length) frames, duration: \(String(format: "%.2f", duration))s, total boost: +\(volumeBoostDB + band.gain) dB)")
+        print("✅ [Playing] PlayerNode.isPlaying = \(playerNode.isPlaying)")
+
+        // ⭐️ 使用定時器監控播放狀態
+        playbackTimer?.invalidate()
+        playbackTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+            guard let self = self,
+                  let node = self.playerNode else {
+                timer.invalidate()
+                return
+            }
+
+            // 檢查是否還在播放
+            if !node.isPlaying {
+                print("✅ [Timer] Playback finished, cleaning up...")
+                timer.invalidate()
+                DispatchQueue.main.async {
+                    self.cleanupPlayback()
+                }
+            }
+        }
+        print("⏱️ [Timer] Started playback monitor")
     }
 
     /// 清理播放資源
     private func cleanupPlayback() {
         print("🧹 [Azure TTS] Cleaning up playback resources")
+
+        // 停止定時器
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+        print("   ⏱️ Stopped timer")
 
         if let node = playerNode, node.isPlaying {
             node.stop()
