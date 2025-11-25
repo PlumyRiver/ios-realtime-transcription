@@ -237,21 +237,29 @@ class AzureTTSService {
     /// 播放合成的語音
     /// - Parameter audioData: 音頻數據（MP3 格式）
     func play(audioData: Data) throws {
-        // ⭐️ 確保 audio session 允許播放
-        // 在 .voiceChat mode 下仍然需要確保音頻可以播放
+        // ⭐️ 確保 audio session 允許播放並最大化音量
         let session = AVAudioSession.sharedInstance()
         try? session.setActive(true)
 
+        // 創建音頻播放器
         audioPlayer = try AVAudioPlayer(data: audioData)
+
+        // ⭐️ 重要：必須在 prepareToPlay 之前設置音量
+        audioPlayer?.volume = 1.0  // 最大音量
+
+        // 啟用音量增強（如果硬體支援）
+        audioPlayer?.enableRate = true
+        audioPlayer?.rate = 1.0
+
+        // 準備播放
         audioPlayer?.prepareToPlay()
-        audioPlayer?.volume = 1.0  // 確保音量為最大
 
         guard audioPlayer?.play() == true else {
             print("❌ [Azure TTS] Failed to start playback")
             throw TTSError.serverError("Failed to start audio playback")
         }
 
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(audioPlayer?.duration ?? 0)s)")
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(audioPlayer?.duration ?? 0)s, volume: \(audioPlayer?.volume ?? 0))")
     }
 
     /// 停止播放
