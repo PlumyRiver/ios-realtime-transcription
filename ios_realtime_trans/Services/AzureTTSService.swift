@@ -33,10 +33,10 @@ class AzureTTSService {
     // ⭐️ 音量增益（dB）
     // 0 dB = 正常音量
     // +6 dB ≈ 2 倍音量
-    // +12 dB ≈ 4 倍音量（默認 - 配合擴音模式使用）
+    // +12 dB ≈ 4 倍音量
     // +18 dB ≈ 8 倍音量
-    // 建議範圍：0 ~ 20 dB（更高可能失真）
-    var volumeBoostDB: Float = 12.0
+    // +24 dB ≈ 16 倍音量（明顯有感）
+    var volumeBoostDB: Float = 24.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
@@ -418,11 +418,12 @@ class AzureTTSService {
         band.filterType = .parametric
         band.frequency = 1000  // 中頻（人聲範圍）
         band.bandwidth = 2.0
-        band.gain = volumeBoostDB / 2  // band 額外增益
+        band.gain = volumeBoostDB  // ⭐️ 使用完整增益（疊加效果）
         band.bypass = false
 
         print("🔊 [Audio EQ] Global gain: \(volumeBoostDB) dB")
         print("🔊 [Audio EQ] Band 0 gain: \(band.gain) dB at \(band.frequency) Hz")
+        print("🔊 [Audio EQ] Total boost: +\(volumeBoostDB + band.gain) dB (約 \(Int(pow(10.0, (volumeBoostDB + band.gain) / 20.0))) 倍)")
 
         // ⭐️ 同時設置 PlayerNode 音量到最大
         playerNode.volume = 1.0
