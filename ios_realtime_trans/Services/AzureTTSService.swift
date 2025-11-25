@@ -23,8 +23,17 @@ class AzureTTSService {
     private var audioChunks: [Data] = []
     private var isReceiving = false
 
-    // 音頻播放器
-    private var audioPlayer: AVAudioPlayer?
+    // 音頻播放器（使用 AVAudioEngine 來支持音量放大）
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var audioFile: AVAudioFile?
+
+    // ⭐️ 音量增益（可調整）
+    // 1.0 = 正常音量
+    // 2.0 = 2 倍音量
+    // 3.0 = 3 倍音量（默認）
+    // 建議範圍：1.0 ~ 5.0（太大會失真）
+    var volumeBoost: Float = 3.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
@@ -234,43 +243,84 @@ class AzureTTSService {
         }
     }
 
-    /// 播放合成的語音
+    /// 播放合成的語音（使用 AVAudioEngine 支持音量放大）
     /// - Parameter audioData: 音頻數據（MP3 格式）
     func play(audioData: Data) throws {
-        // ⭐️ 確保 audio session 允許播放並最大化音量
+        // ⭐️ 確保 audio session 允許播放
         let session = AVAudioSession.sharedInstance()
         try? session.setActive(true)
 
-        // 創建音頻播放器
-        audioPlayer = try AVAudioPlayer(data: audioData)
+        // 停止舊的播放
+        stop()
 
-        // ⭐️ 重要：必須在 prepareToPlay 之前設置音量
-        audioPlayer?.volume = 1.0  // 最大音量
+        // 1. 將音頻數據寫入臨時文件
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
+        try audioData.write(to: tempURL)
 
-        // 啟用音量增強（如果硬體支援）
-        audioPlayer?.enableRate = true
-        audioPlayer?.rate = 1.0
+        // 2. 創建 AVAudioFile
+        audioFile = try AVAudioFile(forReading: tempURL)
 
-        // 準備播放
-        audioPlayer?.prepareToPlay()
-
-        guard audioPlayer?.play() == true else {
-            print("❌ [Azure TTS] Failed to start playback")
-            throw TTSError.serverError("Failed to start audio playback")
+        guard let audioFile = audioFile else {
+            throw TTSError.serverError("Failed to create audio file")
         }
 
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(audioPlayer?.duration ?? 0)s, volume: \(audioPlayer?.volume ?? 0))")
+        // 3. 創建 AVAudioEngine 和 PlayerNode
+        audioEngine = AVAudioEngine()
+        playerNode = AVAudioPlayerNode()
+
+        guard let audioEngine = audioEngine,
+              let playerNode = playerNode else {
+            throw TTSError.serverError("Failed to create audio engine")
+        }
+
+        // 4. 連接節點
+        audioEngine.attach(playerNode)
+
+        // ⭐️ 關鍵：使用 mixer 來放大音量
+        let mixer = audioEngine.mainMixerNode
+        audioEngine.connect(playerNode, to: mixer, format: audioFile.processingFormat)
+
+        // ⭐️ 設置音量增益（使用可配置的 volumeBoost）
+        mixer.outputVolume = volumeBoost
+
+        // 5. 啟動引擎
+        try audioEngine.start()
+
+        // 6. 播放音頻
+        playerNode.scheduleFile(audioFile, at: nil) {
+            // 播放完成後清理
+            DispatchQueue.main.async { [weak self] in
+                self?.cleanupPlayback()
+            }
+        }
+        playerNode.play()
+
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(audioFile.length / audioFile.processingFormat.sampleRate)s, volume boost: \(volumeBoost)x)")
+    }
+
+    /// 清理播放資源
+    private func cleanupPlayback() {
+        playerNode?.stop()
+        audioEngine?.stop()
+
+        // 刪除臨時文件
+        if let audioFile = audioFile {
+            try? FileManager.default.removeItem(at: audioFile.url)
+        }
+
+        playerNode = nil
+        audioEngine = nil
+        audioFile = nil
     }
 
     /// 停止播放
     func stop() {
-        audioPlayer?.stop()
-        audioPlayer = nil
+        cleanupPlayback()
     }
 
     /// 是否正在播放
     var isPlaying: Bool {
-        audioPlayer?.isPlaying ?? false
+        playerNode?.isPlaying ?? false
     }
 }
 
