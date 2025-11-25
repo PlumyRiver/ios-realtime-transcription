@@ -29,6 +29,11 @@ class AzureTTSService {
     private var mixerNode: AVAudioMixerNode?
     private var audioFile: AVAudioFile?
 
+    // Audio Session 原始設置（用於恢復）
+    private var savedCategory: AVAudioSession.Category?
+    private var savedMode: AVAudioSession.Mode?
+    private var savedOptions: AVAudioSession.CategoryOptions?
+
     // ⭐️ 音量增益（可調整）
     // 1.0 = 正常音量
     // 2.0 = 2 倍音量
@@ -370,10 +375,19 @@ class AzureTTSService {
     /// 播放合成的語音（使用 AVAudioEngine 支持音量放大）
     /// - Parameter audioData: 音頻數據（MP3 格式）
     func play(audioData: Data) throws {
-        // ⭐️ 確保 audio session 允許播放
+        // ⭐️ 臨時切換到 moviePlayback mode（無 AGC 限制，支持高音量）
         let session = AVAudioSession.sharedInstance()
+
+        // 保存當前設置，稍後恢復
+        savedCategory = session.category
+        savedMode = session.mode
+        savedOptions = session.categoryOptions
+
+        // 切換到 moviePlayback 模式（關鍵：無 AGC）
+        try? session.setCategory(.playAndRecord, mode: .moviePlayback, options: [.defaultToSpeaker, .allowBluetooth])
         try? session.setActive(true, options: [])
-        print("🔊 [Audio Session] Activated for TTS playback")
+        print("🔊 [Audio Session] Switched to moviePlayback mode (no AGC) for TTS")
+        print("   Previous: \(savedMode?.rawValue ?? "unknown"), New: \(session.mode.rawValue)")
 
         // 停止舊的播放
         stop()
@@ -480,6 +494,21 @@ class AzureTTSService {
         mixerNode = nil
         audioEngine = nil
         audioFile = nil
+
+        // ⭐️ 恢復原始 Audio Session 設置（重新啟用 echo cancellation）
+        if let category = savedCategory,
+           let mode = savedMode,
+           let options = savedOptions {
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(category, mode: mode, options: options)
+            try? session.setActive(true, options: [])
+            print("   🔄 Restored Audio Session to mode: \(mode.rawValue)")
+
+            // 清空保存的設置
+            savedCategory = nil
+            savedMode = nil
+            savedOptions = nil
+        }
 
         print("✅ [Azure TTS] Cleanup completed")
     }
