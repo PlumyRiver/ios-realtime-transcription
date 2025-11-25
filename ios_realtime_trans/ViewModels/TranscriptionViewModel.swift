@@ -72,8 +72,8 @@ final class TranscriptionViewModel {
         return false
     }
 
-    /// 擴音模式狀態
-    var isSpeakerMode: Bool = false
+    /// 擴音模式狀態（默認開啟，提升 TTS 音量）
+    var isSpeakerMode: Bool = true
 
     // MARK: - Configuration
 
@@ -172,6 +172,13 @@ final class TranscriptionViewModel {
         // 開始錄音
         do {
             try audioRecordingService.startRecording()
+
+            // ⭐️ 自動啟用擴音模式（提升 TTS 音量）
+            if isSpeakerMode {
+                try? audioRecordingService.setSpeakerMode(enabled: true)
+                print("🔊 [Auto] 擴音模式已啟用")
+            }
+
             status = .recording
             startDurationTimer()
         } catch {

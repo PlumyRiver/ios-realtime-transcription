@@ -32,11 +32,10 @@ class AzureTTSService {
     // ⭐️ 音量增益（dB）
     // 0 dB = 正常音量
     // +6 dB ≈ 2 倍音量
-    // +12 dB ≈ 4 倍音量
+    // +12 dB ≈ 4 倍音量（默認 - 配合擴音模式使用）
     // +18 dB ≈ 8 倍音量
-    // +24 dB ≈ 16 倍音量（默認 - 非常大聲）
-    // 建議範圍：0 ~ 40 dB
-    var volumeBoostDB: Float = 24.0
+    // 建議範圍：0 ~ 20 dB（更高可能失真）
+    var volumeBoostDB: Float = 12.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
