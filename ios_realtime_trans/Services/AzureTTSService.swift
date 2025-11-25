@@ -295,7 +295,7 @@ class AzureTTSService {
         }
         playerNode.play()
 
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(audioFile.length / audioFile.processingFormat.sampleRate)s, volume boost: \(volumeBoost)x)")
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(Double(audioFile.length) / audioFile.processingFormat.sampleRate)s, volume boost: \(volumeBoost)x)")
     }
 
     /// 清理播放資源
