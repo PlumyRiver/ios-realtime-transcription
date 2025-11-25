@@ -249,22 +249,122 @@ class AzureTTSService {
     /// - Parameters:
     ///   - buffer: 要放大的音頻 buffer
     ///   - gain: 增益倍數
-    private func amplifyBuffer(_ buffer: AVAudioPCMBuffer, gain: Float) {
-        guard let floatChannelData = buffer.floatChannelData else { return }
-
+    private func amplifyBuffer(_ buffer: AVAudioPCMBuffer, gain: Float) -> AVAudioPCMBuffer? {
         let channelCount = Int(buffer.format.channelCount)
         let frameLength = Int(buffer.frameLength)
+        let format = buffer.format
 
-        // 對每個聲道的每個樣本進行放大
-        for channel in 0..<channelCount {
-            let samples = floatChannelData[channel]
-            for frame in 0..<frameLength {
-                // 放大樣本值並限制在 [-1.0, 1.0] 範圍內防止削波
-                samples[frame] = min(max(samples[frame] * gain, -1.0), 1.0)
+        print("📊 [Buffer Format] Channels: \(channelCount), Frames: \(frameLength)")
+        print("📊 [Buffer Format] Sample rate: \(format.sampleRate)Hz, IsFloat: \(format.commonFormat == .pcmFormatFloat32)")
+        print("📊 [Buffer Format] CommonFormat: \(format.commonFormat.rawValue)")
+
+        // 檢查原始樣本值（前 10 個）
+        if let floatData = buffer.floatChannelData {
+            let samples = floatData[0]
+            var maxSample: Float = 0
+            for i in 0..<min(10, Int(frameLength)) {
+                maxSample = max(maxSample, abs(samples[i]))
+                if i < 3 {
+                    print("📊 [Original Sample \(i)] \(samples[i])")
+                }
             }
+            print("📊 [Original Max] \(maxSample)")
+        } else if let int16Data = buffer.int16ChannelData {
+            let samples = int16Data[0]
+            var maxSample: Int16 = 0
+            for i in 0..<min(10, Int(frameLength)) {
+                maxSample = max(maxSample, abs(samples[i]))
+                if i < 3 {
+                    print("📊 [Original Sample \(i)] \(samples[i])")
+                }
+            }
+            print("📊 [Original Max] \(maxSample)")
+        } else {
+            print("❌ [Buffer Amplify] FAILED - No accessible channel data!")
+            return nil
         }
 
-        print("🔊 [Buffer Amplify] Amplified \(frameLength) frames × \(channelCount) channels with gain \(gain)x")
+        // 嘗試 Float 格式放大
+        if let floatChannelData = buffer.floatChannelData {
+            print("✅ [Buffer Amplify] Using FLOAT format")
+
+            for channel in 0..<channelCount {
+                let samples = floatChannelData[channel]
+                for frame in 0..<frameLength {
+                    let original = samples[frame]
+                    let amplified = original * gain
+                    // 硬限制防止削波
+                    samples[frame] = min(max(amplified, -1.0), 1.0)
+                }
+            }
+
+            // 檢查放大後的樣本值
+            let samples = floatChannelData[0]
+            var maxAmplified: Float = 0
+            for i in 0..<min(10, Int(frameLength)) {
+                maxAmplified = max(maxAmplified, abs(samples[i]))
+                if i < 3 {
+                    print("📊 [Amplified Sample \(i)] \(samples[i])")
+                }
+            }
+            print("📊 [Amplified Max] \(maxAmplified)")
+            print("🔊 [Buffer Amplify] Successfully amplified \(frameLength) frames × \(channelCount) channels with gain \(gain)x")
+
+            return buffer
+        }
+
+        // 嘗試 Int16 格式放大（需要轉換）
+        if let int16ChannelData = buffer.int16ChannelData {
+            print("⚠️ [Buffer Amplify] Using INT16 format - need conversion")
+
+            // 創建 Float 格式的 buffer
+            let floatFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                           sampleRate: format.sampleRate,
+                                           channels: format.channelCount,
+                                           interleaved: false)!
+
+            guard let floatBuffer = AVAudioPCMBuffer(pcmFormat: floatFormat, frameCapacity: buffer.frameCapacity) else {
+                print("❌ [Buffer Amplify] Failed to create float buffer")
+                return nil
+            }
+
+            floatBuffer.frameLength = buffer.frameLength
+
+            // 轉換 Int16 → Float 並放大
+            guard let floatData = floatBuffer.floatChannelData else {
+                print("❌ [Buffer Amplify] No float channel data in new buffer")
+                return nil
+            }
+
+            for channel in 0..<channelCount {
+                let int16Samples = int16ChannelData[channel]
+                let floatSamples = floatData[channel]
+
+                for frame in 0..<frameLength {
+                    // Int16 → Float: 除以 32768.0
+                    let floatValue = Float(int16Samples[frame]) / 32768.0
+                    // 放大並限制
+                    floatSamples[frame] = min(max(floatValue * gain, -1.0), 1.0)
+                }
+            }
+
+            // 檢查放大後的樣本值
+            let samples = floatData[0]
+            var maxAmplified: Float = 0
+            for i in 0..<min(10, Int(frameLength)) {
+                maxAmplified = max(maxAmplified, abs(samples[i]))
+                if i < 3 {
+                    print("📊 [Amplified Sample \(i)] \(samples[i])")
+                }
+            }
+            print("📊 [Amplified Max] \(maxAmplified)")
+            print("🔊 [Buffer Amplify] Converted and amplified \(frameLength) frames × \(channelCount) channels with gain \(gain)x")
+
+            return floatBuffer
+        }
+
+        print("❌ [Buffer Amplify] Unsupported buffer format!")
+        return nil
     }
 
     /// 播放合成的語音（使用 AVAudioEngine 支持音量放大）
@@ -299,7 +399,9 @@ class AzureTTSService {
         print("📦 [Azure TTS] Loaded audio buffer: \(buffer.frameLength) frames")
 
         // ⭐️ 關鍵：直接放大 buffer 的樣本值（最可靠的方法）
-        amplifyBuffer(buffer, gain: volumeBoost)
+        guard let amplifiedBuffer = amplifyBuffer(buffer, gain: volumeBoost) else {
+            throw TTSError.serverError("Failed to amplify buffer")
+        }
 
         // 4. 創建 AVAudioEngine 和 PlayerNode
         audioEngine = AVAudioEngine()
@@ -316,9 +418,10 @@ class AzureTTSService {
         audioEngine.attach(playerNode)
         audioEngine.attach(mixerNode)
 
-        let format = audioFile.processingFormat
-        audioEngine.connect(playerNode, to: mixerNode, format: format)
-        audioEngine.connect(mixerNode, to: audioEngine.mainMixerNode, format: format)
+        // ⚠️ 使用放大後的 buffer 的格式（可能已轉換）
+        let playbackFormat = amplifiedBuffer.format
+        audioEngine.connect(playerNode, to: mixerNode, format: playbackFormat)
+        audioEngine.connect(mixerNode, to: audioEngine.mainMixerNode, format: playbackFormat)
 
         // ⭐️ 多層音量增益（保險起見）
         playerNode.volume = 1.0  // PlayerNode 保持正常
@@ -330,7 +433,7 @@ class AzureTTSService {
         print("🎵 [Audio Engine] Started")
 
         // 7. 播放音頻（使用放大後的 buffer）
-        playerNode.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { callbackType in
+        playerNode.scheduleBuffer(amplifiedBuffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { callbackType in
             // 播放完成後清理
             print("✅ [Azure TTS] Playback completed (type: \(callbackType.rawValue))")
             DispatchQueue.main.async { [weak self] in
@@ -340,7 +443,7 @@ class AzureTTSService {
         playerNode.play()
 
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(buffer.frameLength) frames, duration: \(String(format: "%.2f", duration))s, volume boost: \(volumeBoost)x)")
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(amplifiedBuffer.frameLength) frames, duration: \(String(format: "%.2f", duration))s, volume boost: \(volumeBoost)x)")
     }
 
     /// 清理播放資源
