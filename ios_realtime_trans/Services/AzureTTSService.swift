@@ -392,8 +392,8 @@ class AzureTTSService {
         audioEngine = AVAudioEngine()
         playerNode = AVAudioPlayerNode()
 
-        // ⭐️ 關鍵：創建 AVAudioUnitEQ 用於音量放大
-        eqNode = AVAudioUnitEQ(numberOfBands: 0)  // 0 bands = 只使用 globalGain
+        // ⭐️ 關鍵：創建 AVAudioUnitEQ 用於音量放大（至少需要 1 個 band）
+        eqNode = AVAudioUnitEQ(numberOfBands: 1)
 
         guard let audioEngine = audioEngine,
               let playerNode = playerNode,
@@ -409,13 +409,35 @@ class AzureTTSService {
         audioEngine.connect(playerNode, to: eqNode, format: format)
         audioEngine.connect(eqNode, to: audioEngine.mainMixerNode, format: format)
 
-        // ⭐️ 設置 EQ 的 globalGain（這個方法在錄音時也有效！）
+        // ⭐️ 設置 EQ 參數
+        // globalGain 放大整體音量
         eqNode.globalGain = volumeBoostDB
-        print("🔊 [Audio EQ] Global gain set to \(volumeBoostDB) dB")
+
+        // 設置第一個 band 為 peak filter 並放大
+        let band = eqNode.bands[0]
+        band.filterType = .parametric
+        band.frequency = 1000  // 中頻（人聲範圍）
+        band.bandwidth = 2.0
+        band.gain = volumeBoostDB / 2  // band 額外增益
+        band.bypass = false
+
+        print("🔊 [Audio EQ] Global gain: \(volumeBoostDB) dB")
+        print("🔊 [Audio EQ] Band 0 gain: \(band.gain) dB at \(band.frequency) Hz")
+
+        // ⭐️ 同時設置 PlayerNode 音量到最大
+        playerNode.volume = 1.0
+
+        // ⭐️ MainMixer 也設置到最大
+        audioEngine.mainMixerNode.outputVolume = 1.0
 
         // 5. 啟動引擎
         try audioEngine.start()
         print("🎵 [Audio Engine] Started")
+
+        // 讀取並驗證設置
+        print("✅ [Verification] EQ globalGain = \(eqNode.globalGain) dB")
+        print("✅ [Verification] PlayerNode volume = \(playerNode.volume)")
+        print("✅ [Verification] MainMixer volume = \(audioEngine.mainMixerNode.outputVolume)")
 
         // 6. 直接播放文件
         playerNode.scheduleFile(audioFile, at: nil) {
@@ -427,7 +449,7 @@ class AzureTTSService {
         playerNode.play()
 
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(audioFile.length) frames, duration: \(String(format: "%.2f", duration))s, volume boost: +\(volumeBoostDB) dB)")
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(audioFile.length) frames, duration: \(String(format: "%.2f", duration))s, total boost: +\(volumeBoostDB + band.gain) dB)")
     }
 
     /// 清理播放資源
