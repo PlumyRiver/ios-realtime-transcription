@@ -46,6 +46,26 @@ enum Language: String, CaseIterable, Identifiable {
         case .vi: return "🇻🇳 越南文"
         }
     }
+
+    var flag: String {
+        switch self {
+        case .auto: return "🌐"
+        case .zh: return "🇹🇼"
+        case .en: return "🇺🇸"
+        case .ja: return "🇯🇵"
+        case .ko: return "🇰🇷"
+        case .es: return "🇪🇸"
+        case .fr: return "🇫🇷"
+        case .de: return "🇩🇪"
+        case .it: return "🇮🇹"
+        case .pt: return "🇵🇹"
+        case .ru: return "🇷🇺"
+        case .ar: return "🇸🇦"
+        case .hi: return "🇮🇳"
+        case .th: return "🇹🇭"
+        case .vi: return "🇻🇳"
+        }
+    }
 }
 
 /// 轉錄訊息

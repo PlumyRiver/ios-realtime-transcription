@@ -248,7 +248,8 @@ class AzureTTSService {
     func play(audioData: Data) throws {
         // ⭐️ 確保 audio session 允許播放
         let session = AVAudioSession.sharedInstance()
-        try? session.setActive(true)
+        try? session.setActive(true, options: [])
+        print("🔊 [Audio Session] Activated for TTS playback")
 
         // 停止舊的播放
         stop()
@@ -264,7 +265,16 @@ class AzureTTSService {
             throw TTSError.serverError("Failed to create audio file")
         }
 
-        // 3. 創建 AVAudioEngine 和 PlayerNode
+        // 3. 讀取整個音頻到 buffer（避免播放中斷）
+        let frameCount = AVAudioFrameCount(audioFile.length)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
+            throw TTSError.serverError("Failed to create audio buffer")
+        }
+
+        try audioFile.read(into: buffer, frameCount: frameCount)
+        print("📦 [Azure TTS] Loaded audio buffer: \(buffer.frameLength) frames")
+
+        // 4. 創建 AVAudioEngine 和 PlayerNode
         audioEngine = AVAudioEngine()
         playerNode = AVAudioPlayerNode()
 
@@ -273,7 +283,7 @@ class AzureTTSService {
             throw TTSError.serverError("Failed to create audio engine")
         }
 
-        // 4. 連接節點
+        // 5. 連接節點
         audioEngine.attach(playerNode)
 
         // ⭐️ 關鍵：使用 mixer 來放大音量
@@ -283,38 +293,54 @@ class AzureTTSService {
         // ⭐️ 設置音量增益（使用可配置的 volumeBoost）
         mixer.outputVolume = volumeBoost
 
-        // 5. 啟動引擎
+        // 6. 啟動引擎
         try audioEngine.start()
+        print("🎵 [Audio Engine] Started")
 
-        // 6. 播放音頻
-        playerNode.scheduleFile(audioFile, at: nil) {
+        // 7. 播放音頻（使用 buffer 而不是 file）
+        playerNode.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { callbackType in
             // 播放完成後清理
+            print("✅ [Azure TTS] Playback completed (type: \(callbackType.rawValue))")
             DispatchQueue.main.async { [weak self] in
                 self?.cleanupPlayback()
             }
         }
         playerNode.play()
 
-        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, duration: \(Double(audioFile.length) / audioFile.processingFormat.sampleRate)s, volume boost: \(volumeBoost)x)")
+        let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
+        print("▶️ [Azure TTS] Playing audio (\(audioData.count) bytes, \(buffer.frameLength) frames, duration: \(String(format: "%.2f", duration))s, volume boost: \(volumeBoost)x)")
     }
 
     /// 清理播放資源
     private func cleanupPlayback() {
-        playerNode?.stop()
-        audioEngine?.stop()
+        print("🧹 [Azure TTS] Cleaning up playback resources")
+
+        if let node = playerNode, node.isPlaying {
+            node.stop()
+            print("   ⏹️ Stopped player node")
+        }
+
+        if let engine = audioEngine, engine.isRunning {
+            engine.stop()
+            print("   ⏹️ Stopped audio engine")
+        }
 
         // 刪除臨時文件
         if let audioFile = audioFile {
             try? FileManager.default.removeItem(at: audioFile.url)
+            print("   🗑️ Removed temp file")
         }
 
         playerNode = nil
         audioEngine = nil
         audioFile = nil
+
+        print("✅ [Azure TTS] Cleanup completed")
     }
 
     /// 停止播放
     func stop() {
+        print("⏹️ [Azure TTS] Stop requested")
         cleanupPlayback()
     }
 
