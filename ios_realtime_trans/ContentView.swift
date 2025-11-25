@@ -13,110 +13,133 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    // 統計卡片
-                    StatsView(
-                        transcriptCount: viewModel.transcriptCount,
-                        wordCount: viewModel.wordCount,
-                        recordingDuration: viewModel.recordingDuration
-                    )
-
-                    // 控制區塊
-                    VStack(spacing: 16) {
-                        // 語言選擇
-                        LanguageSelectorView(
-                            sourceLang: $viewModel.sourceLang,
-                            targetLang: $viewModel.targetLang,
-                            isDisabled: viewModel.isRecording
-                        )
-
-                        // 錄音按鈕和清除按鈕
-                        HStack(spacing: 16) {
-                            RecordButtonView(
-                                isRecording: viewModel.isRecording
-                            ) {
-                                Task {
-                                    await viewModel.toggleRecording()
-                                }
+            VStack(spacing: 0) {
+                // 對話區域
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            // 最終結果（從舊到新，從上到下）
+                            ForEach(viewModel.transcripts) { transcript in
+                                ConversationBubbleView(transcript: transcript, targetLang: viewModel.targetLang)
+                                    .id(transcript.id)
                             }
 
-                            Button {
-                                viewModel.clearTranscripts()
+                            // Interim 結果（最新的，在最下面）
+                            if let interim = viewModel.interimTranscript {
+                                ConversationBubbleView(transcript: interim, targetLang: viewModel.targetLang)
+                                    .id("interim")
+                            }
+                        }
+                        .padding()
+                    }
+                    .onChange(of: viewModel.transcripts.count) { _, _ in
+                        // 自動滾動到最新訊息
+                        if let lastId = viewModel.transcripts.last?.id {
+                            withAnimation {
+                                proxy.scrollTo(lastId, anchor: .bottom)
+                            }
+                        }
+                    }
+                    .onChange(of: viewModel.interimTranscript) { _, _ in
+                        // 滾動到 interim
+                        withAnimation {
+                            proxy.scrollTo("interim", anchor: .bottom)
+                        }
+                    }
+                }
+
+                // 底部控制列
+                VStack(spacing: 0) {
+                    Divider()
+
+                    HStack(spacing: 16) {
+                        // 語言選擇（精簡版）
+                        HStack(spacing: 8) {
+                            Menu {
+                                ForEach(Language.allCases, id: \.self) { lang in
+                                    Button(lang.displayName) {
+                                        viewModel.sourceLang = lang
+                                    }
+                                }
                             } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "trash")
-                                    Text("清除")
+                                HStack(spacing: 4) {
+                                    Text(viewModel.sourceLang.flag)
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption2)
                                 }
                                 .foregroundStyle(.secondary)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 14)
-                                .background(Color(.systemGray6))
-                                .cornerRadius(10)
                             }
-                            .disabled(viewModel.isRecording || viewModel.transcripts.isEmpty)
-                        }
+                            .disabled(viewModel.isRecording)
 
-                        // 狀態欄
-                        StatusBarView(status: viewModel.status)
+                            Image(systemName: "arrow.right")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+
+                            Menu {
+                                ForEach(Language.allCases, id: \.self) { lang in
+                                    Button(lang.displayName) {
+                                        viewModel.targetLang = lang
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(viewModel.targetLang.flag)
+                                    Image(systemName: "chevron.down")
+                                        .font(.caption2)
+                                }
+                                .foregroundStyle(.secondary)
+                            }
+                            .disabled(viewModel.isRecording)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color(.systemGray6))
+                        .cornerRadius(20)
+
+                        Spacer()
+
+                        // 擴音按鈕
+                        Button {
+                            viewModel.toggleSpeakerMode()
+                        } label: {
+                            VStack(spacing: 4) {
+                                Image(systemName: viewModel.isSpeakerMode ? "speaker.wave.3.fill" : "speaker.wave.2")
+                                    .font(.system(size: 20))
+                                Text("擴音")
+                                    .font(.caption2)
+                            }
+                            .foregroundStyle(viewModel.isSpeakerMode ? Color.blue : Color.secondary)
+                            .frame(width: 60, height: 60)
+                            .background(viewModel.isSpeakerMode ? Color.blue.opacity(0.1) : Color(.systemGray6))
+                            .cornerRadius(12)
+                        }
+                        .disabled(!viewModel.isRecording)
+                        .opacity(viewModel.isRecording ? 1.0 : 0.5)
+
+                        // 通話按鈕
+                        Button {
+                            Task {
+                                await viewModel.toggleRecording()
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: viewModel.isRecording ? "phone.down.fill" : "phone.fill")
+                                Text(viewModel.isRecording ? "結束通話" : "開始通話")
+                                    .fontWeight(.semibold)
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 14)
+                            .background(viewModel.isRecording ? Color.red : Color.blue)
+                            .cornerRadius(25)
+                        }
                     }
                     .padding()
                     .background(Color(.systemBackground))
-                    .cornerRadius(20)
-                    .shadow(color: .black.opacity(0.1), radius: 10, x: 0, y: 5)
-
-                    // 轉錄結果區塊
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            Text("轉錄結果")
-                                .font(.headline)
-
-                            Spacer()
-
-                            if !viewModel.transcripts.isEmpty {
-                                Text("\(viewModel.transcripts.count) 條記錄")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-
-                        if viewModel.transcripts.isEmpty && viewModel.interimTranscript == nil {
-                            // 空狀態
-                            EmptyTranscriptView()
-                        } else {
-                            // 轉錄列表
-                            LazyVStack(spacing: 12) {
-                                // Interim 結果（正在識別中）
-                                if let interim = viewModel.interimTranscript {
-                                    TranscriptItemView(transcript: interim)
-                                        .transition(.opacity.combined(with: .move(edge: .top)))
-                                }
-
-                                // 最終結果
-                                ForEach(viewModel.transcripts) { transcript in
-                                    TranscriptItemView(transcript: transcript)
-                                        .transition(.opacity.combined(with: .move(edge: .top)))
-                                }
-                            }
-                            .animation(.easeInOut(duration: 0.3), value: viewModel.transcripts.count)
-                        }
-                    }
-                    .padding()
-                    .background(Color(.systemBackground))
-                    .cornerRadius(20)
-                    .shadow(color: .black.opacity(0.1), radius: 10, x: 0, y: 5)
                 }
-                .padding()
             }
-            .background(
-                LinearGradient(
-                    colors: [Color.purple.opacity(0.6), Color.indigo.opacity(0.8)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
-            )
-            .navigationTitle("Chirp3 語音轉錄")
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("即時翻譯")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -126,35 +149,197 @@ struct ContentView: View {
                         Image(systemName: "gearshape")
                     }
                 }
+
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        viewModel.clearTranscripts()
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(viewModel.isRecording || viewModel.transcripts.isEmpty)
+                }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(serverURL: $viewModel.serverURL)
             }
         }
-        .preferredColorScheme(.light)
     }
 }
 
-// MARK: - Empty State View
+// MARK: - Conversation Bubble View
 
-struct EmptyTranscriptView: View {
+struct ConversationBubbleView: View {
+    let transcript: TranscriptMessage
+    let targetLang: Language
+    @State private var ttsService = AzureTTSService()
+    @State private var isPlaying = false
+    @State private var isSynthesizing = false
+
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "waveform")
-                .font(.system(size: 60))
-                .foregroundStyle(.tertiary)
+        VStack(alignment: .leading, spacing: 0) {
+            // 轉錄文字區域
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(transcript.text)
+                        .font(.body)
+                        .foregroundStyle(transcript.isFinal ? .primary : .secondary)
 
-            Text("尚無轉錄結果")
-                .font(.headline)
-                .foregroundStyle(.secondary)
+                    // 元數據行
+                    HStack(spacing: 8) {
+                        if let language = transcript.language {
+                            Text(languageDisplayName(language))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
 
-            Text("開始錄音後，轉錄文字將顯示在這裡")
-                .font(.subheadline)
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
+                        if transcript.isFinal && transcript.confidence > 0 {
+                            Text("\(Int(transcript.confidence * 100))%")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        if !transcript.isFinal {
+                            HStack(spacing: 2) {
+                                Circle()
+                                    .fill(Color.secondary)
+                                    .frame(width: 3, height: 3)
+                                Circle()
+                                    .fill(Color.secondary)
+                                    .frame(width: 3, height: 3)
+                                Circle()
+                                    .fill(Color.secondary)
+                                    .frame(width: 3, height: 3)
+                            }
+                        }
+                    }
+                }
+
+                // TTS 播放按鈕（只在 final 結果且有翻譯時顯示）
+                if transcript.isFinal && transcript.translation != nil {
+                    Button {
+                        Task {
+                            // 播放翻譯內容（使用目標語言）
+                            await playTTS(text: transcript.translation!, language: targetLang.rawValue)
+                        }
+                    } label: {
+                        if isSynthesizing {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Image(systemName: isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                .font(.title3)
+                                .foregroundStyle(.blue)
+                        }
+                    }
+                    .disabled(isSynthesizing)
+                }
+            }
+            .padding()
+
+            // 分隔線（只在有翻譯時顯示）
+            if let translation = transcript.translation {
+                Divider()
+                    .padding(.horizontal)
+
+                // 翻譯文字區域
+                Text(translation)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .padding()
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 60)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.systemBackground))
+        .cornerRadius(16)
+        .shadow(color: .black.opacity(0.05), radius: 2, x: 0, y: 1)
+        .opacity(transcript.isFinal ? 1.0 : 0.7)
+    }
+
+    private func languageDisplayName(_ code: String) -> String {
+        let base = code.split(separator: "-").first.map(String.init) ?? code
+        let names: [String: String] = [
+            "zh": "中文",
+            "en": "English",
+            "ja": "日本語",
+            "ko": "한국어",
+            "es": "Español",
+            "fr": "Français",
+            "de": "Deutsch",
+            "it": "Italiano",
+            "pt": "Português",
+            "ru": "Русский",
+            "ar": "العربية",
+            "hi": "हिन्दी",
+            "th": "ไทย",
+            "vi": "Tiếng Việt"
+        ]
+        return names[base] ?? code
+    }
+
+    private func mapLanguageCode(_ lang: String) -> String {
+        // 映射簡單語言代碼到 Azure TTS 完整格式
+        let mapping: [String: String] = [
+            "zh": "zh-TW",
+            "en": "en-US",
+            "ja": "ja-JP",
+            "ko": "ko-KR",
+            "es": "es-ES",
+            "fr": "fr-FR",
+            "de": "de-DE",
+            "it": "it-IT",
+            "pt": "pt-BR",
+            "ru": "ru-RU",
+            "ar": "ar-SA",
+            "hi": "hi-IN",
+            "th": "th-TH",
+            "vi": "vi-VN"
+        ]
+        return mapping[lang] ?? "zh-TW"
+    }
+
+    private func playTTS(text: String, language: String) async {
+        if isPlaying {
+            // 停止播放
+            ttsService.stop()
+            isPlaying = false
+            return
+        }
+
+        isSynthesizing = true
+
+        do {
+            // 映射語言代碼到 Azure TTS 格式
+            let langCode = mapLanguageCode(language)
+
+            print("🔊 [TTS] 播放翻譯: \(text.prefix(30))... (語言: \(langCode))")
+
+            // 合成語音
+            let audioData = try await ttsService.synthesize(
+                text: text,
+                languageCode: langCode,
+                gender: "female",
+                useMultilingual: true
+            )
+
+            // 播放
+            try ttsService.play(audioData: audioData)
+            isPlaying = true
+
+            // 監聽播放結束
+            Task {
+                while ttsService.isPlaying {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
+                }
+                await MainActor.run {
+                    isPlaying = false
+                }
+            }
+
+        } catch {
+            print("❌ TTS Error: \(error.localizedDescription)")
+        }
+
+        isSynthesizing = false
     }
 }
 
@@ -172,7 +357,7 @@ struct SettingsView: View {
                         .textContentType(.URL)
                         .autocapitalization(.none)
 
-                    Text("例如：192.168.1.100:3008 或 your-server.com:3008")
+                    Text("例如：your-server.run.app")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

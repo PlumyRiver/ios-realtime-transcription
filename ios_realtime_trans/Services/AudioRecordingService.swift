@@ -150,6 +150,22 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
         recordingState = .idle
     }
 
+    /// 切換擴音模式
+    /// - Parameter enabled: true = 揚聲器（擴音），false = 聽筒
+    func setSpeakerMode(enabled: Bool) throws {
+        let session = AVAudioSession.sharedInstance()
+
+        if enabled {
+            // 切換到揚聲器（擴音）
+            try session.overrideOutputAudioPort(.speaker)
+            print("📢 [Audio Session] 擴音模式：揚聲器")
+        } else {
+            // 切換回聽筒
+            try session.overrideOutputAudioPort(.none)
+            print("📱 [Audio Session] 聽筒模式")
+        }
+    }
+
     // MARK: - Private Methods
 
     /// 設定音頻 Session

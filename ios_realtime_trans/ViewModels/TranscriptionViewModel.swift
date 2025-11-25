@@ -72,6 +72,9 @@ final class TranscriptionViewModel {
         return false
     }
 
+    /// 擴音模式狀態
+    var isSpeakerMode: Bool = false
+
     // MARK: - Configuration
 
     /// 伺服器 URL（Cloud Run 部署的服務）
@@ -189,6 +192,19 @@ final class TranscriptionViewModel {
         interimTranscript = nil
     }
 
+    /// 切換擴音模式
+    func toggleSpeakerMode() {
+        isSpeakerMode.toggle()
+        do {
+            try audioRecordingService.setSpeakerMode(enabled: isSpeakerMode)
+            print("🔊 [ViewModel] 擴音模式: \(isSpeakerMode ? "開啟" : "關閉")")
+        } catch {
+            print("❌ [ViewModel] 切換擴音失敗: \(error)")
+            // 回滾狀態
+            isSpeakerMode.toggle()
+        }
+    }
+
     /// 設定 Combine 訂閱
     private func setupSubscriptions() {
         // 訂閱音頻數據
@@ -227,8 +243,8 @@ final class TranscriptionViewModel {
     /// 處理轉錄結果
     private func handleTranscript(_ transcript: TranscriptMessage) {
         if transcript.isFinal {
-            // 最終結果：添加到列表
-            transcripts.insert(transcript, at: 0)
+            // 最終結果：添加到列表末尾（最新的在下面）
+            transcripts.append(transcript)
             interimTranscript = nil
             updateStats()
         } else {
