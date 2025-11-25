@@ -373,6 +373,13 @@ class AzureTTSService {
         // 停止舊的播放
         stop()
 
+        // ⭐️ 檢查 Audio Session 狀態（確認回音消除是否啟用）
+        let session = AVAudioSession.sharedInstance()
+        print("🔍 [TTS] Audio Session Check:")
+        print("   Category: \(session.category.rawValue)")
+        print("   Mode: \(session.mode.rawValue) (應該是 AVAudioSessionModeVoiceChat)")
+        print("   Route: \(session.currentRoute.outputs.first?.portType.rawValue ?? "unknown")")
+
         // 1. 將音頻數據寫入臨時文件
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp3")
         try audioData.write(to: tempURL)

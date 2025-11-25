@@ -182,6 +182,12 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
 
         print("🔇 [Audio Session] Echo Cancellation enabled (mode: .voiceChat)")
         print("📱 [Audio Session] Output route: Controlled by overrideOutputAudioPort")
+
+        // ⭐️ 驗證設置
+        print("✅ [Verification] Category: \(session.category.rawValue)")
+        print("✅ [Verification] Mode: \(session.mode.rawValue)")
+        print("✅ [Verification] Options: \(session.categoryOptions.rawValue)")
+        print("✅ [Verification] Current route: \(session.currentRoute.outputs.first?.portType.rawValue ?? "unknown")")
     }
 
     /// 重設音頻 Session
