@@ -305,7 +305,10 @@ struct ConversationBubbleView: View {
             return
         }
 
-        isSynthesizing = true
+        // ⭐️ 立即更新 UI 狀態（不阻塞用戶操作）
+        await MainActor.run {
+            isSynthesizing = true
+        }
 
         do {
             // 映射語言代碼到 Azure TTS 格式
@@ -313,7 +316,7 @@ struct ConversationBubbleView: View {
 
             print("🔊 [TTS] 播放翻譯: \(text.prefix(30))... (語言: \(langCode))")
 
-            // 合成語音
+            // ⭐️ 合成語音（在後台執行，不阻塞轉錄）
             let audioData = try await ttsService.synthesize(
                 text: text,
                 languageCode: langCode,
@@ -321,25 +324,37 @@ struct ConversationBubbleView: View {
                 useMultilingual: true
             )
 
+            // ⭐️ 合成完成，更新 UI 並播放
+            await MainActor.run {
+                isSynthesizing = false
+            }
+
             // 播放
             try ttsService.play(audioData: audioData)
-            isPlaying = true
 
-            // 監聽播放結束
-            Task {
-                while ttsService.isPlaying {
+            await MainActor.run {
+                isPlaying = true
+            }
+
+            // ⭐️ 監聽播放結束（獨立 Task，不阻塞）
+            Task.detached { [weak self] in
+                guard let self = self else { return }
+
+                while self.ttsService.isPlaying {
                     try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
                 }
+
                 await MainActor.run {
-                    isPlaying = false
+                    self.isPlaying = false
                 }
             }
 
         } catch {
             print("❌ TTS Error: \(error.localizedDescription)")
+            await MainActor.run {
+                isSynthesizing = false
+            }
         }
-
-        isSynthesizing = false
     }
 }
 
