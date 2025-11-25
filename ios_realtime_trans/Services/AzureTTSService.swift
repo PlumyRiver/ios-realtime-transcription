@@ -26,14 +26,16 @@ class AzureTTSService {
     // 音頻播放器（使用 AVAudioEngine 來支持音量放大）
     private var audioEngine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
+    private var mixerNode: AVAudioMixerNode?
     private var audioFile: AVAudioFile?
 
     // ⭐️ 音量增益（可調整）
     // 1.0 = 正常音量
     // 2.0 = 2 倍音量
-    // 3.0 = 3 倍音量（默認）
-    // 建議範圍：1.0 ~ 5.0（太大會失真）
-    var volumeBoost: Float = 3.0
+    // 3.0 = 3 倍音量
+    // 5.0 = 5 倍音量（默認 - 非常大聲）
+    // 建議範圍：1.0 ~ 10.0（太大會失真）
+    var volumeBoost: Float = 5.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
@@ -243,6 +245,28 @@ class AzureTTSService {
         }
     }
 
+    /// 直接放大 PCM buffer 的音量（修改樣本值）
+    /// - Parameters:
+    ///   - buffer: 要放大的音頻 buffer
+    ///   - gain: 增益倍數
+    private func amplifyBuffer(_ buffer: AVAudioPCMBuffer, gain: Float) {
+        guard let floatChannelData = buffer.floatChannelData else { return }
+
+        let channelCount = Int(buffer.format.channelCount)
+        let frameLength = Int(buffer.frameLength)
+
+        // 對每個聲道的每個樣本進行放大
+        for channel in 0..<channelCount {
+            let samples = floatChannelData[channel]
+            for frame in 0..<frameLength {
+                // 放大樣本值並限制在 [-1.0, 1.0] 範圍內防止削波
+                samples[frame] = min(max(samples[frame] * gain, -1.0), 1.0)
+            }
+        }
+
+        print("🔊 [Buffer Amplify] Amplified \(frameLength) frames × \(channelCount) channels with gain \(gain)x")
+    }
+
     /// 播放合成的語音（使用 AVAudioEngine 支持音量放大）
     /// - Parameter audioData: 音頻數據（MP3 格式）
     func play(audioData: Data) throws {
@@ -274,30 +298,38 @@ class AzureTTSService {
         try audioFile.read(into: buffer, frameCount: frameCount)
         print("📦 [Azure TTS] Loaded audio buffer: \(buffer.frameLength) frames")
 
+        // ⭐️ 關鍵：直接放大 buffer 的樣本值（最可靠的方法）
+        amplifyBuffer(buffer, gain: volumeBoost)
+
         // 4. 創建 AVAudioEngine 和 PlayerNode
         audioEngine = AVAudioEngine()
         playerNode = AVAudioPlayerNode()
+        mixerNode = AVAudioMixerNode()
 
         guard let audioEngine = audioEngine,
-              let playerNode = playerNode else {
+              let playerNode = playerNode,
+              let mixerNode = mixerNode else {
             throw TTSError.serverError("Failed to create audio engine")
         }
 
-        // 5. 連接節點
+        // 5. 連接節點：PlayerNode → MixerNode → MainMixerNode → Output
         audioEngine.attach(playerNode)
+        audioEngine.attach(mixerNode)
 
-        // ⭐️ 關鍵：使用 mixer 來放大音量
-        let mixer = audioEngine.mainMixerNode
-        audioEngine.connect(playerNode, to: mixer, format: audioFile.processingFormat)
+        let format = audioFile.processingFormat
+        audioEngine.connect(playerNode, to: mixerNode, format: format)
+        audioEngine.connect(mixerNode, to: audioEngine.mainMixerNode, format: format)
 
-        // ⭐️ 設置音量增益（使用可配置的 volumeBoost）
-        mixer.outputVolume = volumeBoost
+        // ⭐️ 多層音量增益（保險起見）
+        playerNode.volume = 1.0  // PlayerNode 保持正常
+        mixerNode.outputVolume = 1.0  // MixerNode 保持正常（已經在 buffer 層級放大了）
+        audioEngine.mainMixerNode.outputVolume = 1.0  // Main mixer 保持正常
 
         // 6. 啟動引擎
         try audioEngine.start()
         print("🎵 [Audio Engine] Started")
 
-        // 7. 播放音頻（使用 buffer 而不是 file）
+        // 7. 播放音頻（使用放大後的 buffer）
         playerNode.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { callbackType in
             // 播放完成後清理
             print("✅ [Azure TTS] Playback completed (type: \(callbackType.rawValue))")
@@ -332,6 +364,7 @@ class AzureTTSService {
         }
 
         playerNode = nil
+        mixerNode = nil
         audioEngine = nil
         audioFile = nil
 
