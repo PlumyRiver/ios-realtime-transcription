@@ -31,12 +31,11 @@ class AzureTTSService {
     private var playbackTimer: Timer?
 
     // ⭐️ 音量增益（dB）
+    // 重要：過高的增益會導致削波（破音），但 Voice Processing 的 AGC 會壓制音量
+    // 結果：破音但沒變大聲
     // 0 dB = 正常音量
-    // +6 dB ≈ 2 倍音量
-    // +12 dB ≈ 4 倍音量
-    // +18 dB ≈ 8 倍音量
-    // +24 dB ≈ 16 倍音量（明顯有感）
-    var volumeBoostDB: Float = 24.0
+    // +6 dB ≈ 2 倍音量（推薦 - 配合擴音模式和系統音量）
+    var volumeBoostDB: Float = 6.0
 
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
