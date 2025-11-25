@@ -160,10 +160,12 @@ final class AudioRecordingService: AudioRecordingServiceProtocol {
         // - Echo Cancellation: 消除揚聲器播放的聲音被麥克風收音
         // - Noise Suppression: 抑制背景噪音
         // - Automatic Gain Control: 自動調整麥克風增益
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+        // 📱 移除 .defaultToSpeaker，改用聽筒（earpiece）輸出
+        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
         try session.setActive(true)
 
         print("🔇 [Audio Session] Echo Cancellation enabled (mode: .voiceChat)")
+        print("📱 [Audio Session] Output route: Receiver (earpiece)")
     }
 
     /// 重設音頻 Session
