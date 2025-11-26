@@ -37,6 +37,9 @@ final class AudioManager {
     /// ⭐️ 是否暫停發送音頻（TTS 播放時暫停，避免回音被錄到）
     private(set) var isSendingPaused: Bool = false
 
+    /// ⭐️ Push-to-Talk 模式：手動控制發送（按住才發送）
+    private(set) var isManualSendingPaused: Bool = true
+
     /// ⭐️ 防止 onTTSPlaybackComplete 重複調用
     private var hasTriggeredCompletion: Bool = false
 
@@ -96,6 +99,9 @@ final class AudioManager {
 
     /// TTS 播放完成回調
     var onTTSPlaybackFinished: (() -> Void)?
+
+    /// ⭐️ PTT 結束語句回調（放開按鈕時調用，用於發送結束信號給服務器）
+    var onEndUtterance: (() -> Void)?
 
     // MARK: - Initialization
 
@@ -288,6 +294,86 @@ final class AudioManager {
         print("⏹️ [AudioManager] 停止錄音 (總計發送 \(sendCount) 次)")
         sendCount = 0
         recordingState = .idle
+
+        // 重置 Push-to-Talk 狀態
+        isManualSendingPaused = true
+    }
+
+    // MARK: - Push-to-Talk Methods
+
+    /// 開始發送音頻（按住說話時調用）
+    func startSending() {
+        isManualSendingPaused = false
+        print("🎙️ [AudioManager] Push-to-Talk: 開始發送音頻")
+    }
+
+    /// 停止發送音頻（放開按鈕時調用）
+    func stopSending() {
+        // ⭐️ 順序很重要：
+        // 1. 先發送緩衝區中剩餘的音頻
+        // 2. 再發送靜音讓 Chirp3 判斷語句結束
+        // 3. 發送結束信號強制刷新串流
+        // 4. 最後才停止發送
+
+        // 1. 立即發送緩衝區中的剩餘音頻
+        flushRemainingAudio()
+
+        // 2. 發送尾部靜音，讓 Chirp3 判斷語句結束
+        sendTrailingSilence()
+
+        // 3. 發送結束語句信號，強制 Chirp3 輸出結果
+        onEndUtterance?()
+
+        // 4. 設置暫停狀態
+        isManualSendingPaused = true
+        print("⏸️ [AudioManager] Push-to-Talk: 停止發送音頻")
+    }
+
+    /// 立即發送緩衝區中的剩餘音頻（不受 isManualSendingPaused 影響）
+    private func flushRemainingAudio() {
+        guard !audioBufferCollector.isEmpty else { return }
+
+        // 合併並發送所有緩衝的音頻
+        var combinedData = Data()
+        for buffer in audioBufferCollector {
+            combinedData.append(buffer)
+        }
+        audioBufferCollector.removeAll()
+
+        if combinedData.isEmpty { return }
+
+        // 分割發送
+        var offset = 0
+        while offset < combinedData.count {
+            let chunkSize = min(maxChunkSize, combinedData.count - offset)
+            let chunk = combinedData.subdata(in: offset..<(offset + chunkSize))
+
+            sendCount += 1
+            print("📤 [AudioManager] 發送剩餘音頻 #\(sendCount): \(chunk.count) bytes")
+            audioDataSubject.send(chunk)
+
+            offset += chunkSize
+        }
+    }
+
+    /// 發送尾部靜音（讓 Chirp3 判斷語句結束）
+    private func sendTrailingSilence() {
+        // 1000ms 的靜音，分成 4 個 chunk 發送
+        // 每個 chunk 250ms = 8000 bytes
+        let totalDurationMs = 1000
+        let numChunks = 4
+        let chunkDurationMs = totalDurationMs / numChunks  // 250ms
+        let sampleRate = 16000
+        let bytesPerSample = 2
+        let bytesPerChunk = (chunkDurationMs * sampleRate * bytesPerSample) / 1000  // 8000 bytes
+
+        print("🔇 [AudioManager] 發送尾部靜音: \(totalDurationMs)ms (\(numChunks) chunks × \(bytesPerChunk) bytes)")
+
+        for _ in 0..<numChunks {
+            let silenceData = Data(count: bytesPerChunk)
+            sendCount += 1
+            audioDataSubject.send(silenceData)
+        }
     }
 
     // MARK: - TTS Playback Methods
@@ -484,6 +570,14 @@ final class AudioManager {
         // ⭐️ TTS 播放時暫停發送（避免回音被錄到）
         if isSendingPaused {
             // 丟棄緩衝區（TTS 播放中的音頻可能包含回音）
+            audioBufferCollector.removeAll()
+            return
+        }
+
+        // ⭐️ Push-to-Talk 模式：未按住時不發送（不發送靜音避免計費）
+        if isManualSendingPaused {
+            // 丟棄緩衝區（沒按住按鈕）
+            // 注意：這會導致 Chirp3 串流超時，但服務器會自動重啟串流
             audioBufferCollector.removeAll()
             return
         }

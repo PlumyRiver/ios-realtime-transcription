@@ -39,6 +39,10 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
 
+    /// ⭐️ 心跳計時器（保持連接存活）
+    private var pingTimer: Timer?
+    private let pingInterval: TimeInterval = 15.0  // 每 15 秒發送一次 ping
+
     // Combine Publishers
     private let transcriptSubject = PassthroughSubject<TranscriptMessage, Never>()
     private let translationSubject = PassthroughSubject<(String, String), Never>()
@@ -111,6 +115,9 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
 
     /// 斷開連接
     func disconnect() {
+        // 停止心跳
+        stopPingTimer()
+
         if wsSendCount > 0 {
             print("📊 WebSocket 總計發送: \(wsSendCount) 次音頻")
         }
@@ -122,8 +129,66 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
         connectionState = .disconnected
     }
 
+    // MARK: - 心跳機制
+
+    /// 啟動心跳計時器
+    private func startPingTimer() {
+        stopPingTimer()
+        pingTimer = Timer.scheduledTimer(withTimeInterval: pingInterval, repeats: true) { [weak self] _ in
+            self?.sendPing()
+        }
+        print("💓 心跳計時器已啟動（每 \(Int(pingInterval)) 秒）")
+    }
+
+    /// 停止心跳計時器
+    private func stopPingTimer() {
+        pingTimer?.invalidate()
+        pingTimer = nil
+    }
+
+    /// 發送 ping
+    private func sendPing() {
+        guard connectionState == .connected else { return }
+
+        webSocketTask?.sendPing { [weak self] error in
+            if let error {
+                print("❌ Ping 失敗: \(error.localizedDescription)")
+                // Ping 失敗可能表示連接已斷開
+                Task { @MainActor in
+                    self?.connectionState = .error("連接已斷開")
+                    self?.errorSubject.send("連接已斷開")
+                }
+            } else {
+                print("💓 Ping 成功")
+            }
+        }
+    }
+
     /// 發送計數器
     private var wsSendCount = 0
+
+    /// ⭐️ 發送結束語句信號（PTT 放開時調用，強制 Chirp3 輸出結果）
+    func sendEndUtterance() {
+        guard connectionState == .connected else { return }
+
+        let endMessage = ["type": "end_utterance"]
+
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: endMessage)
+            if let jsonString = String(data: jsonData, encoding: .utf8) {
+                let message = URLSessionWebSocketTask.Message.string(jsonString)
+                webSocketTask?.send(message) { error in
+                    if let error {
+                        print("❌ 發送結束信號錯誤: \(error.localizedDescription)")
+                    } else {
+                        print("🔚 已發送結束語句信號")
+                    }
+                }
+            }
+        } catch {
+            print("❌ 編碼結束信號錯誤: \(error)")
+        }
+    }
 
     /// 發送音頻數據
     func sendAudio(data: Data) {
@@ -253,6 +318,8 @@ extension WebSocketService: URLSessionWebSocketDelegate {
         Task { @MainActor in
             print("✅ WebSocket 連接成功")
             self.connectionState = .connected
+            // ⭐️ 連接成功後啟動心跳
+            self.startPingTimer()
         }
     }
 

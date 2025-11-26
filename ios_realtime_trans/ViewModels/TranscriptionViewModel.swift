@@ -88,6 +88,30 @@ final class TranscriptionViewModel {
         audioManager.isPlayingTTS
     }
 
+    /// ⭐️ Push-to-Talk：是否正在按住說話
+    var isPushToTalkActive: Bool {
+        !audioManager.isManualSendingPaused
+    }
+
+    /// ⭐️ 輸入模式：PTT（按住說話）或 VAD（持續監聽）
+    enum InputMode: String {
+        case ptt = "ptt"  // Push-to-Talk：按住說話
+        case vad = "vad"  // Voice Activity Detection：持續監聽
+    }
+
+    var inputMode: InputMode = .ptt {
+        didSet {
+            if oldValue != inputMode {
+                handleInputModeChange()
+            }
+        }
+    }
+
+    /// 是否為持續監聽模式
+    var isVADMode: Bool {
+        inputMode == .vad
+    }
+
     // MARK: - Configuration
 
     /// 伺服器 URL（Cloud Run 部署的服務）
@@ -202,6 +226,12 @@ final class TranscriptionViewModel {
 
             print("🔊 [AudioManager] 全雙工模式啟動（錄音 + TTS 播放共用 Engine，AEC 啟用）")
 
+            // ⭐️ VAD 模式：自動開始發送音頻
+            if inputMode == .vad {
+                audioManager.startSending()
+                print("🎙️ [ViewModel] VAD 模式：自動開始持續監聽")
+            }
+
             status = .recording
             startDurationTimer()
         } catch {
@@ -233,6 +263,43 @@ final class TranscriptionViewModel {
         isSpeakerMode.toggle()
         // AudioManager 會通過 didSet 自動同步
         print("🔊 [ViewModel] 擴音模式: \(isSpeakerMode ? "開啟" : "關閉")")
+    }
+
+    // MARK: - Input Mode Methods
+
+    /// 切換輸入模式
+    func toggleInputMode() {
+        inputMode = (inputMode == .ptt) ? .vad : .ptt
+    }
+
+    /// 處理輸入模式變更
+    private func handleInputModeChange() {
+        print("🎙️ [ViewModel] 輸入模式切換: \(inputMode.rawValue)")
+
+        if inputMode == .vad {
+            // VAD 模式：持續發送音頻
+            if isRecording {
+                audioManager.startSending()
+            }
+        } else {
+            // PTT 模式：停止發送，等待按住
+            audioManager.stopSending()
+        }
+    }
+
+    // MARK: - Push-to-Talk Methods
+
+    /// 開始說話（按下按鈕時調用，僅 PTT 模式有效）
+    func startTalking() {
+        guard isRecording else { return }
+        guard inputMode == .ptt else { return }  // VAD 模式不需要手動控制
+        audioManager.startSending()
+    }
+
+    /// 停止說話（放開按鈕時調用，僅 PTT 模式有效）
+    func stopTalking() {
+        guard inputMode == .ptt else { return }  // VAD 模式不需要手動控制
+        audioManager.stopSending()
     }
 
     /// 設定 Combine 訂閱
@@ -272,6 +339,11 @@ final class TranscriptionViewModel {
         // ⭐️ TTS 播放完成回調（播放隊列中的下一個）
         audioManager.onTTSPlaybackFinished = { [weak self] in
             self?.processNextTTS()
+        }
+
+        // ⭐️ PTT 結束語句回調（發送結束信號強制 Chirp3 輸出結果）
+        audioManager.onEndUtterance = { [weak self] in
+            self?.webSocketService.sendEndUtterance()
         }
     }
 
