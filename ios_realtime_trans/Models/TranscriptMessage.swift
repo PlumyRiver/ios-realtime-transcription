@@ -7,6 +7,62 @@
 
 import Foundation
 
+/// TTS 播放模式（四段切換）
+/// - sourceOnly: 當「你」說話時播放 → 播放目標語言的翻譯
+/// - targetOnly: 當「對方」說話時播放 → 播放來源語言的翻譯
+enum TTSPlaybackMode: Int, CaseIterable {
+    case all = 0          // 播放所有 TTS
+    case sourceOnly = 1   // 只播放目標語言（當你說話時）
+    case targetOnly = 2   // 只播放來源語言（當對方說話時）
+    case muted = 3        // 靜音（不播放任何 TTS）
+
+    /// 顯示名稱（用於設定頁面）
+    var displayName: String {
+        switch self {
+        case .all: return "全部播放"
+        case .sourceOnly: return "只播目標語言"
+        case .targetOnly: return "只播來源語言"
+        case .muted: return "靜音"
+        }
+    }
+
+    /// 簡短名稱（靜態，用於無語言資訊時）
+    var shortName: String {
+        switch self {
+        case .all: return "全部"
+        case .sourceOnly: return "目標語言"
+        case .targetOnly: return "來源語言"
+        case .muted: return "靜音"
+        }
+    }
+
+    /// 動態生成顯示名稱（帶具體語言）
+    func displayText(sourceLang: Language, targetLang: Language) -> String {
+        switch self {
+        case .all: return "全部"
+        case .sourceOnly: return "只播\(targetLang.shortName)"  // 播放目標語言
+        case .targetOnly: return "只播\(sourceLang.shortName)"  // 播放來源語言
+        case .muted: return "靜音"
+        }
+    }
+
+    /// SF Symbol 圖標名稱
+    var iconName: String {
+        switch self {
+        case .all: return "speaker.wave.3.fill"
+        case .sourceOnly: return "speaker.wave.2.fill"
+        case .targetOnly: return "speaker.wave.1.fill"
+        case .muted: return "speaker.slash.fill"
+        }
+    }
+
+    /// 切換到下一個模式
+    func next() -> TTSPlaybackMode {
+        let nextRawValue = (self.rawValue + 1) % TTSPlaybackMode.allCases.count
+        return TTSPlaybackMode(rawValue: nextRawValue) ?? .all
+    }
+}
+
 /// 語言選項
 enum Language: String, CaseIterable, Identifiable {
     case auto = "auto"

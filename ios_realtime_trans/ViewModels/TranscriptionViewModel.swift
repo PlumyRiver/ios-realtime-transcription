@@ -80,8 +80,14 @@ final class TranscriptionViewModel {
         }
     }
 
-    /// 自動播放翻譯（TTS）
-    var autoPlayTTS: Bool = true
+    /// TTS 播放模式（四段切換）
+    var ttsPlaybackMode: TTSPlaybackMode = .all
+
+    /// 自動播放翻譯（TTS）- 計算屬性，向後兼容
+    var autoPlayTTS: Bool {
+        get { ttsPlaybackMode != .muted }
+        set { ttsPlaybackMode = newValue ? .all : .muted }
+    }
 
     /// ⭐️ TTS 音量（0.0 ~ 1.0，對應 0 ~ 36 dB 總增益，WebRTC AEC3 無 AGC 限制）
     var ttsVolume: Float {
@@ -370,6 +376,7 @@ final class TranscriptionViewModel {
     private func handleTranslation(sourceText: String, translatedText: String) {
         // 找到對應的轉錄並添加翻譯
         var shouldPlayTTS = false
+        var detectedLanguage: String? = nil
 
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
             // ⭐️ 只有當翻譯不存在時才播放 TTS（避免 interim + final 翻譯都觸發）
@@ -377,17 +384,49 @@ final class TranscriptionViewModel {
             if existingTranslation == nil || existingTranslation?.isEmpty == true {
                 shouldPlayTTS = true
             }
+            detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
         } else if interimTranscript?.text == sourceText {
             interimTranscript?.translation = translatedText
+            detectedLanguage = interimTranscript?.language
             // interim 結果不播放 TTS
         }
 
-        // ⭐️ 自動播放 TTS（僅播放一次，避免重複）
-        if autoPlayTTS && shouldPlayTTS {
+        // ⭐️ 根據 TTS 播放模式決定是否播放
+        if shouldPlayTTS {
+            shouldPlayTTS = shouldPlayTTSForMode(detectedLanguage: detectedLanguage)
+        }
+
+        if shouldPlayTTS {
             // 判斷翻譯的目標語言
             let targetLangCode = getTargetLanguageCode(for: translatedText)
             enqueueTTS(text: translatedText, languageCode: targetLangCode)
+        }
+    }
+
+    /// 根據 TTS 播放模式判斷是否應該播放
+    /// - Parameter detectedLanguage: Chirp3 檢測到的語言代碼
+    /// - Returns: 是否應該播放 TTS
+    private func shouldPlayTTSForMode(detectedLanguage: String?) -> Bool {
+        switch ttsPlaybackMode {
+        case .muted:
+            return false
+        case .all:
+            return true
+        case .sourceOnly:
+            // 只有當原文是「來源語言」時才播放翻譯結果
+            // 例如：用戶設定 sourceLang=zh, targetLang=en
+            // 當用戶說中文（來源語言）→ 播放英文翻譯
+            guard let detected = detectedLanguage else { return false }
+            let detectedBase = detected.split(separator: "-").first.map(String.init) ?? detected
+            return detectedBase == sourceLang.rawValue
+        case .targetOnly:
+            // 只有當原文是「目標語言」時才播放翻譯結果
+            // 例如：用戶設定 sourceLang=zh, targetLang=en
+            // 當對方說英文（目標語言）→ 播放中文翻譯
+            guard let detected = detectedLanguage else { return false }
+            let detectedBase = detected.split(separator: "-").first.map(String.init) ?? detected
+            return detectedBase == targetLang.rawValue
         }
     }
 

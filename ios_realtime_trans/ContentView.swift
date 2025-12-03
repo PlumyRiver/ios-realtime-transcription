@@ -571,37 +571,61 @@ struct DualIconControlRow: View {
         }
     }
 
-    // MARK: - TTS 播放按鈕（原擴音按鈕位置）
+    // MARK: - TTS 播放按鈕（四段切換：全部 → 只播來源 → 只播目標 → 靜音）
+
+    /// 根據 TTS 播放模式返回對應顏色
+    private var ttsButtonColor: Color {
+        switch viewModel.ttsPlaybackMode {
+        case .all:
+            return .green       // 全部播放：綠色
+        case .sourceOnly:
+            return .blue        // 只播來源：藍色
+        case .targetOnly:
+            return .orange      // 只播目標：橘色
+        case .muted:
+            return Color(.systemGray4)  // 靜音：灰色
+        }
+    }
+
+    /// 根據 TTS 播放模式返回是否活躍
+    private var isTTSActive: Bool {
+        viewModel.ttsPlaybackMode != .muted
+    }
 
     private var speakerButton: some View {
         Button {
-            viewModel.autoPlayTTS.toggle()
+            // 切換到下一個 TTS 播放模式
+            viewModel.ttsPlaybackMode = viewModel.ttsPlaybackMode.next()
             let generator = UIImpactFeedbackGenerator(style: .light)
             generator.impactOccurred()
         } label: {
             ZStack {
                 // 外圈（活躍時有光暈）
                 Circle()
-                    .fill(viewModel.autoPlayTTS ? Color.green.opacity(0.15) : Color(.systemGray6))
+                    .fill(isTTSActive ? ttsButtonColor.opacity(0.15) : Color(.systemGray6))
                     .frame(width: buttonSize, height: buttonSize)
 
                 // 主圈
                 Circle()
-                    .fill(viewModel.autoPlayTTS ? Color.green : Color(.systemGray4))
+                    .fill(ttsButtonColor)
                     .frame(width: buttonSize - 10, height: buttonSize - 10)
-                    .shadow(color: viewModel.autoPlayTTS ? Color.green.opacity(0.3) : Color.clear, radius: 8, x: 0, y: 2)
+                    .shadow(color: isTTSActive ? ttsButtonColor.opacity(0.3) : Color.clear, radius: 8, x: 0, y: 2)
 
-                // 圖標
-                Image(systemName: viewModel.autoPlayTTS ? "speaker.wave.3.fill" : "speaker.slash.fill")
+                // 圖標（根據模式變化）
+                Image(systemName: viewModel.ttsPlaybackMode.iconName)
                     .font(.system(size: iconSize, weight: .medium))
                     .foregroundStyle(.white)
             }
         }
         .overlay(alignment: .bottom) {
-            Text(viewModel.autoPlayTTS ? "自動播放" : "靜音")
+            // 顯示當前模式名稱（帶具體語言，如「只播英文」）
+            Text(viewModel.ttsPlaybackMode.displayText(
+                sourceLang: viewModel.sourceLang,
+                targetLang: viewModel.targetLang
+            ))
                 .font(.caption2)
                 .fontWeight(.medium)
-                .foregroundStyle(viewModel.autoPlayTTS ? .green : .secondary)
+                .foregroundStyle(isTTSActive ? ttsButtonColor : .secondary)
                 .offset(y: 24)
         }
     }
@@ -988,18 +1012,38 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("播放設定") {
-                    Toggle(isOn: $viewModel.autoPlayTTS) {
+                Section("TTS 播放模式") {
+                    Picker(selection: $viewModel.ttsPlaybackMode) {
+                        ForEach(TTSPlaybackMode.allCases, id: \.self) { mode in
+                            HStack {
+                                Image(systemName: mode.iconName)
+                                Text(mode.displayName)
+                            }
+                            .tag(mode)
+                        }
+                    } label: {
                         HStack {
-                            Image(systemName: "play.circle.fill")
-                                .foregroundStyle(.green)
-                            Text("自動播放翻譯")
+                            Image(systemName: viewModel.ttsPlaybackMode.iconName)
+                                .foregroundStyle(ttsPlaybackModeColor(viewModel.ttsPlaybackMode))
+                            Text("播放模式")
                         }
                     }
 
-                    Text("開啟後會自動播放翻譯結果的語音")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // 模式說明（動態顯示具體語言）
+                    VStack(alignment: .leading, spacing: 4) {
+                        switch viewModel.ttsPlaybackMode {
+                        case .all:
+                            Text("全部播放：自動播放所有翻譯結果")
+                        case .sourceOnly:
+                            Text("只播放「\(viewModel.targetLang.shortName)」：當你說\(viewModel.sourceLang.shortName)時，播放\(viewModel.targetLang.shortName)翻譯給對方聽")
+                        case .targetOnly:
+                            Text("只播放「\(viewModel.sourceLang.shortName)」：當對方說\(viewModel.targetLang.shortName)時，播放\(viewModel.sourceLang.shortName)翻譯給你聽")
+                        case .muted:
+                            Text("靜音：不播放任何 TTS 語音")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
 
                 Section("伺服器設定") {
@@ -1057,6 +1101,20 @@ struct SettingsView: View {
             return .orange
         } else {
             return .red
+        }
+    }
+
+    /// 根據 TTS 播放模式返回對應顏色
+    private func ttsPlaybackModeColor(_ mode: TTSPlaybackMode) -> Color {
+        switch mode {
+        case .all:
+            return .green
+        case .sourceOnly:
+            return .blue
+        case .targetOnly:
+            return .orange
+        case .muted:
+            return .gray
         }
     }
 }
