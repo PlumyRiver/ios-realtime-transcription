@@ -200,6 +200,12 @@ struct TranscriptMessage: Identifiable, Equatable {
 
 // MARK: - WebSocket 訊息解析
 
+/// 延遲統計結構
+struct LatencyInfo: Decodable {
+    let transcriptMs: Int?      // 轉錄延遲（毫秒）
+    let translationMs: Int?     // 翻譯延遲（毫秒）
+}
+
 /// 從 Server 收到的轉錄訊息
 struct ServerTranscriptResponse: Decodable {
     let type: String
@@ -214,6 +220,7 @@ struct ServerTranscriptResponse: Decodable {
     let sourceText: String?
     let sourceLanguage: String?
     let targetLanguage: String?
+    let latency: LatencyInfo?   // ⭐️ 延遲統計
 }
 
 /// 發送到 Server 的音頻訊息

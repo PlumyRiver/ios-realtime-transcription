@@ -378,6 +378,14 @@ final class TranscriptionViewModel {
         var shouldPlayTTS = false
         var detectedLanguage: String? = nil
 
+        // ⭐️ DEBUG: 打印匹配信息
+        print("🔍 [翻譯匹配] sourceText: \"\(sourceText)\"")
+        print("🔍 [翻譯匹配] transcripts 數量: \(transcripts.count)")
+        for (i, t) in transcripts.suffix(3).enumerated() {
+            let match = t.text == sourceText
+            print("🔍 [翻譯匹配] [\(i)] \"\(t.text.prefix(30))...\" | 匹配: \(match)")
+        }
+
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
             // ⭐️ 只有當翻譯不存在時才播放 TTS（避免 interim + final 翻譯都觸發）
             let existingTranslation = transcripts[index].translation

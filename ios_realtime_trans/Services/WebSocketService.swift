@@ -279,8 +279,16 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
 
                 transcriptSubject.send(transcript)
 
+                // ⭐️ 打印延遲統計
+                let latencyStr: String
+                if let latency = response.latency?.transcriptMs {
+                    latencyStr = " ⏱️\(latency)ms"
+                } else {
+                    latencyStr = ""
+                }
+
                 if transcript.isFinal {
-                    print("✅ [\(response.language ?? "?")]  \(transcriptText)")
+                    print("✅ [\(response.language ?? "?")] \(transcriptText)\(latencyStr)")
                 } else {
                     print("⋯ [interim] \(transcriptText)")
                 }
@@ -290,7 +298,15 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
                       let sourceText = response.sourceText else { return }
 
                 translationSubject.send((sourceText, translatedText))
-                print("🌐 翻譯: \(translatedText)")
+
+                // ⭐️ 打印延遲統計
+                let latencyStr: String
+                if let latency = response.latency?.translationMs {
+                    latencyStr = " ⏱️\(latency)ms"
+                } else {
+                    latencyStr = ""
+                }
+                print("🌐 翻譯: \(translatedText)\(latencyStr)")
 
             case "error":
                 let errorMessage = response.message ?? "未知錯誤"
