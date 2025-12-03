@@ -1,0 +1,14 @@
+# CocoaPods
+Pods/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+
+# macOS
+.DS_Store

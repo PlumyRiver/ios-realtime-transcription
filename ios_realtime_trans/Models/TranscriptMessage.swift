@@ -66,6 +66,27 @@ enum Language: String, CaseIterable, Identifiable {
         case .vi: return "🇻🇳"
         }
     }
+
+    /// 簡短名稱（用於底部控制欄）
+    var shortName: String {
+        switch self {
+        case .auto: return "自動"
+        case .zh: return "中文"
+        case .en: return "英文"
+        case .ja: return "日文"
+        case .ko: return "韓文"
+        case .es: return "西文"
+        case .fr: return "法文"
+        case .de: return "德文"
+        case .it: return "義文"
+        case .pt: return "葡文"
+        case .ru: return "俄文"
+        case .ar: return "阿文"
+        case .hi: return "印地"
+        case .th: return "泰文"
+        case .vi: return "越文"
+        }
+    }
 }
 
 /// 轉錄訊息

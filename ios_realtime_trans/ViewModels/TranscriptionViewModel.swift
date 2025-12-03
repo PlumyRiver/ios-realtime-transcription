@@ -83,6 +83,12 @@ final class TranscriptionViewModel {
     /// 自動播放翻譯（TTS）
     var autoPlayTTS: Bool = true
 
+    /// ⭐️ TTS 音量（0.0 ~ 1.0，對應 0 ~ 36 dB 總增益，WebRTC AEC3 無 AGC 限制）
+    var ttsVolume: Float {
+        get { audioManager.volumePercent }
+        set { audioManager.volumePercent = newValue }
+    }
+
     /// TTS 播放中
     var isPlayingTTS: Bool {
         audioManager.isPlayingTTS
@@ -121,8 +127,8 @@ final class TranscriptionViewModel {
 
     private let webSocketService = WebSocketService()
 
-    /// ⭐️ 使用統一的 AudioManager（回音消除核心）
-    private let audioManager = AudioManager.shared
+    /// ⭐️ 使用 WebRTC AEC3 音頻管理器（全雙工回音消除）
+    private let audioManager = WebRTCAudioManager.shared
 
     /// TTS 服務
     private let ttsService = AzureTTSService()
@@ -224,7 +230,7 @@ final class TranscriptionViewModel {
 
             try audioManager.startRecording()
 
-            print("🔊 [AudioManager] 全雙工模式啟動（錄音 + TTS 播放共用 Engine，AEC 啟用）")
+            print("🔊 [WebRTC AEC3] 全雙工模式啟動（獨立錄音 + 播放引擎，AEC3 回音消除）")
 
             // ⭐️ VAD 模式：自動開始發送音頻
             if inputMode == .vad {

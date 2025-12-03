@@ -60,7 +60,7 @@ final class AudioManager {
     /// 播放器節點（TTS 播放用）
     private var playerNode: AVAudioPlayerNode?
 
-    /// EQ 節點（音量放大用）
+    /// EQ 節點（音量放大用，3 頻段分散增益）
     private var eqNode: AVAudioUnitEQ?
 
     /// 混音器節點
@@ -86,8 +86,24 @@ final class AudioManager {
     private var audioFile: AVAudioFile?
     private var playbackTimer: Timer?
 
-    /// 音量增益（dB）
-    var volumeBoostDB: Float = 6.0
+    /// 音量增益（dB）- 可動態調整
+    /// ⭐️ 最大 +36 dB，使用 3 頻段 EQ 分散增益減少失真
+    static let maxVolumeDB: Float = 36.0
+
+    var volumeBoostDB: Float = 18.0 {
+        didSet {
+            updateVolumeGain()
+        }
+    }
+
+    /// 音量百分比（0.0 ~ 1.0），對應 0 ~ 36 dB
+    var volumePercent: Float {
+        get { volumeBoostDB / Self.maxVolumeDB }
+        set {
+            let clamped = min(max(newValue, 0), 1)
+            volumeBoostDB = clamped * Self.maxVolumeDB
+        }
+    }
 
     // MARK: - Combine Publishers
 
@@ -115,7 +131,7 @@ final class AudioManager {
     private func setupAudioEngine() {
         // 創建節點
         playerNode = AVAudioPlayerNode()
-        eqNode = AVAudioUnitEQ(numberOfBands: 1)
+        eqNode = AVAudioUnitEQ(numberOfBands: 3)  // ⭐️ 3 頻段分散增益
         mixerNode = AVAudioMixerNode()
 
         guard let playerNode = playerNode,
@@ -168,6 +184,32 @@ final class AudioManager {
             }
         } catch {
             print("❌ [AudioManager] 更新輸出路由失敗: \(error)")
+        }
+    }
+
+    /// ⭐️ 切換到播放模式（.default mode，無 AGC 限制，音量更大）
+    private func switchToPlaybackMode() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            // 使用 .default mode 繞過 voiceChat 的 AGC 音量限制
+            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth, .defaultToSpeaker])
+            print("🔊 [AudioManager] 切換到播放模式（.default，無 AGC 限制）")
+        } catch {
+            print("❌ [AudioManager] 切換到播放模式失敗: \(error)")
+        }
+    }
+
+    /// ⭐️ 切換回錄音模式（.voiceChat mode，啟用 AEC）
+    private func switchToRecordingMode() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            // 恢復 .voiceChat mode 啟用 AEC
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+            // 重新設置擴音模式
+            updateOutputRoute()
+            print("🎙️ [AudioManager] 切換回錄音模式（.voiceChat，AEC 啟用）")
+        } catch {
+            print("❌ [AudioManager] 切換回錄音模式失敗: \(error)")
         }
     }
 
@@ -249,6 +291,7 @@ final class AudioManager {
     }
 
     /// 連接播放節點
+    /// ⭐️ 使用 3 頻段 EQ 分散增益，減少單點過載造成的失真
     private func connectPlaybackNodes() {
         guard let playerNode = playerNode,
               let eqNode = eqNode else { return }
@@ -260,16 +303,54 @@ final class AudioManager {
         audioEngine.connect(playerNode, to: eqNode, format: outputFormat)
         audioEngine.connect(eqNode, to: audioEngine.mainMixerNode, format: outputFormat)
 
-        // 配置 EQ
-        eqNode.globalGain = volumeBoostDB
-        let band = eqNode.bands[0]
-        band.filterType = .parametric
-        band.frequency = 1000
-        band.bandwidth = 2.0
-        band.gain = volumeBoostDB
-        band.bypass = false
+        // ⭐️ 配置 3 頻段 EQ - 分散增益減少失真
+        // 每個頻段增益 = totalGain / 3
+        let perBandGain = volumeBoostDB / 3.0
 
-        print("🔊 [AudioManager] 播放節點已連接，音量增益: +\(volumeBoostDB * 2) dB")
+        // 低頻 (250 Hz)
+        let lowBand = eqNode.bands[0]
+        lowBand.filterType = .lowShelf
+        lowBand.frequency = 250
+        lowBand.gain = perBandGain
+        lowBand.bypass = false
+
+        // 中頻 (1000 Hz)
+        let midBand = eqNode.bands[1]
+        midBand.filterType = .parametric
+        midBand.frequency = 1000
+        midBand.bandwidth = 1.0
+        midBand.gain = perBandGain
+        midBand.bypass = false
+
+        // 高頻 (4000 Hz)
+        let highBand = eqNode.bands[2]
+        highBand.filterType = .highShelf
+        highBand.frequency = 4000
+        highBand.gain = perBandGain
+        highBand.bypass = false
+
+        // globalGain 設為 0，只使用頻段增益
+        eqNode.globalGain = 0
+
+        // Mixer 音量保持 1.0（避免系統層級削波）
+        audioEngine.mainMixerNode.outputVolume = 1.0
+
+        print("🔊 [AudioManager] 播放節點已連接")
+        print("   3 頻段 EQ 增益: +\(Int(perBandGain)) dB × 3 = +\(Int(volumeBoostDB)) dB")
+    }
+
+    /// ⭐️ 動態更新音量增益（滑塊調整時調用）
+    private func updateVolumeGain() {
+        guard let eqNode = eqNode else { return }
+
+        let perBandGain = volumeBoostDB / 3.0
+
+        // 更新每個頻段的增益
+        for band in eqNode.bands {
+            band.gain = perBandGain
+        }
+
+        print("🔊 [AudioManager] 音量調整: +\(Int(volumeBoostDB)) dB (\(Int(volumePercent * 100))%)")
     }
 
     /// 停止錄音
@@ -304,7 +385,13 @@ final class AudioManager {
     /// 開始發送音頻（按住說話時調用）
     func startSending() {
         isManualSendingPaused = false
-        print("🎙️ [AudioManager] Push-to-Talk: 開始發送音頻")
+        print("🎙️ [AudioManager] 開始發送音頻")
+
+        // ⭐️ 立即發送緩衝區中已累積的音頻（不等待下一個 timer tick）
+        if !audioBufferCollector.isEmpty {
+            print("📦 [AudioManager] 立即發送緩衝音頻: \(audioBufferCollector.count) 個片段")
+            flushBuffer()
+        }
     }
 
     /// 停止發送音頻（放開按鈕時調用）
@@ -390,9 +477,14 @@ final class AudioManager {
         isPlayingTTS = true
         hasTriggeredCompletion = false  // 重置完成標誌
 
-        // ⭐️ 暫停發送音頻到服務器（避免回音被錄到）
+        // ⭐️ 半雙工模式：TTS 播放時暫停發送音頻（避免回音）
         isSendingPaused = true
-        print("⏸️ [AudioManager] 暫停發送音頻（TTS 播放中，避免回音）")
+
+        // ⭐️ 切換到 .default mode 繞過 AGC 音量限制
+        // （.voiceChat mode 的 AGC 會自動壓縮音量，導致聲音太小）
+        switchToPlaybackMode()
+
+        print("🔊 [AudioManager] TTS 播放中（半雙工模式，無 AGC 限制）")
 
         // 確保引擎正在運行
         if !audioEngine.isRunning {
@@ -419,8 +511,9 @@ final class AudioManager {
         print("▶️ [AudioManager] 播放 TTS")
         print("   文本: \(text?.prefix(30) ?? "unknown")...")
         print("   長度: \(audioFile.length) frames")
+        print("   增益: +\(Int(volumeBoostDB)) dB")
 
-        // 調度文件播放
+        // 調度文件播放（增益由 EQ 節點處理）
         playerNode.scheduleFile(audioFile, at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             DispatchQueue.main.async {
                 self?.onTTSPlaybackComplete()
@@ -447,9 +540,7 @@ final class AudioManager {
         isPlayingTTS = false
         currentTTSText = nil
 
-        // ⭐️ 恢復發送音頻到服務器
-        isSendingPaused = false
-        print("▶️ [AudioManager] 恢復發送音頻")
+        // 全雙工模式：無需恢復，音頻一直在發送
 
         cleanupPlayback()
         onTTSPlaybackFinished?()
@@ -470,11 +561,7 @@ final class AudioManager {
         isPlayingTTS = false
         currentTTSText = nil
 
-        // ⭐️ 恢復發送音頻
-        if isSendingPaused {
-            isSendingPaused = false
-            print("▶️ [AudioManager] 恢復發送音頻（TTS 已停止）")
-        }
+        // 全雙工模式：無需恢復，音頻一直在發送
     }
 
     /// 啟動播放監控
@@ -567,18 +654,16 @@ final class AudioManager {
     private func flushBuffer() {
         guard !audioBufferCollector.isEmpty else { return }
 
-        // ⭐️ TTS 播放時暫停發送（避免回音被錄到）
-        if isSendingPaused {
-            // 丟棄緩衝區（TTS 播放中的音頻可能包含回音）
-            audioBufferCollector.removeAll()
-            return
-        }
+        // ⭐️ 全雙工模式：TTS 播放時也繼續發送（依賴 AEC 消除回音）
+        // 不再檢查 isSendingPaused，讓音頻持續發送
 
-        // ⭐️ Push-to-Talk 模式：未按住時不發送（不發送靜音避免計費）
+        // ⭐️ Push-to-Talk 模式：未按住時不發送
+        // 注意：不再丟棄緩衝區，保留最近的音頻以便按下時立即發送
         if isManualSendingPaused {
-            // 丟棄緩衝區（沒按住按鈕）
-            // 注意：這會導致 Chirp3 串流超時，但服務器會自動重啟串流
-            audioBufferCollector.removeAll()
+            // 限制緩衝區大小（最多保留 1 秒的音頻 = 4 個 0.25 秒的 chunk）
+            while audioBufferCollector.count > 4 {
+                audioBufferCollector.removeFirst()
+            }
             return
         }
 
