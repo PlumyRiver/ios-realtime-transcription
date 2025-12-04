@@ -545,7 +545,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             return
         }
 
-        print("✂️ [智能翻譯] \(response.segments.count) 段 (interim 模式，等待 VAD commit)")
+        // ⭐️ 顯示 LLM 檢測的語言方向
+        let langInfo = response.detectedLang.map { "\($0) → \(response.translatedTo ?? "?")" } ?? "?"
+        print("✂️ [智能翻譯] \(response.segments.count) 段 (\(langInfo)) (interim 模式)")
 
         // ⭐️ 保存分句結果（等待 VAD commit 時使用）
         pendingSegments = response.segments.compactMap { segment in
@@ -558,8 +560,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         // ⭐️ 在 interim 階段：整段文本作為 interim 發送
         // 不切分，保持完整性
-        // ⭐️ 自動檢測語言（用於 UI 顯示）
-        let detectedLanguage = detectLanguageFromText(originalText)
+        // ⭐️ 使用 LLM 檢測的語言（如果有），否則本地檢測
+        let detectedLanguage = response.detectedLang ?? detectLanguageFromText(originalText)
         let transcript = TranscriptMessage(
             text: originalText,
             isFinal: false,
@@ -614,6 +616,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         let lastCompleteIndex: Int
         let lastCompleteOffset: Int
         let latencyMs: Int?
+        // ⭐️ 新增欄位：LLM 檢測到的語言和翻譯目標
+        let detectedLang: String?
+        let translatedTo: String?
+        let originalText: String?
+        let error: String?
 
         struct Segment: Decodable {
             let original: String
