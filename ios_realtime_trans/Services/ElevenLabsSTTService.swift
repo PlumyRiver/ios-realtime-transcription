@@ -36,6 +36,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var confirmedTextLength: Int = 0  // 已確認（發送為 final）的字符長度
     private var lastConfirmedText: String = ""  // 上次確認的完整文本（用於比對）
 
+    /// ⭐️ 延遲確認機制：避免過早切分（如 "I can speak" + "English"）
+    /// 策略：在 interim 階段只顯示翻譯，不固定句子
+    ///       只有 ElevenLabs VAD commit 時才真正確認句子
+    private var pendingConfirmOffset: Int = 0  // 待確認的 offset（等待 VAD commit）
+    private var pendingSegments: [(original: String, translation: String)] = []  // 待確認的分句結果
+
     /// Token 獲取 URL（從後端服務器獲取）
     private var tokenEndpoint: String = ""
 
@@ -140,6 +146,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         lastTranslatedText = ""
         confirmedTextLength = 0  // 重置分句狀態
         lastConfirmedText = ""
+        pendingConfirmOffset = 0
+        pendingSegments = []
 
         // 發送結束信號
         sendCommit()
@@ -451,77 +459,39 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// ⭐️ 處理智能翻譯響應
-    /// 核心邏輯：基於 lastCompleteOffset 追蹤已確認的字符位置
-    /// - 只發送「新增的已確認部分」作為 final
-    /// - 未確認部分作為 interim（會被後續更新覆蓋）
+    /// 新策略：在 interim 階段「只翻譯，不確認」
+    /// - 所有內容都作為 interim 發送（包括 LLM 認為 complete 的）
+    /// - 只有 ElevenLabs VAD commit 時才真正確認句子
+    /// - 這樣可以避免「I can speak」+「English」的切分問題
     private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
         guard !response.segments.isEmpty else { return }
 
-        let lastCompleteOffset = response.lastCompleteOffset
+        print("✂️ [智能翻譯] \(response.segments.count) 段 (interim 模式，等待 VAD commit)")
 
-        print("✂️ [智能分句] \(response.segments.count) 段, lastCompleteOffset=\(lastCompleteOffset), 已確認=\(confirmedTextLength)")
-
-        // ⭐️ 計算需要新確認的文本
-        // 只有當 lastCompleteOffset 大於 confirmedTextLength 時，才有新的完整句子
-        if lastCompleteOffset > confirmedTextLength {
-            // 提取新確認的部分（從 confirmedTextLength 到 lastCompleteOffset）
-            let startIdx = originalText.index(originalText.startIndex, offsetBy: confirmedTextLength, limitedBy: originalText.endIndex) ?? originalText.endIndex
-            let endIdx = originalText.index(originalText.startIndex, offsetBy: min(lastCompleteOffset, originalText.count), limitedBy: originalText.endIndex) ?? originalText.endIndex
-
-            if startIdx < endIdx {
-                let newConfirmedText = String(originalText[startIdx..<endIdx]).trimmingCharacters(in: .whitespaces)
-
-                // ⭐️ 過濾掉純標點符號（避免發送「。」這種無意義的句子）
-                let meaningfulChars = newConfirmedText.filter { !$0.isPunctuation && !$0.isWhitespace }
-                if !meaningfulChars.isEmpty {
-                    // 發送新確認的文本作為 final
-                    let transcript = TranscriptMessage(
-                        text: newConfirmedText,
-                        isFinal: true,
-                        confidence: 0.95,
-                        language: nil
-                    )
-                    transcriptSubject.send(transcript)
-                    print("✅ [新確認] \(newConfirmedText)")
-
-                    // 找對應的翻譯（從 segments 中匹配）
-                    let matchingTranslation = findTranslationForText(newConfirmedText, in: response.segments)
-                    if let translation = matchingTranslation, !translation.isEmpty {
-                        translationSubject.send((newConfirmedText, translation))
-                        print("   🌐 \(translation)")
-                    }
-                }
-
-                // 更新已確認長度
-                confirmedTextLength = lastCompleteOffset
-                lastConfirmedText = String(originalText.prefix(lastCompleteOffset))
+        // ⭐️ 保存分句結果（等待 VAD commit 時使用）
+        pendingSegments = response.segments.compactMap { segment in
+            if let translation = segment.translation {
+                return (original: segment.original, translation: translation)
             }
+            return nil
         }
+        pendingConfirmOffset = response.lastCompleteOffset
 
-        // ⭐️ 處理未確認部分（interim）
-        // 只取 lastCompleteOffset 之後的部分作為 interim
-        if lastCompleteOffset < originalText.count {
-            let startIdx = originalText.index(originalText.startIndex, offsetBy: lastCompleteOffset, limitedBy: originalText.endIndex) ?? originalText.endIndex
-            let interimText = String(originalText[startIdx...]).trimmingCharacters(in: .whitespaces)
+        // ⭐️ 在 interim 階段：整段文本作為 interim 發送
+        // 不切分，保持完整性
+        let transcript = TranscriptMessage(
+            text: originalText,
+            isFinal: false,
+            confidence: 0.7,
+            language: nil
+        )
+        transcriptSubject.send(transcript)
 
-            if !interimText.isEmpty {
-                // 發送未確認部分作為 interim
-                let transcript = TranscriptMessage(
-                    text: interimText,
-                    isFinal: false,
-                    confidence: 0.7,
-                    language: nil
-                )
-                transcriptSubject.send(transcript)
-
-                // 找對應的翻譯
-                let matchingTranslation = findTranslationForText(interimText, in: response.segments)
-                if let translation = matchingTranslation, !translation.isEmpty {
-                    translationSubject.send((interimText, translation))
-                }
-
-                print("⏳ [interim] \(interimText) → \(matchingTranslation ?? "")")
-            }
+        // ⭐️ 合併所有翻譯作為 interim 翻譯
+        let allTranslations = response.segments.compactMap { $0.translation }.joined(separator: " ")
+        if !allTranslations.isEmpty {
+            translationSubject.send((originalText, allTranslations))
+            print("⏳ [interim] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
         }
     }
 
@@ -683,6 +653,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "committed_transcript_with_timestamps":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
+                print("🔒 [VAD Commit] 確認句子: \(transcriptText.prefix(40))...")
+
                 // 打印時間戳
                 if let words = response.words {
                     for word in words.prefix(3) {
@@ -690,28 +662,40 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     }
                 }
 
-                // ⭐️ 計算還沒被確認的部分（基於字符位置）
-                if confirmedTextLength < transcriptText.count {
-                    let startIdx = transcriptText.index(transcriptText.startIndex, offsetBy: confirmedTextLength, limitedBy: transcriptText.endIndex) ?? transcriptText.endIndex
-                    let unconfirmedText = String(transcriptText[startIdx...]).trimmingCharacters(in: .whitespaces)
+                // ⭐️ VAD commit 時才真正確認句子
+                // 使用之前保存的 pendingSegments（如果有的話）
+                if !pendingSegments.isEmpty {
+                    // 使用智能分句的結果
+                    for (original, translation) in pendingSegments {
+                        let meaningfulChars = original.filter { !$0.isPunctuation && !$0.isWhitespace }
+                        guard !meaningfulChars.isEmpty else { continue }
 
-                    // ⭐️ 過濾純標點符號
-                    let meaningfulChars = unconfirmedText.filter { !$0.isPunctuation && !$0.isWhitespace }
-
-                    if !meaningfulChars.isEmpty {
-                        // 發送剩餘的文本作為 final
                         let transcript = TranscriptMessage(
-                            text: unconfirmedText,
+                            text: original,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0.9,
+                            language: response.detectedLanguage
+                        )
+                        transcriptSubject.send(transcript)
+                        translationSubject.send((original, translation))
+                        print("✅ [確認] \(original) → \(translation)")
+                    }
+                } else {
+                    // 沒有分句結果，整段作為一個句子
+                    let meaningfulChars = transcriptText.filter { !$0.isPunctuation && !$0.isWhitespace }
+                    if !meaningfulChars.isEmpty {
+                        let transcript = TranscriptMessage(
+                            text: transcriptText,
                             isFinal: true,
                             confidence: response.confidence ?? 0,
                             language: response.detectedLanguage
                         )
                         transcriptSubject.send(transcript)
-                        print("✅ [Final 剩餘] \(unconfirmedText)")
+                        print("✅ [確認-整段] \(transcriptText)")
 
-                        // 翻譯剩餘文本
+                        // 翻譯
                         Task {
-                            await self.translateTextDirectly(unconfirmedText, isInterim: false)
+                            await self.translateTextDirectly(transcriptText, isInterim: false)
                         }
                     }
                 }
@@ -721,6 +705,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 lastInterimLength = 0
                 confirmedTextLength = 0
                 lastConfirmedText = ""
+                pendingConfirmOffset = 0
+                pendingSegments = []
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
