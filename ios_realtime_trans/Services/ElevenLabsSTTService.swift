@@ -32,6 +32,19 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var lastInterimLength: Int = 0  // 上次 interim 長度（用於檢測是否變長）
     private var lastTranslatedText: String = ""  // 上次翻譯的文本（避免重複翻譯）
 
+    /// ⭐️ 即時分句：基於標點符號（。.!?！？）
+    private var processedTextLength: Int = 0  // 已處理（已分句）的文本長度
+    private let sentenceEndingChars: Set<Character> = ["。", ".", "!", "?", "！", "？"]
+    private let minSentenceLength = 20  // 最小分句長度：不超過此長度不分句
+
+    /// ⭐️ 分句冷卻機制（避免切太碎）
+    private var lastSegmentTime: Date?  // 上次分句時間
+    private let segmentCooldown: TimeInterval = 2.0  // 分句冷卻時間（秒）
+
+    /// ⭐️ 基於翻譯結果的分句
+    private var pendingInterimForSegment: String = ""  // 等待分句判定的 interim 原文
+    private var lastTranslationEndedWithPunctuation = false  // 上次翻譯是否以標點結尾
+
     /// Token 獲取 URL（從後端服務器獲取）
     private var tokenEndpoint: String = ""
 
@@ -66,6 +79,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// 模型 ID
     private let modelId = "scribe_v2_realtime"
+
+    /// ⭐️ 分句閾值：超過此長度的 final 結果會自動分句
+    private let segmentThreshold = 30
 
     // MARK: - Public Methods
 
@@ -131,6 +147,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         currentInterimText = ""
         lastInterimLength = 0
         lastTranslatedText = ""
+        processedTextLength = 0  // 重置分句狀態
+        pendingInterimForSegment = ""
+        lastTranslationEndedWithPunctuation = false
+        lastSegmentTime = nil  // 重置分句冷卻
 
         // 發送結束信號
         sendCommit()
@@ -147,12 +167,27 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         sendCommit()
     }
 
+    /// 發送錯誤計數（避免刷屏）
+    private var sendErrorCount = 0
+    private let maxSendErrorLogs = 3
+
     /// 發送音頻數據
     func sendAudio(data: Data) {
         guard connectionState == .connected else {
             if sendCount == 0 {
                 print("⚠️ [ElevenLabs] 未連接，無法發送音頻")
             }
+            return
+        }
+
+        // 檢查 WebSocket 是否有效
+        guard let task = webSocketTask, task.state == .running else {
+            if sendErrorCount < maxSendErrorLogs {
+                print("⚠️ [ElevenLabs] WebSocket 已關閉，停止發送")
+                sendErrorCount += 1
+            }
+            // 更新連接狀態
+            connectionState = .disconnected
             return
         }
 
@@ -172,10 +207,20 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             let jsonData = try JSONSerialization.data(withJSONObject: audioMessage)
             if let jsonString = String(data: jsonData, encoding: .utf8) {
                 let message = URLSessionWebSocketTask.Message.string(jsonString)
-                webSocketTask?.send(message) { [weak self] error in
+                task.send(message) { [weak self] error in
                     if let error {
-                        print("❌ [ElevenLabs] 發送音頻錯誤: \(error.localizedDescription)")
-                        self?.errorSubject.send("發送音頻失敗")
+                        guard let self else { return }
+                        // 只打印前幾次錯誤，避免刷屏
+                        if self.sendErrorCount < self.maxSendErrorLogs {
+                            print("❌ [ElevenLabs] 發送音頻錯誤: \(error.localizedDescription)")
+                            self.sendErrorCount += 1
+                        }
+                        // 如果是連接取消錯誤，更新狀態
+                        if error.localizedDescription.contains("canceled") || error.localizedDescription.contains("timed out") {
+                            Task { @MainActor in
+                                self.connectionState = .disconnected
+                            }
+                        }
                     }
                 }
             }
@@ -371,8 +416,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
-    /// 直接翻譯文本（不檢查 isFinal）
-    private func translateTextDirectly(_ text: String) async {
+    /// 直接翻譯文本
+    /// - Parameters:
+    ///   - text: 要翻譯的文本
+    ///   - isInterim: 是否為 interim 翻譯（用於分句判斷，預設 true）
+    private func translateTextDirectly(_ text: String, isInterim: Bool = true) async {
         // 判斷翻譯方向
         let sourceLangCode = currentSourceLang.rawValue
         let targetLangCode = currentTargetLang.rawValue
@@ -388,7 +436,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             translateTo = (sourceLangCode == "zh") ? sourceLangCode : targetLangCode
         }
 
-        await callTranslationAPI(text: text, targetLang: translateTo)
+        await callTranslationAPI(text: text, targetLang: translateTo, isInterim: isInterim)
     }
 
     private func sendPing() {
@@ -453,18 +501,77 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
-                let transcript = TranscriptMessage(
-                    text: transcriptText,
-                    isFinal: false,
-                    confidence: response.confidence ?? 0,
-                    language: response.detectedLanguage
-                )
+                // ⭐️ 即時分句：檢查是否有新的完整句子（基於標點符號）
+                let newText = transcriptText
+                let confidence = response.confidence ?? 0
+                let language = response.detectedLanguage
 
-                transcriptSubject.send(transcript)
-                print("⋯ [ElevenLabs interim] \(transcriptText) (長度:\(transcriptText.count))")
+                // 只檢查新增的部分
+                if newText.count > processedTextLength {
+                    let startIndex = newText.index(newText.startIndex, offsetBy: processedTextLength)
+                    let newPortion = String(newText[startIndex...])
 
-                // ⭐️ 更新 interim 文本（定時翻譯會自動檢測長度變化）
-                currentInterimText = transcriptText
+                    // 找到最後一個句號的位置
+                    if let lastSentenceEnd = newPortion.lastIndex(where: { sentenceEndingChars.contains($0) }) {
+                        // 計算完整句子的結束位置（在原文中的位置）
+                        let sentenceEndOffset = newText.distance(from: newText.startIndex, to: newText.index(startIndex, offsetBy: newPortion.distance(from: newPortion.startIndex, to: lastSentenceEnd)))
+
+                        // 提取完整的句子（從上次處理的位置到句號）
+                        let completedText = String(newText[newText.index(newText.startIndex, offsetBy: processedTextLength)...newText.index(newText.startIndex, offsetBy: sentenceEndOffset)])
+
+                        // ⭐️ 檢查是否在冷卻期內
+                        let isInCooldown = lastSegmentTime.map { Date().timeIntervalSince($0) < segmentCooldown } ?? false
+
+                        // ⭐️ 只有超過最小長度 且 不在冷卻期 才分句
+                        if !completedText.isEmpty && completedText.count >= minSentenceLength && !isInCooldown {
+                            // 發送完成的句子作為 final
+                            let completedTranscript = TranscriptMessage(
+                                text: completedText,
+                                isFinal: true,
+                                confidence: confidence,
+                                language: language
+                            )
+                            transcriptSubject.send(completedTranscript)
+                            print("✅ [即時分句] \(completedText) (\(completedText.count)字)")
+
+                            // 翻譯完成的句子（已是 final，不需要分句判斷）
+                            Task {
+                                await self.translateTextDirectly(completedText, isInterim: false)
+                            }
+
+                            // 更新已處理長度 & 記錄分句時間
+                            processedTextLength = sentenceEndOffset + 1
+                            lastSegmentTime = Date()
+                        } else if !completedText.isEmpty && isInCooldown {
+                            let remaining = segmentCooldown - (Date().timeIntervalSince(lastSegmentTime ?? Date()))
+                            print("❄️ [冷卻中] \(completedText) (還需 \(String(format: "%.1f", remaining))秒)")
+                        } else if !completedText.isEmpty {
+                            print("⏳ [跳過分句] \(completedText) (\(completedText.count)字 < \(minSentenceLength)字)")
+                        }
+                    }
+                }
+
+                // 發送剩餘部分作為 interim
+                let remainingText: String
+                if processedTextLength < newText.count {
+                    remainingText = String(newText[newText.index(newText.startIndex, offsetBy: processedTextLength)...])
+                } else {
+                    remainingText = ""
+                }
+
+                if !remainingText.isEmpty {
+                    let transcript = TranscriptMessage(
+                        text: remainingText,
+                        isFinal: false,
+                        confidence: confidence,
+                        language: language
+                    )
+                    transcriptSubject.send(transcript)
+                    print("⋯ [interim] \(remainingText)")
+                }
+
+                // 更新 interim 文本（用於定時翻譯）
+                currentInterimText = remainingText
 
             case "committed_transcript":
                 // ⭐️ 忽略此訊息，只處理 committed_transcript_with_timestamps
@@ -475,17 +582,6 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "committed_transcript_with_timestamps":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
-                let transcript = TranscriptMessage(
-                    text: transcriptText,
-                    isFinal: true,
-                    confidence: response.confidence ?? 0,
-                    language: response.detectedLanguage
-                )
-
-                // ⭐️ 只在這裡發送（避免重複）
-                transcriptSubject.send(transcript)
-                print("✅ [ElevenLabs] \(transcriptText)")
-
                 // 打印時間戳
                 if let words = response.words {
                     for word in words.prefix(3) {
@@ -493,17 +589,31 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     }
                 }
 
-                // ⭐️ 重置 interim 狀態（準備下一句）
-                currentInterimText = ""
-                lastInterimLength = 0
+                // ⭐️ 處理剩餘未分句的文本（從 processedTextLength 到結尾）
+                let remainingStart = min(processedTextLength, transcriptText.count)
+                if remainingStart < transcriptText.count {
+                    let remainingText = String(transcriptText[transcriptText.index(transcriptText.startIndex, offsetBy: remainingStart)...])
+                    if !remainingText.isEmpty {
+                        let transcript = TranscriptMessage(
+                            text: remainingText,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0,
+                            language: response.detectedLanguage
+                        )
+                        transcriptSubject.send(transcript)
+                        print("✅ [Final 剩餘] \(remainingText)")
 
-                // ⭐️ 翻譯最終結果（如果與上次翻譯不同）
-                if transcriptText != lastTranslatedText {
-                    lastTranslatedText = transcriptText
-                    Task {
-                        await translateTextDirectly(transcriptText)
+                        // 翻譯剩餘文本（已是 final，不需要分句判斷）
+                        Task {
+                            await self.translateTextDirectly(remainingText, isInterim: false)
+                        }
                     }
                 }
+
+                // ⭐️ 重置所有狀態（準備下一輪）
+                currentInterimText = ""
+                lastInterimLength = 0
+                processedTextLength = 0
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
@@ -525,10 +635,104 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
+    // MARK: - 分句功能
+
+    /// 調用後端分句 API，將長文本分成多個有意義的句子
+    private func segmentAndSend(_ text: String, confidence: Double, language: String?) async {
+        let segmentURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/segment")
+
+        guard let url = URL(string: segmentURL) else {
+            // 分句失敗，發送原文
+            await sendSingleTranscript(text, confidence: confidence, language: language)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "text": text,
+            "sourceLang": currentSourceLang.rawValue,
+            "targetLang": currentTargetLang.rawValue
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (data, _) = try await URLSession.shared.data(for: request)
+
+            // 解析分句結果
+            struct SegmentResponse: Decodable {
+                let segments: [Segment]
+                let latencyMs: Int?
+
+                struct Segment: Decodable {
+                    let original: String
+                    let translation: String?
+                }
+            }
+
+            let response = try JSONDecoder().decode(SegmentResponse.self, from: data)
+
+            print("✂️ [分句] 分成 \(response.segments.count) 句 (\(response.latencyMs ?? 0)ms)")
+
+            // 逐個發送分句結果
+            await MainActor.run {
+                for (index, segment) in response.segments.enumerated() {
+                    let transcript = TranscriptMessage(
+                        text: segment.original,
+                        isFinal: true,
+                        confidence: confidence,
+                        language: language
+                    )
+
+                    // 發送轉錄
+                    transcriptSubject.send(transcript)
+                    print("   ✅ [\(index + 1)] \(segment.original)")
+
+                    // 發送翻譯（如果有）
+                    if let translation = segment.translation, !translation.isEmpty {
+                        translationSubject.send((segment.original, translation))
+                        print("   🌐 [\(index + 1)] \(translation)")
+                    }
+                }
+            }
+
+        } catch {
+            print("❌ [分句] 錯誤: \(error.localizedDescription)")
+            // 分句失敗，發送原文
+            await sendSingleTranscript(text, confidence: confidence, language: language)
+        }
+    }
+
+    /// 發送單一轉錄（分句失敗時的後備方案）
+    private func sendSingleTranscript(_ text: String, confidence: Double, language: String?) async {
+        await MainActor.run {
+            let transcript = TranscriptMessage(
+                text: text,
+                isFinal: true,
+                confidence: confidence,
+                language: language
+            )
+            transcriptSubject.send(transcript)
+            print("✅ [ElevenLabs] \(text)")
+        }
+
+        // 翻譯
+        if text != lastTranslatedText {
+            lastTranslatedText = text
+            await translateTextDirectly(text)
+        }
+    }
+
     // MARK: - 翻譯功能
 
     /// 調用後端翻譯 API
-    private func callTranslationAPI(text: String, targetLang: String) async {
+    /// - Parameters:
+    ///   - text: 要翻譯的原文
+    ///   - targetLang: 目標語言
+    ///   - isInterim: 是否為 interim 翻譯（用於分句判斷）
+    private func callTranslationAPI(text: String, targetLang: String, isInterim: Bool = false) async {
         // 使用現有的後端翻譯端點
         let translateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/translate")
 
@@ -553,10 +757,49 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             }
 
             let response = try JSONDecoder().decode(TranslateResponse.self, from: data)
+            let translatedText = response.translatedText
+
+            // ⭐️ 檢查翻譯結果是否以標點符號結尾
+            let endsWithPunctuation = translatedText.last.map { sentenceEndingChars.contains($0) } ?? false
 
             await MainActor.run {
-                translationSubject.send((text, response.translatedText))
-                print("🌐 [ElevenLabs 翻譯] \(response.translatedText)")
+                // 發送翻譯結果
+                translationSubject.send((text, translatedText))
+
+                // ⭐️ 檢查是否在冷卻期內
+                let isInCooldown = self.lastSegmentTime.map { Date().timeIntervalSince($0) < self.segmentCooldown } ?? false
+
+                // ⭐️ 如果是 interim 且翻譯以標點結尾 → 這是完整句子，升級為 final
+                // ⭐️ 但要超過最小長度 且 不在冷卻期 才分句
+                if isInterim && endsWithPunctuation && !text.isEmpty && text.count >= self.minSentenceLength && !isInCooldown {
+                    print("✂️ [翻譯分句] 翻譯以標點結尾，升級為 final: \"\(text)\" (\(text.count)字)")
+
+                    // 發送完整句子作為 final
+                    let transcript = TranscriptMessage(
+                        text: text,
+                        isFinal: true,
+                        confidence: 0.9,
+                        language: nil
+                    )
+                    transcriptSubject.send(transcript)
+
+                    // 更新已處理長度（跳過這段文本）& 記錄分句時間
+                    processedTextLength += text.count
+                    currentInterimText = ""
+                    lastInterimLength = 0
+                    lastSegmentTime = Date()
+
+                    print("✅ [翻譯分句] \(text) → \(translatedText)")
+                } else if isInterim && endsWithPunctuation && isInCooldown {
+                    let remaining = self.segmentCooldown - (Date().timeIntervalSince(self.lastSegmentTime ?? Date()))
+                    print("❄️ [冷卻中] \(text) (還需 \(String(format: "%.1f", remaining))秒)")
+                    print("🌐 [翻譯] \(translatedText)")
+                } else if isInterim && endsWithPunctuation && text.count < self.minSentenceLength {
+                    print("⏳ [跳過翻譯分句] \(text) (\(text.count)字 < \(self.minSentenceLength)字)")
+                    print("🌐 [翻譯] \(translatedText)")
+                } else {
+                    print("🌐 [翻譯] \(translatedText)")
+                }
             }
 
         } catch {
@@ -576,6 +819,7 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
         Task { @MainActor in
             print("✅ [ElevenLabs] WebSocket 連接成功")
             self.connectionState = .connected
+            self.sendErrorCount = 0  // 重置錯誤計數
             self.startPingTimer()
             self.startTranslationTimer()  // ⭐️ 啟動定時翻譯
         }
