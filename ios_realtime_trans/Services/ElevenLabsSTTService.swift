@@ -440,20 +440,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, _) = try await URLSession.shared.data(for: request)
 
-            // 解析智能翻譯結果
-            struct SmartTranslateResponse: Decodable {
-                let segments: [Segment]
-                let lastCompleteIndex: Int
-                let lastCompleteOffset: Int
-                let latencyMs: Int?
-
-                struct Segment: Decodable {
-                    let original: String
-                    let translation: String?
-                    let isComplete: Bool
-                }
-            }
-
+            // 解析智能翻譯結果（使用類別級別的 SmartTranslateResponse）
             let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
 
             await MainActor.run {
