@@ -25,25 +25,19 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var pingTimer: Timer?
     private let pingInterval: TimeInterval = 20.0
 
-    /// ⭐️ 定時翻譯計時器（用於 interim 結果）
+    /// ⭐️ 定時智能翻譯計時器（用於 interim 結果）
     private var translationTimer: Timer?
     private let translationInterval: TimeInterval = 0.5  // 每 0.5 秒檢查一次
-    private var currentInterimText: String = ""  // 當前 interim 文本
+    private var currentInterimText: String = ""  // 當前累積的 interim 文本（完整）
     private var lastInterimLength: Int = 0  // 上次 interim 長度（用於檢測是否變長）
     private var lastTranslatedText: String = ""  // 上次翻譯的文本（避免重複翻譯）
 
-    /// ⭐️ 即時分句：基於標點符號（。.!?！？）
-    private var processedTextLength: Int = 0  // 已處理（已分句）的文本長度
-    private let sentenceEndingChars: Set<Character> = ["。", ".", "!", "?", "！", "？"]
-    private let minSentenceLength = 20  // 最小分句長度：不超過此長度不分句
+    /// ⭐️ 智能分句：由 Cerebras LLM 判斷語義完整性
+    private var completedTextLength: Int = 0  // 已確認完成的文本長度（不會再改變）
 
-    /// ⭐️ 分句冷卻機制（避免切太碎）
-    private var lastSegmentTime: Date?  // 上次分句時間
-    private let segmentCooldown: TimeInterval = 2.0  // 分句冷卻時間（秒）
-
-    /// ⭐️ 基於翻譯結果的分句
-    private var pendingInterimForSegment: String = ""  // 等待分句判定的 interim 原文
-    private var lastTranslationEndedWithPunctuation = false  // 上次翻譯是否以標點結尾
+    /// ⭐️ 已確認完成的句子（不會再更新）
+    private var confirmedSegments: [String] = []  // 已確認的原文句子
+    private var confirmedTranslations: [String] = []  // 對應的翻譯
 
     /// Token 獲取 URL（從後端服務器獲取）
     private var tokenEndpoint: String = ""
@@ -147,10 +141,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         currentInterimText = ""
         lastInterimLength = 0
         lastTranslatedText = ""
-        processedTextLength = 0  // 重置分句狀態
-        pendingInterimForSegment = ""
-        lastTranslationEndedWithPunctuation = false
-        lastSegmentTime = nil  // 重置分句冷卻
+        completedTextLength = 0  // 重置分句狀態
+        confirmedSegments = []
+        confirmedTranslations = []
 
         // 發送結束信號
         sendCommit()
@@ -388,7 +381,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         translationTimer = nil
     }
 
-    /// 檢查並翻譯 interim 結果
+    /// 檢查並調用智能翻譯（含分句判斷）
     private func checkAndTranslateInterim() {
         let currentLength = currentInterimText.count
 
@@ -408,11 +401,141 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         lastInterimLength = currentLength
         lastTranslatedText = currentInterimText
 
-        print("📝 [定時翻譯] 長度變長 \(previousLength) → \(currentLength)，開始翻譯")
+        print("📝 [智能翻譯] 長度變長 \(previousLength) → \(currentLength)，調用 smart-translate")
 
-        // 執行翻譯
+        // ⭐️ 調用智能翻譯 API（含分句判斷）
         Task {
-            await translateTextDirectly(currentInterimText)
+            await callSmartTranslateAPI(text: currentInterimText)
+        }
+    }
+
+    /// ⭐️ 調用智能翻譯 + 分句 API
+    /// Cerebras 會同時翻譯並判斷哪些句子「語義完整」
+    private func callSmartTranslateAPI(text: String) async {
+        let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
+
+        guard let url = URL(string: smartTranslateURL) else { return }
+
+        // 判斷翻譯方向
+        let chineseCount = text.unicodeScalars.filter { $0.value >= 0x4E00 && $0.value <= 0x9FFF }.count
+        let isChineseText = chineseCount > text.count / 3
+        let targetLang: String
+        if isChineseText {
+            targetLang = (currentTargetLang.rawValue == "zh") ? currentSourceLang.rawValue : currentTargetLang.rawValue
+        } else {
+            targetLang = (currentSourceLang.rawValue == "zh") ? currentSourceLang.rawValue : currentTargetLang.rawValue
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "text": text,
+            "targetLang": targetLang,
+            "mode": "streaming"
+        ]
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (data, _) = try await URLSession.shared.data(for: request)
+
+            // 解析智能翻譯結果
+            struct SmartTranslateResponse: Decodable {
+                let segments: [Segment]
+                let lastCompleteIndex: Int
+                let lastCompleteOffset: Int
+                let latencyMs: Int?
+
+                struct Segment: Decodable {
+                    let original: String
+                    let translation: String?
+                    let isComplete: Bool
+                }
+            }
+
+            let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
+
+            await MainActor.run {
+                processSmartTranslateResponse(response, originalText: text)
+            }
+
+        } catch {
+            print("❌ [智能翻譯] 錯誤: \(error.localizedDescription)")
+            // 備用方案：使用普通翻譯
+            await translateTextDirectly(text, isInterim: true)
+        }
+    }
+
+    /// ⭐️ 處理智能翻譯響應
+    /// 將已完成的句子固定為 final，未完成的保持 interim
+    private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
+        guard !response.segments.isEmpty else { return }
+
+        print("✂️ [智能分句] 收到 \(response.segments.count) 個段落，lastCompleteIndex=\(response.lastCompleteIndex)")
+
+        for (index, segment) in response.segments.enumerated() {
+            let isComplete = segment.isComplete
+
+            if isComplete {
+                // ⭐️ 這個句子已經「語義完整」，固定為 final
+                let alreadyConfirmed = confirmedSegments.contains(segment.original)
+
+                if !alreadyConfirmed {
+                    // 新的完整句子：發送 final transcript
+                    let transcript = TranscriptMessage(
+                        text: segment.original,
+                        isFinal: true,
+                        confidence: 0.95,
+                        language: nil
+                    )
+                    transcriptSubject.send(transcript)
+                    confirmedSegments.append(segment.original)
+
+                    // 發送翻譯
+                    if let translation = segment.translation, !translation.isEmpty {
+                        translationSubject.send((segment.original, translation))
+                        confirmedTranslations.append(translation)
+                    }
+
+                    print("✅ [分句固定] \(segment.original) → \(segment.translation ?? "")")
+                }
+            } else {
+                // ⭐️ 這個句子還沒說完，顯示為 interim
+                let transcript = TranscriptMessage(
+                    text: segment.original,
+                    isFinal: false,
+                    confidence: 0.7,
+                    language: nil
+                )
+                transcriptSubject.send(transcript)
+
+                // 也發送 interim 翻譯（讓用戶即時看到）
+                if let translation = segment.translation, !translation.isEmpty {
+                    translationSubject.send((segment.original, translation))
+                }
+
+                print("⏳ [interim] \(segment.original) → \(segment.translation ?? "")")
+            }
+        }
+
+        // 更新已完成的文本長度
+        if response.lastCompleteOffset > 0 {
+            completedTextLength = response.lastCompleteOffset
+        }
+    }
+
+    /// SmartTranslateResponse 結構（用於解碼）
+    private struct SmartTranslateResponse: Decodable {
+        let segments: [Segment]
+        let lastCompleteIndex: Int
+        let lastCompleteOffset: Int
+        let latencyMs: Int?
+
+        struct Segment: Decodable {
+            let original: String
+            let translation: String?
+            let isComplete: Bool
         }
     }
 
@@ -501,77 +624,23 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
-                // ⭐️ 即時分句：檢查是否有新的完整句子（基於標點符號）
-                let newText = transcriptText
+                // ⭐️ 簡化版：只累積 interim 文本，分句由 smart-translate API 處理
                 let confidence = response.confidence ?? 0
                 let language = response.detectedLanguage
 
-                // 只檢查新增的部分
-                if newText.count > processedTextLength {
-                    let startIndex = newText.index(newText.startIndex, offsetBy: processedTextLength)
-                    let newPortion = String(newText[startIndex...])
+                // 發送 interim transcript（UI 顯示用）
+                let transcript = TranscriptMessage(
+                    text: transcriptText,
+                    isFinal: false,
+                    confidence: confidence,
+                    language: language
+                )
+                transcriptSubject.send(transcript)
+                print("⋯ [interim] \(transcriptText)")
 
-                    // 找到最後一個句號的位置
-                    if let lastSentenceEnd = newPortion.lastIndex(where: { sentenceEndingChars.contains($0) }) {
-                        // 計算完整句子的結束位置（在原文中的位置）
-                        let sentenceEndOffset = newText.distance(from: newText.startIndex, to: newText.index(startIndex, offsetBy: newPortion.distance(from: newPortion.startIndex, to: lastSentenceEnd)))
-
-                        // 提取完整的句子（從上次處理的位置到句號）
-                        let completedText = String(newText[newText.index(newText.startIndex, offsetBy: processedTextLength)...newText.index(newText.startIndex, offsetBy: sentenceEndOffset)])
-
-                        // ⭐️ 檢查是否在冷卻期內
-                        let isInCooldown = lastSegmentTime.map { Date().timeIntervalSince($0) < segmentCooldown } ?? false
-
-                        // ⭐️ 只有超過最小長度 且 不在冷卻期 才分句
-                        if !completedText.isEmpty && completedText.count >= minSentenceLength && !isInCooldown {
-                            // 發送完成的句子作為 final
-                            let completedTranscript = TranscriptMessage(
-                                text: completedText,
-                                isFinal: true,
-                                confidence: confidence,
-                                language: language
-                            )
-                            transcriptSubject.send(completedTranscript)
-                            print("✅ [即時分句] \(completedText) (\(completedText.count)字)")
-
-                            // 翻譯完成的句子（已是 final，不需要分句判斷）
-                            Task {
-                                await self.translateTextDirectly(completedText, isInterim: false)
-                            }
-
-                            // 更新已處理長度 & 記錄分句時間
-                            processedTextLength = sentenceEndOffset + 1
-                            lastSegmentTime = Date()
-                        } else if !completedText.isEmpty && isInCooldown {
-                            let remaining = segmentCooldown - (Date().timeIntervalSince(lastSegmentTime ?? Date()))
-                            print("❄️ [冷卻中] \(completedText) (還需 \(String(format: "%.1f", remaining))秒)")
-                        } else if !completedText.isEmpty {
-                            print("⏳ [跳過分句] \(completedText) (\(completedText.count)字 < \(minSentenceLength)字)")
-                        }
-                    }
-                }
-
-                // 發送剩餘部分作為 interim
-                let remainingText: String
-                if processedTextLength < newText.count {
-                    remainingText = String(newText[newText.index(newText.startIndex, offsetBy: processedTextLength)...])
-                } else {
-                    remainingText = ""
-                }
-
-                if !remainingText.isEmpty {
-                    let transcript = TranscriptMessage(
-                        text: remainingText,
-                        isFinal: false,
-                        confidence: confidence,
-                        language: language
-                    )
-                    transcriptSubject.send(transcript)
-                    print("⋯ [interim] \(remainingText)")
-                }
-
-                // 更新 interim 文本（用於定時翻譯）
-                currentInterimText = remainingText
+                // ⭐️ 更新 interim 文本（用於定時智能翻譯）
+                // 注意：這裡保存完整的 interim，讓 smart-translate API 來判斷分句
+                currentInterimText = transcriptText
 
             case "committed_transcript":
                 // ⭐️ 忽略此訊息，只處理 committed_transcript_with_timestamps
@@ -589,31 +658,39 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     }
                 }
 
-                // ⭐️ 處理剩餘未分句的文本（從 processedTextLength 到結尾）
-                let remainingStart = min(processedTextLength, transcriptText.count)
-                if remainingStart < transcriptText.count {
-                    let remainingText = String(transcriptText[transcriptText.index(transcriptText.startIndex, offsetBy: remainingStart)...])
-                    if !remainingText.isEmpty {
-                        let transcript = TranscriptMessage(
-                            text: remainingText,
-                            isFinal: true,
-                            confidence: response.confidence ?? 0,
-                            language: response.detectedLanguage
-                        )
-                        transcriptSubject.send(transcript)
-                        print("✅ [Final 剩餘] \(remainingText)")
+                // ⭐️ 計算還沒被確認的部分（智能分句可能已經處理了一些）
+                // 找出還沒發送過的文本
+                var unconfirmedText = transcriptText
+                for confirmed in confirmedSegments {
+                    if let range = unconfirmedText.range(of: confirmed) {
+                        unconfirmedText.removeSubrange(range)
+                    }
+                }
+                unconfirmedText = unconfirmedText.trimmingCharacters(in: .whitespaces)
 
-                        // 翻譯剩餘文本（已是 final，不需要分句判斷）
-                        Task {
-                            await self.translateTextDirectly(remainingText, isInterim: false)
-                        }
+                if !unconfirmedText.isEmpty {
+                    // 發送剩餘的文本作為 final
+                    let transcript = TranscriptMessage(
+                        text: unconfirmedText,
+                        isFinal: true,
+                        confidence: response.confidence ?? 0,
+                        language: response.detectedLanguage
+                    )
+                    transcriptSubject.send(transcript)
+                    print("✅ [Final 剩餘] \(unconfirmedText)")
+
+                    // 翻譯剩餘文本
+                    Task {
+                        await self.translateTextDirectly(unconfirmedText, isInterim: false)
                     }
                 }
 
                 // ⭐️ 重置所有狀態（準備下一輪）
                 currentInterimText = ""
                 lastInterimLength = 0
-                processedTextLength = 0
+                completedTextLength = 0
+                confirmedSegments = []
+                confirmedTranslations = []
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
@@ -725,13 +802,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
-    // MARK: - 翻譯功能
+    // MARK: - 翻譯功能（備用，當智能翻譯失敗時使用）
 
-    /// 調用後端翻譯 API
+    /// 調用後端翻譯 API（簡單版，不含分句）
     /// - Parameters:
     ///   - text: 要翻譯的原文
     ///   - targetLang: 目標語言
-    ///   - isInterim: 是否為 interim 翻譯（用於分句判斷）
+    ///   - isInterim: 是否為 interim 翻譯
     private func callTranslationAPI(text: String, targetLang: String, isInterim: Bool = false) async {
         // 使用現有的後端翻譯端點
         let translateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/translate")
@@ -759,47 +836,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             let response = try JSONDecoder().decode(TranslateResponse.self, from: data)
             let translatedText = response.translatedText
 
-            // ⭐️ 檢查翻譯結果是否以標點符號結尾
-            let endsWithPunctuation = translatedText.last.map { sentenceEndingChars.contains($0) } ?? false
-
             await MainActor.run {
                 // 發送翻譯結果
                 translationSubject.send((text, translatedText))
-
-                // ⭐️ 檢查是否在冷卻期內
-                let isInCooldown = self.lastSegmentTime.map { Date().timeIntervalSince($0) < self.segmentCooldown } ?? false
-
-                // ⭐️ 如果是 interim 且翻譯以標點結尾 → 這是完整句子，升級為 final
-                // ⭐️ 但要超過最小長度 且 不在冷卻期 才分句
-                if isInterim && endsWithPunctuation && !text.isEmpty && text.count >= self.minSentenceLength && !isInCooldown {
-                    print("✂️ [翻譯分句] 翻譯以標點結尾，升級為 final: \"\(text)\" (\(text.count)字)")
-
-                    // 發送完整句子作為 final
-                    let transcript = TranscriptMessage(
-                        text: text,
-                        isFinal: true,
-                        confidence: 0.9,
-                        language: nil
-                    )
-                    transcriptSubject.send(transcript)
-
-                    // 更新已處理長度（跳過這段文本）& 記錄分句時間
-                    processedTextLength += text.count
-                    currentInterimText = ""
-                    lastInterimLength = 0
-                    lastSegmentTime = Date()
-
-                    print("✅ [翻譯分句] \(text) → \(translatedText)")
-                } else if isInterim && endsWithPunctuation && isInCooldown {
-                    let remaining = self.segmentCooldown - (Date().timeIntervalSince(self.lastSegmentTime ?? Date()))
-                    print("❄️ [冷卻中] \(text) (還需 \(String(format: "%.1f", remaining))秒)")
-                    print("🌐 [翻譯] \(translatedText)")
-                } else if isInterim && endsWithPunctuation && text.count < self.minSentenceLength {
-                    print("⏳ [跳過翻譯分句] \(text) (\(text.count)字 < \(self.minSentenceLength)字)")
-                    print("🌐 [翻譯] \(translatedText)")
-                } else {
-                    print("🌐 [翻譯] \(translatedText)")
-                }
+                print("🌐 [翻譯] \(translatedText)")
             }
 
         } catch {
