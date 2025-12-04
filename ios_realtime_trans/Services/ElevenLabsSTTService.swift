@@ -42,6 +42,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var pendingConfirmOffset: Int = 0  // 待確認的 offset（等待 VAD commit）
     private var pendingSegments: [(original: String, translation: String)] = []  // 待確認的分句結果
 
+    /// ⭐️ 防止 race condition：VAD commit 後忽略舊的 async 翻譯回調
+    /// 當 VAD commit 時設為 true，收到新 partial 時設為 false
+    private var isCommitted: Bool = false
+
     /// Token 獲取 URL（從後端服務器獲取）
     private var tokenEndpoint: String = ""
 
@@ -148,6 +152,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         lastConfirmedText = ""
         pendingConfirmOffset = 0
         pendingSegments = []
+        isCommitted = false  // 重置 commit 狀態
 
         // 發送結束信號
         sendCommit()
@@ -466,6 +471,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
         guard !response.segments.isEmpty else { return }
 
+        // ⭐️ 防止 race condition：如果已經 commit，忽略這個舊的回調
+        guard !isCommitted else {
+            print("⚠️ [智能翻譯] 已 commit，忽略舊回調: \(originalText.prefix(30))...")
+            return
+        }
+
         print("✂️ [智能翻譯] \(response.segments.count) 段 (interim 模式，等待 VAD commit)")
 
         // ⭐️ 保存分句結果（等待 VAD commit 時使用）
@@ -626,6 +637,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
+                // ⭐️ 收到新的 partial，解除 commit 狀態
+                // 這樣新的翻譯回調才會被處理
+                isCommitted = false
+
                 // ⭐️ 只更新 currentInterimText，不發送 interim
                 // interim 由 processSmartTranslateResponse 統一發送（帶翻譯）
                 // 避免重複發送導致 UI 混亂
@@ -640,6 +655,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
             case "committed_transcript_with_timestamps":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
+
+                // ⭐️ 標記為已 commit，讓後續的 async 翻譯回調被忽略
+                isCommitted = true
 
                 print("🔒 [VAD Commit] 確認句子: \(transcriptText.prefix(40))...")
 
