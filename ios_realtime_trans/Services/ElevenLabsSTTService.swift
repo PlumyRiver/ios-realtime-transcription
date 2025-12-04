@@ -626,23 +626,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
 
-                // ⭐️ 簡化版：只累積 interim 文本，分句由 smart-translate API 處理
-                let confidence = response.confidence ?? 0
-                let language = response.detectedLanguage
-
-                // 發送 interim transcript（UI 顯示用）
-                let transcript = TranscriptMessage(
-                    text: transcriptText,
-                    isFinal: false,
-                    confidence: confidence,
-                    language: language
-                )
-                transcriptSubject.send(transcript)
-                print("⋯ [interim] \(transcriptText)")
-
-                // ⭐️ 更新 interim 文本（用於定時智能翻譯）
-                // 注意：這裡保存完整的 interim，讓 smart-translate API 來判斷分句
+                // ⭐️ 只更新 currentInterimText，不發送 interim
+                // interim 由 processSmartTranslateResponse 統一發送（帶翻譯）
+                // 避免重複發送導致 UI 混亂
                 currentInterimText = transcriptText
+                print("⋯ [partial] \(transcriptText.prefix(30))...")
 
             case "committed_transcript":
                 // ⭐️ 忽略此訊息，只處理 committed_transcript_with_timestamps
@@ -662,41 +650,38 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     }
                 }
 
-                // ⭐️ VAD commit 時才真正確認句子
-                // 使用之前保存的 pendingSegments（如果有的話）
+                // ⭐️ 過濾純標點符號
+                let meaningfulChars = transcriptText.filter { !$0.isPunctuation && !$0.isWhitespace }
+                guard !meaningfulChars.isEmpty else {
+                    // 純標點，跳過
+                    currentInterimText = ""
+                    lastInterimLength = 0
+                    pendingSegments = []
+                    return
+                }
+
+                // ⭐️ VAD commit 時確認句子
+                // 策略：發送完整的 transcriptText 作為 final（與 interim 匹配）
+                // 這樣 ViewModel 會正確清除 interimTranscript
+                let transcript = TranscriptMessage(
+                    text: transcriptText,
+                    isFinal: true,
+                    confidence: response.confidence ?? 0.9,
+                    language: response.detectedLanguage
+                )
+                transcriptSubject.send(transcript)
+
+                // ⭐️ 使用 pendingSegments 的翻譯（如果有）
                 if !pendingSegments.isEmpty {
-                    // 使用智能分句的結果
-                    for (original, translation) in pendingSegments {
-                        let meaningfulChars = original.filter { !$0.isPunctuation && !$0.isWhitespace }
-                        guard !meaningfulChars.isEmpty else { continue }
-
-                        let transcript = TranscriptMessage(
-                            text: original,
-                            isFinal: true,
-                            confidence: response.confidence ?? 0.9,
-                            language: response.detectedLanguage
-                        )
-                        transcriptSubject.send(transcript)
-                        translationSubject.send((original, translation))
-                        print("✅ [確認] \(original) → \(translation)")
-                    }
+                    // 合併所有翻譯
+                    let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
+                    translationSubject.send((transcriptText, combinedTranslation))
+                    print("✅ [確認] \(transcriptText) → \(combinedTranslation)")
                 } else {
-                    // 沒有分句結果，整段作為一個句子
-                    let meaningfulChars = transcriptText.filter { !$0.isPunctuation && !$0.isWhitespace }
-                    if !meaningfulChars.isEmpty {
-                        let transcript = TranscriptMessage(
-                            text: transcriptText,
-                            isFinal: true,
-                            confidence: response.confidence ?? 0,
-                            language: response.detectedLanguage
-                        )
-                        transcriptSubject.send(transcript)
-                        print("✅ [確認-整段] \(transcriptText)")
-
-                        // 翻譯
-                        Task {
-                            await self.translateTextDirectly(transcriptText, isInterim: false)
-                        }
+                    // 沒有翻譯結果，調用翻譯 API
+                    print("✅ [確認] \(transcriptText)")
+                    Task {
+                        await self.translateTextDirectly(transcriptText, isInterim: false)
                     }
                 }
 
