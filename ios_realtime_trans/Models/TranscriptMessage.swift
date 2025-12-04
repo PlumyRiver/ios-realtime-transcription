@@ -2,10 +2,56 @@
 //  TranscriptMessage.swift
 //  ios_realtime_trans
 //
-//  Chirp3 語音轉錄與翻譯的資料模型
+//  語音轉錄與翻譯的資料模型
+//  支援 Google Chirp3 和 ElevenLabs Scribe v2 Realtime
 //
 
 import Foundation
+
+/// STT 提供商
+enum STTProvider: String, CaseIterable, Identifiable {
+    case chirp3 = "chirp3"           // Google Cloud Chirp 3
+    case elevenLabs = "elevenlabs"   // ElevenLabs Scribe v2 Realtime
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .chirp3: return "Google Chirp 3"
+        case .elevenLabs: return "ElevenLabs Scribe"
+        }
+    }
+
+    var shortName: String {
+        switch self {
+        case .chirp3: return "Chirp3"
+        case .elevenLabs: return "ElevenLabs"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .chirp3: return "waveform"
+        case .elevenLabs: return "waveform.circle.fill"
+        }
+    }
+
+    /// 延遲特性說明
+    var latencyDescription: String {
+        switch self {
+        case .chirp3: return "~300-500ms"
+        case .elevenLabs: return "~150ms"
+        }
+    }
+
+    /// 語言支援數量
+    var languageCount: Int {
+        switch self {
+        case .chirp3: return 100
+        case .elevenLabs: return 92
+        }
+    }
+}
 
 /// TTS 播放模式（四段切換）
 /// - sourceOnly: 當「你」說話時播放 → 播放目標語言的翻譯

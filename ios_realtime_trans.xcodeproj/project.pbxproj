@@ -82,7 +82,6 @@
 				1E3D87512FF9C87396AF0E20 /* Pods-ios_realtime_trans.debug.xcconfig */,
 				3997CDEF82448B0A5FECFA1A /* Pods-ios_realtime_trans.release.xcconfig */,
 			);
-			name = Pods;
 			path = Pods;
 			sourceTree = "<group>";
 		};
@@ -164,9 +163,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-ios_realtime_trans/Pods-ios_realtime_trans-frameworks-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Embed Pods Frameworks";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-ios_realtime_trans/Pods-ios_realtime_trans-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;

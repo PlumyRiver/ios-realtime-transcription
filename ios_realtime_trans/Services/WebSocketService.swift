@@ -26,6 +26,7 @@ protocol WebSocketServiceProtocol {
     func connect(serverURL: String, sourceLang: Language, targetLang: Language)
     func disconnect()
     func sendAudio(data: Data)
+    func sendEndUtterance()
 }
 
 /// WebSocket 服務實作

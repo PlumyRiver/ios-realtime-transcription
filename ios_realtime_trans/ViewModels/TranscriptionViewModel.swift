@@ -129,9 +129,36 @@ final class TranscriptionViewModel {
     /// 伺服器 URL（Cloud Run 部署的服務）
     var serverURL: String = "chirp3-ios-api-1027448899164.asia-east1.run.app"
 
+    /// ⭐️ STT 提供商選擇（預設 ElevenLabs，延遲更低）
+    var sttProvider: STTProvider = .elevenLabs {
+        didSet {
+            if oldValue != sttProvider {
+                print("🔄 [STT] 切換提供商: \(oldValue.displayName) → \(sttProvider.displayName)")
+                // 如果正在錄音，需要重新連接
+                if isRecording {
+                    Task { @MainActor in
+                        stopRecording()
+                        try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s 延遲
+                        await startRecording()
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Private Properties
 
-    private let webSocketService = WebSocketService()
+    /// ⭐️ 雙 STT 服務
+    private let chirp3Service = WebSocketService()
+    private let elevenLabsService = ElevenLabsSTTService()
+
+    /// 當前使用的 STT 服務
+    private var currentSTTService: WebSocketServiceProtocol {
+        switch sttProvider {
+        case .chirp3: return chirp3Service
+        case .elevenLabs: return elevenLabsService
+        }
+    }
 
     /// ⭐️ 使用 WebRTC AEC3 音頻管理器（全雙工回音消除）
     private let audioManager = WebRTCAudioManager.shared
@@ -201,29 +228,30 @@ final class TranscriptionViewModel {
 
         status = .connecting
 
-        print("🔌 開始連接伺服器: \(serverURL)")
+        print("🔌 開始連接伺服器: \(serverURL) (使用 \(sttProvider.displayName))")
 
-        // 連接 WebSocket
-        webSocketService.connect(
+        // ⭐️ 根據選擇的 STT 提供商連接
+        currentSTTService.connect(
             serverURL: serverURL,
             sourceLang: sourceLang,
             targetLang: targetLang
         )
 
-        // 等待連接成功（最多等待 10 秒）
-        print("⏳ 等待連接...")
-        let connectionResult = await waitForConnection(timeout: 10.0)
-        print("📡 連接結果: \(connectionResult), 狀態: \(webSocketService.connectionState)")
+        // 等待連接成功（ElevenLabs 需要較長時間：token + WebSocket）
+        let timeout: TimeInterval = (sttProvider == .elevenLabs) ? 20.0 : 10.0
+        print("⏳ 等待連接...（超時: \(Int(timeout))秒）")
+        let connectionResult = await waitForConnection(timeout: timeout)
+        print("📡 連接結果: \(connectionResult), 狀態: \(currentSTTService.connectionState)")
 
         guard connectionResult else {
-            if case .error(let message) = webSocketService.connectionState {
+            if case .error(let message) = currentSTTService.connectionState {
                 print("❌ 連接錯誤: \(message)")
                 status = .error(message)
             } else {
                 print("❌ 連接逾時")
                 status = .error("連接逾時，請檢查網路或伺服器狀態")
             }
-            webSocketService.disconnect()
+            currentSTTService.disconnect()
             return
         }
 
@@ -248,7 +276,7 @@ final class TranscriptionViewModel {
             startDurationTimer()
         } catch {
             status = .error(error.localizedDescription)
-            webSocketService.disconnect()
+            currentSTTService.disconnect()
         }
     }
 
@@ -261,7 +289,8 @@ final class TranscriptionViewModel {
         audioManager.stopRecording()
         audioManager.stopTTS()
 
-        webSocketService.disconnect()
+        // ⭐️ 斷開當前 STT 服務
+        currentSTTService.disconnect()
         status = .disconnected
 
         // 清除 interim 和 TTS 隊列
@@ -317,33 +346,61 @@ final class TranscriptionViewModel {
     /// 設定 Combine 訂閱
     private func setupSubscriptions() {
         // ⭐️ 訂閱音頻數據（來自統一的 AudioManager）
+        // 根據當前選擇的 STT 提供商發送到對應服務
         audioManager.audioDataPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] data in
-                self?.webSocketService.sendAudio(data: data)
+                guard let self else { return }
+                self.currentSTTService.sendAudio(data: data)
             }
             .store(in: &cancellables)
 
-        // 訂閱轉錄結果
-        webSocketService.transcriptPublisher
+        // ⭐️ 訂閱 Chirp3 服務的結果
+        chirp3Service.transcriptPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transcript in
+                guard self?.sttProvider == .chirp3 else { return }
                 self?.handleTranscript(transcript)
             }
             .store(in: &cancellables)
 
-        // 訂閱翻譯結果
-        webSocketService.translationPublisher
+        chirp3Service.translationPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] (sourceText, translatedText) in
+                guard self?.sttProvider == .chirp3 else { return }
                 self?.handleTranslation(sourceText: sourceText, translatedText: translatedText)
             }
             .store(in: &cancellables)
 
-        // 訂閱錯誤
-        webSocketService.errorPublisher
+        chirp3Service.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] errorMessage in
+                guard self?.sttProvider == .chirp3 else { return }
+                self?.status = .error(errorMessage)
+            }
+            .store(in: &cancellables)
+
+        // ⭐️ 訂閱 ElevenLabs 服務的結果
+        elevenLabsService.transcriptPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transcript in
+                guard self?.sttProvider == .elevenLabs else { return }
+                self?.handleTranscript(transcript)
+            }
+            .store(in: &cancellables)
+
+        elevenLabsService.translationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] (sourceText, translatedText) in
+                guard self?.sttProvider == .elevenLabs else { return }
+                self?.handleTranslation(sourceText: sourceText, translatedText: translatedText)
+            }
+            .store(in: &cancellables)
+
+        elevenLabsService.errorPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] errorMessage in
+                guard self?.sttProvider == .elevenLabs else { return }
                 self?.status = .error(errorMessage)
             }
             .store(in: &cancellables)
@@ -353,22 +410,68 @@ final class TranscriptionViewModel {
             self?.processNextTTS()
         }
 
-        // ⭐️ PTT 結束語句回調（發送結束信號強制 Chirp3 輸出結果）
+        // ⭐️ PTT 結束語句回調（發送結束信號）
         audioManager.onEndUtterance = { [weak self] in
-            self?.webSocketService.sendEndUtterance()
+            self?.currentSTTService.sendEndUtterance()
         }
+    }
+
+    /// 切換 STT 提供商
+    func toggleSTTProvider() {
+        sttProvider = (sttProvider == .chirp3) ? .elevenLabs : .chirp3
     }
 
     /// 處理轉錄結果
     private func handleTranscript(_ transcript: TranscriptMessage) {
         if transcript.isFinal {
             // 最終結果：添加到列表末尾（最新的在下面）
-            transcripts.append(transcript)
+            var finalTranscript = transcript
+
+            // ⭐️ 保留 interim 的翻譯（定時翻譯的結果）
+            if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
+                finalTranscript.translation = interimTranslation
+                print("✅ [Final] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+            }
+
+            transcripts.append(finalTranscript)
             interimTranscript = nil
             updateStats()
         } else {
-            // 中間結果：更新 interim
+            // ⭐️ 中間結果：檢查是否為新的語句
+            // 注意：ElevenLabs 使用 VAD 自動 commit，不需要 Pseudo-Final 機制
+            // Chirp3 可能需要，因為有時 final 結果會丟失
+
+            // 只對 Chirp3 啟用 Pseudo-Final（ElevenLabs VAD 會自動處理）
+            if sttProvider == .chirp3, let oldInterim = interimTranscript {
+                let oldText = oldInterim.text.replacingOccurrences(of: " ", with: "")
+                let newText = transcript.text.replacingOccurrences(of: " ", with: "")
+
+                // 判斷是否為新語句：新文本不以舊文本為前綴，且舊文本長度 > 10
+                let isNewUtterance = !newText.hasPrefix(oldText) && oldText.count > 10
+
+                if isNewUtterance {
+                    // 將舊的 interim 提升為 pseudo-final（避免丟失）
+                    print("⚠️ [Pseudo-Final] 檢測到新語句，保存舊 interim: \"\(oldInterim.text.prefix(30))...\"")
+                    let pseudoFinal = TranscriptMessage(
+                        text: oldInterim.text,
+                        isFinal: true,  // 標記為 final
+                        confidence: oldInterim.confidence,
+                        language: oldInterim.language,
+                        converted: oldInterim.converted,
+                        originalText: oldInterim.originalText,
+                        speakerTag: oldInterim.speakerTag
+                    )
+                    transcripts.append(pseudoFinal)
+                    updateStats()
+                }
+            }
+
+            // ⭐️ 更新 interim，但保留舊的翻譯（避免翻譯閃現後消失）
+            let oldTranslation = interimTranscript?.translation
             interimTranscript = transcript
+            if let translation = oldTranslation, !translation.isEmpty {
+                interimTranscript?.translation = translation
+            }
         }
     }
 
@@ -394,10 +497,13 @@ final class TranscriptionViewModel {
             }
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
-        } else if interimTranscript?.text == sourceText {
+        } else if interimTranscript != nil {
+            // ⭐️ 沒有匹配到 final 結果，更新 interim 翻譯
+            // 不需要精確匹配，因為 interim 可能已經變長（定時翻譯延遲導致）
             interimTranscript?.translation = translatedText
             detectedLanguage = interimTranscript?.language
             // interim 結果不播放 TTS
+            print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
         }
 
         // ⭐️ 根據 TTS 播放模式決定是否播放
@@ -562,8 +668,8 @@ final class TranscriptionViewModel {
         let checkInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
 
         while Date().timeIntervalSince(startTime) < timeout {
-            // 檢查連接狀態
-            switch webSocketService.connectionState {
+            // ⭐️ 檢查當前 STT 服務的連接狀態
+            switch currentSTTService.connectionState {
             case .connected:
                 return true
             case .error:

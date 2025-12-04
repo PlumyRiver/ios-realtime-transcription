@@ -741,32 +741,140 @@ struct DualIconControlRow: View {
 struct CenteredCallButton: View {
     @Bindable var viewModel: TranscriptionViewModel
 
+    // 滑動狀態
+    @State private var dragOffset: CGFloat = 0
+    @State private var isDragging = false
+
+    // 尺寸常數
+    private let trackWidth: CGFloat = 280
+    private let trackHeight: CGFloat = 70
+    private let thumbSize: CGFloat = 60
+    private let threshold: CGFloat = 0.6  // 滑動超過 60% 觸發
+
+    // 計算滑動範圍
+    private var maxOffset: CGFloat {
+        trackWidth - thumbSize - 10
+    }
+
+    // 背景顏色
+    private var trackColor: Color {
+        viewModel.isRecording ? Color.red.opacity(0.15) : Color.green.opacity(0.15)
+    }
+
+    // 按鈕顏色
+    private var thumbGradient: LinearGradient {
+        if viewModel.isRecording {
+            return LinearGradient(
+                colors: [Color.pink, Color.red],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [Color.green, Color.mint],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+
     var body: some View {
         HStack {
             Spacer()
 
-            Button {
-                Task {
-                    await viewModel.toggleRecording()
+            ZStack {
+                // 背景軌道
+                RoundedRectangle(cornerRadius: trackHeight / 2)
+                    .fill(trackColor)
+                    .frame(width: trackWidth, height: trackHeight)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: trackHeight / 2)
+                            .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                    )
+
+                // 左邊圖標（結束通話）
+                HStack {
+                    Image(systemName: "phone.down.fill")
+                        .font(.title3)
+                        .foregroundStyle(.red.opacity(viewModel.isRecording ? 0.8 : 0.3))
+                        .padding(.leading, 18)
+                    Spacer()
                 }
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: viewModel.isRecording ? "phone.down.fill" : "phone.fill")
-                        .font(.system(size: 20, weight: .semibold))
-                    Text(viewModel.isRecording ? "結束通話" : "開始通話")
-                        .font(.headline)
-                        .fontWeight(.semibold)
+                .frame(width: trackWidth)
+
+                // 右邊圖標（開始通話）
+                HStack {
+                    Spacer()
+                    Image(systemName: "phone.fill")
+                        .font(.title3)
+                        .foregroundStyle(.green.opacity(viewModel.isRecording ? 0.3 : 0.8))
+                        .padding(.trailing, 18)
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 32)
-                .padding(.vertical, 14)
-                .background(viewModel.isRecording ? Color.red : Color.blue)
-                .cornerRadius(28)
-                .shadow(color: (viewModel.isRecording ? Color.red : Color.blue).opacity(0.4), radius: 8, x: 0, y: 4)
+                .frame(width: trackWidth)
+
+                // 中間提示文字
+                Text(viewModel.isRecording ? "← 滑動結束" : "滑動開始 →")
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.secondary)
+
+                // 可滑動的按鈕
+                Circle()
+                    .fill(thumbGradient)
+                    .frame(width: thumbSize, height: thumbSize)
+                    .shadow(color: viewModel.isRecording ? .red.opacity(0.4) : .green.opacity(0.4), radius: 8, x: 0, y: 4)
+                    .overlay(
+                        Image(systemName: viewModel.isRecording ? "waveform" : "mic.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                    )
+                    .scaleEffect(isDragging ? 1.1 : 1.0)
+                    .animation(.spring(response: 0.3), value: isDragging)
+                    .offset(x: thumbPosition + dragOffset)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                isDragging = true
+                                if viewModel.isRecording {
+                                    // 通話中：只能往左滑
+                                    dragOffset = min(0, max(-maxOffset, value.translation.width))
+                                } else {
+                                    // 未通話：只能往右滑
+                                    dragOffset = max(0, min(maxOffset, value.translation.width))
+                                }
+                            }
+                            .onEnded { _ in
+                                isDragging = false
+                                let progress = abs(dragOffset) / maxOffset
+
+                                if progress > threshold {
+                                    // 觸覺反饋
+                                    let generator = UIImpactFeedbackGenerator(style: .medium)
+                                    generator.impactOccurred()
+
+                                    // 執行操作
+                                    Task {
+                                        await viewModel.toggleRecording()
+                                    }
+                                }
+
+                                // 彈回原位
+                                withAnimation(.spring(response: 0.3)) {
+                                    dragOffset = 0
+                                }
+                            }
+                    )
             }
+            .frame(width: trackWidth, height: trackHeight)
 
             Spacer()
         }
+    }
+
+    // 計算按鈕初始位置
+    private var thumbPosition: CGFloat {
+        let halfTrack = (trackWidth - thumbSize) / 2 - 5
+        return viewModel.isRecording ? halfTrack : -halfTrack
     }
 }
 
@@ -1046,6 +1154,60 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                // ⭐️ STT 提供商選擇
+                Section("語音轉文字引擎") {
+                    Picker(selection: $viewModel.sttProvider) {
+                        ForEach(STTProvider.allCases) { provider in
+                            HStack {
+                                Image(systemName: provider.iconName)
+                                VStack(alignment: .leading) {
+                                    Text(provider.displayName)
+                                    Text("延遲: \(provider.latencyDescription)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tag(provider)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: viewModel.sttProvider.iconName)
+                                .foregroundStyle(sttProviderColor(viewModel.sttProvider))
+                            Text("STT 引擎")
+                        }
+                    }
+
+                    // 提供商說明
+                    VStack(alignment: .leading, spacing: 4) {
+                        switch viewModel.sttProvider {
+                        case .chirp3:
+                            HStack {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("Google Chirp 3：支援 100+ 語言，內建翻譯")
+                            }
+                            HStack {
+                                Image(systemName: "clock")
+                                    .foregroundStyle(.orange)
+                                Text("延遲約 300-500ms")
+                            }
+                        case .elevenLabs:
+                            HStack {
+                                Image(systemName: "bolt.circle.fill")
+                                    .foregroundStyle(.blue)
+                                Text("ElevenLabs Scribe v2：超低延遲 ~150ms")
+                            }
+                            HStack {
+                                Image(systemName: "globe")
+                                    .foregroundStyle(.purple)
+                                Text("支援 92 語言，需外部翻譯")
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
                 Section("伺服器設定") {
                     TextField("伺服器 URL", text: $viewModel.serverURL)
                         .textContentType(.URL)
@@ -1060,21 +1222,21 @@ struct SettingsView: View {
                     HStack {
                         Text("版本")
                         Spacer()
-                        Text("1.0.0")
+                        Text("2.0.0")
                             .foregroundStyle(.secondary)
                     }
 
                     HStack {
                         Text("轉錄引擎")
                         Spacer()
-                        Text("Google Chirp 3")
+                        Text(viewModel.sttProvider.displayName)
                             .foregroundStyle(.secondary)
                     }
 
                     HStack {
                         Text("翻譯引擎")
                         Spacer()
-                        Text("Cerebras llama-3.3-70b")
+                        Text("Cerebras gpt-oss-120b")
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -1115,6 +1277,16 @@ struct SettingsView: View {
             return .orange
         case .muted:
             return .gray
+        }
+    }
+
+    /// 根據 STT 提供商返回對應顏色
+    private func sttProviderColor(_ provider: STTProvider) -> Color {
+        switch provider {
+        case .chirp3:
+            return .green
+        case .elevenLabs:
+            return .blue
         }
     }
 }
