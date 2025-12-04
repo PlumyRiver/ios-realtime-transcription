@@ -428,9 +428,17 @@ final class TranscriptionViewModel {
             var finalTranscript = transcript
 
             // ⭐️ 保留 interim 的翻譯（定時翻譯的結果）
+            // 同時觸發 TTS 播放（因為 handleTranslation 會跳過已有翻譯的情況）
             if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
                 finalTranscript.translation = interimTranslation
                 print("✅ [Final] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+
+                // ⭐️ 從 interim 保留翻譯時，觸發 TTS 播放
+                let detectedLanguage = interimTranscript?.language
+                if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
+                    let targetLangCode = getTargetLanguageCode(for: interimTranslation)
+                    enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
+                }
             }
 
             transcripts.append(finalTranscript)
