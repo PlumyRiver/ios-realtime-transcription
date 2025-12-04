@@ -496,15 +496,25 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         guard let url = URL(string: smartTranslateURL) else { return }
 
-        // 判斷翻譯方向
-        let chineseCount = text.unicodeScalars.filter { $0.value >= 0x4E00 && $0.value <= 0x9FFF }.count
-        let isChineseText = chineseCount > text.count / 3
+        // ⭐️ 使用精確的語言檢測（支援日文假名識別）
+        let detectedLang = detectLanguageFromText(text)
+
+        // ⭐️ 判斷翻譯方向：
+        // - 如果檢測到的語言 == 來源語言 → 翻譯到目標語言
+        // - 如果檢測到的語言 == 目標語言 → 翻譯到來源語言（反向翻譯）
+        // - 否則翻譯到目標語言
         let targetLang: String
-        if isChineseText {
-            targetLang = (currentTargetLang.rawValue == "zh") ? currentSourceLang.rawValue : currentTargetLang.rawValue
+        if detectedLang == currentSourceLang.rawValue {
+            // 說的是來源語言，翻譯到目標語言
+            targetLang = currentTargetLang.rawValue
+        } else if detectedLang == currentTargetLang.rawValue {
+            // 說的是目標語言，反向翻譯到來源語言
+            targetLang = currentSourceLang.rawValue
         } else {
-            targetLang = (currentSourceLang.rawValue == "zh") ? currentSourceLang.rawValue : currentTargetLang.rawValue
+            // 檢測到其他語言，翻譯到目標語言
+            targetLang = currentTargetLang.rawValue
         }
+        print("🔀 [翻譯方向] 檢測: \(detectedLang) | 來源: \(currentSourceLang.rawValue) 目標: \(currentTargetLang.rawValue) → 翻譯到: \(targetLang)")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -630,19 +640,20 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     ///   - text: 要翻譯的文本
     ///   - isInterim: 是否為 interim 翻譯（用於分句判斷，預設 true）
     private func translateTextDirectly(_ text: String, isInterim: Bool = true) async {
-        // 判斷翻譯方向
-        let sourceLangCode = currentSourceLang.rawValue
-        let targetLangCode = currentTargetLang.rawValue
+        // ⭐️ 使用精確的語言檢測（支援日文假名識別）
+        let detectedLang = detectLanguageFromText(text)
 
-        // 簡單判斷：如果是中文字符多，則是中文
-        let chineseCount = text.unicodeScalars.filter { $0.value >= 0x4E00 && $0.value <= 0x9FFF }.count
-        let isChineseText = chineseCount > text.count / 3
-
+        // ⭐️ 判斷翻譯方向（與 callSmartTranslateAPI 相同邏輯）
         let translateTo: String
-        if isChineseText {
-            translateTo = (targetLangCode == "zh") ? sourceLangCode : targetLangCode
+        if detectedLang == currentSourceLang.rawValue {
+            // 說的是來源語言，翻譯到目標語言
+            translateTo = currentTargetLang.rawValue
+        } else if detectedLang == currentTargetLang.rawValue {
+            // 說的是目標語言，反向翻譯到來源語言
+            translateTo = currentSourceLang.rawValue
         } else {
-            translateTo = (sourceLangCode == "zh") ? sourceLangCode : targetLangCode
+            // 檢測到其他語言，翻譯到目標語言
+            translateTo = currentTargetLang.rawValue
         }
 
         await callTranslationAPI(text: text, targetLang: translateTo, isInterim: isInterim)
