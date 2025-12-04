@@ -330,6 +330,77 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
+    /// ⭐️ 根據文本內容自動檢測語言
+    /// 用於 ElevenLabs 沒有回傳 detected_language 時
+    private func detectLanguageFromText(_ text: String) -> String {
+        // 統計各種字符的數量
+        var chineseCount = 0
+        var japaneseCount = 0
+        var koreanCount = 0
+        var latinCount = 0
+        var arabicCount = 0
+        var thaiCount = 0
+        var devanagariCount = 0  // Hindi
+
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if value >= 0x4E00 && value <= 0x9FFF {
+                // CJK 統一漢字
+                chineseCount += 1
+            } else if value >= 0x3040 && value <= 0x309F {
+                // 平假名
+                japaneseCount += 1
+            } else if value >= 0x30A0 && value <= 0x30FF {
+                // 片假名
+                japaneseCount += 1
+            } else if value >= 0xAC00 && value <= 0xD7AF {
+                // 韓文音節
+                koreanCount += 1
+            } else if value >= 0x0041 && value <= 0x007A {
+                // 拉丁字母 (A-Z, a-z)
+                latinCount += 1
+            } else if value >= 0x0600 && value <= 0x06FF {
+                // 阿拉伯文
+                arabicCount += 1
+            } else if value >= 0x0E00 && value <= 0x0E7F {
+                // 泰文
+                thaiCount += 1
+            } else if value >= 0x0900 && value <= 0x097F {
+                // 天城文（Hindi）
+                devanagariCount += 1
+            }
+        }
+
+        // 找出數量最多的語言
+        let counts: [(String, Int)] = [
+            ("zh", chineseCount),
+            ("ja", japaneseCount),
+            ("ko", koreanCount),
+            ("en", latinCount),
+            ("ar", arabicCount),
+            ("th", thaiCount),
+            ("hi", devanagariCount)
+        ]
+
+        // 如果有日文假名，優先判斷為日文（即使有漢字）
+        if japaneseCount > 0 {
+            return "ja"
+        }
+
+        // 如果有韓文，判斷為韓文
+        if koreanCount > 0 {
+            return "ko"
+        }
+
+        // 取最大值
+        if let maxCount = counts.max(by: { $0.1 < $1.1 }), maxCount.1 > 0 {
+            return maxCount.0
+        }
+
+        // 默認返回來源語言
+        return currentSourceLang.rawValue
+    }
+
     /// 發送 commit 信號（結束當前語句）
     private func sendCommit() {
         guard connectionState == .connected else { return }
@@ -490,11 +561,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         // ⭐️ 在 interim 階段：整段文本作為 interim 發送
         // 不切分，保持完整性
+        // ⭐️ 自動檢測語言（用於 UI 顯示）
+        let detectedLanguage = detectLanguageFromText(originalText)
         let transcript = TranscriptMessage(
             text: originalText,
             isFinal: false,
             confidence: 0.7,
-            language: nil
+            language: detectedLanguage
         )
         transcriptSubject.send(transcript)
 
@@ -660,6 +733,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 isCommitted = true
 
                 print("🔒 [VAD Commit] 確認句子: \(transcriptText.prefix(40))...")
+                print("   🌐 detected_language: \(response.detectedLanguage ?? "nil")")
 
                 // 打印時間戳
                 if let words = response.words {
@@ -681,11 +755,21 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 // ⭐️ VAD commit 時確認句子
                 // 策略：發送完整的 transcriptText 作為 final（與 interim 匹配）
                 // 這樣 ViewModel 會正確清除 interimTranscript
+
+                // ⭐️ 語言檢測：如果 ElevenLabs 沒有回傳，自己判斷
+                let detectedLanguage: String
+                if let lang = response.detectedLanguage, !lang.isEmpty {
+                    detectedLanguage = lang
+                } else {
+                    // 自動檢測：根據文本內容判斷
+                    detectedLanguage = detectLanguageFromText(transcriptText)
+                }
+
                 let transcript = TranscriptMessage(
                     text: transcriptText,
                     isFinal: true,
                     confidence: response.confidence ?? 0.9,
-                    language: response.detectedLanguage
+                    language: detectedLanguage
                 )
                 transcriptSubject.send(transcript)
 
