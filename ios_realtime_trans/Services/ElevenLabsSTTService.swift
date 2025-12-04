@@ -32,12 +32,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var lastInterimLength: Int = 0  // 上次 interim 長度（用於檢測是否變長）
     private var lastTranslatedText: String = ""  // 上次翻譯的文本（避免重複翻譯）
 
-    /// ⭐️ 智能分句：由 Cerebras LLM 判斷語義完整性
-    private var completedTextLength: Int = 0  // 已確認完成的文本長度（不會再改變）
-
-    /// ⭐️ 已確認完成的句子（不會再更新）
-    private var confirmedSegments: [String] = []  // 已確認的原文句子
-    private var confirmedTranslations: [String] = []  // 對應的翻譯
+    /// ⭐️ 智能分句：基於字符位置追蹤（避免 LLM 分段不一致問題）
+    private var confirmedTextLength: Int = 0  // 已確認（發送為 final）的字符長度
+    private var lastConfirmedText: String = ""  // 上次確認的完整文本（用於比對）
 
     /// Token 獲取 URL（從後端服務器獲取）
     private var tokenEndpoint: String = ""
@@ -141,9 +138,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         currentInterimText = ""
         lastInterimLength = 0
         lastTranslatedText = ""
-        completedTextLength = 0  // 重置分句狀態
-        confirmedSegments = []
-        confirmedTranslations = []
+        confirmedTextLength = 0  // 重置分句狀態
+        lastConfirmedText = ""
 
         // 發送結束信號
         sendCommit()
@@ -455,61 +451,110 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// ⭐️ 處理智能翻譯響應
-    /// 將已完成的句子固定為 final，未完成的保持 interim
+    /// 核心邏輯：基於 lastCompleteOffset 追蹤已確認的字符位置
+    /// - 只發送「新增的已確認部分」作為 final
+    /// - 未確認部分作為 interim（會被後續更新覆蓋）
     private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
         guard !response.segments.isEmpty else { return }
 
-        print("✂️ [智能分句] 收到 \(response.segments.count) 個段落，lastCompleteIndex=\(response.lastCompleteIndex)")
+        let lastCompleteOffset = response.lastCompleteOffset
 
-        for (index, segment) in response.segments.enumerated() {
-            let isComplete = segment.isComplete
+        print("✂️ [智能分句] \(response.segments.count) 段, lastCompleteOffset=\(lastCompleteOffset), 已確認=\(confirmedTextLength)")
 
-            if isComplete {
-                // ⭐️ 這個句子已經「語義完整」，固定為 final
-                let alreadyConfirmed = confirmedSegments.contains(segment.original)
+        // ⭐️ 計算需要新確認的文本
+        // 只有當 lastCompleteOffset 大於 confirmedTextLength 時，才有新的完整句子
+        if lastCompleteOffset > confirmedTextLength {
+            // 提取新確認的部分（從 confirmedTextLength 到 lastCompleteOffset）
+            let startIdx = originalText.index(originalText.startIndex, offsetBy: confirmedTextLength, limitedBy: originalText.endIndex) ?? originalText.endIndex
+            let endIdx = originalText.index(originalText.startIndex, offsetBy: min(lastCompleteOffset, originalText.count), limitedBy: originalText.endIndex) ?? originalText.endIndex
 
-                if !alreadyConfirmed {
-                    // 新的完整句子：發送 final transcript
+            if startIdx < endIdx {
+                let newConfirmedText = String(originalText[startIdx..<endIdx]).trimmingCharacters(in: .whitespaces)
+
+                // ⭐️ 過濾掉純標點符號（避免發送「。」這種無意義的句子）
+                let meaningfulChars = newConfirmedText.filter { !$0.isPunctuation && !$0.isWhitespace }
+                if !meaningfulChars.isEmpty {
+                    // 發送新確認的文本作為 final
                     let transcript = TranscriptMessage(
-                        text: segment.original,
+                        text: newConfirmedText,
                         isFinal: true,
                         confidence: 0.95,
                         language: nil
                     )
                     transcriptSubject.send(transcript)
-                    confirmedSegments.append(segment.original)
+                    print("✅ [新確認] \(newConfirmedText)")
 
-                    // 發送翻譯
-                    if let translation = segment.translation, !translation.isEmpty {
-                        translationSubject.send((segment.original, translation))
-                        confirmedTranslations.append(translation)
+                    // 找對應的翻譯（從 segments 中匹配）
+                    let matchingTranslation = findTranslationForText(newConfirmedText, in: response.segments)
+                    if let translation = matchingTranslation, !translation.isEmpty {
+                        translationSubject.send((newConfirmedText, translation))
+                        print("   🌐 \(translation)")
                     }
-
-                    print("✅ [分句固定] \(segment.original) → \(segment.translation ?? "")")
                 }
-            } else {
-                // ⭐️ 這個句子還沒說完，顯示為 interim
+
+                // 更新已確認長度
+                confirmedTextLength = lastCompleteOffset
+                lastConfirmedText = String(originalText.prefix(lastCompleteOffset))
+            }
+        }
+
+        // ⭐️ 處理未確認部分（interim）
+        // 只取 lastCompleteOffset 之後的部分作為 interim
+        if lastCompleteOffset < originalText.count {
+            let startIdx = originalText.index(originalText.startIndex, offsetBy: lastCompleteOffset, limitedBy: originalText.endIndex) ?? originalText.endIndex
+            let interimText = String(originalText[startIdx...]).trimmingCharacters(in: .whitespaces)
+
+            if !interimText.isEmpty {
+                // 發送未確認部分作為 interim
                 let transcript = TranscriptMessage(
-                    text: segment.original,
+                    text: interimText,
                     isFinal: false,
                     confidence: 0.7,
                     language: nil
                 )
                 transcriptSubject.send(transcript)
 
-                // 也發送 interim 翻譯（讓用戶即時看到）
-                if let translation = segment.translation, !translation.isEmpty {
-                    translationSubject.send((segment.original, translation))
+                // 找對應的翻譯
+                let matchingTranslation = findTranslationForText(interimText, in: response.segments)
+                if let translation = matchingTranslation, !translation.isEmpty {
+                    translationSubject.send((interimText, translation))
                 }
 
-                print("⏳ [interim] \(segment.original) → \(segment.translation ?? "")")
+                print("⏳ [interim] \(interimText) → \(matchingTranslation ?? "")")
+            }
+        }
+    }
+
+    /// 從 segments 中找到匹配的翻譯
+    private func findTranslationForText(_ text: String, in segments: [SmartTranslateResponse.Segment]) -> String? {
+        // 精確匹配
+        if let segment = segments.first(where: { $0.original == text }) {
+            return segment.translation
+        }
+
+        // 部分匹配（text 包含在某個 segment 中，或 segment 包含在 text 中）
+        for segment in segments {
+            if segment.original.contains(text) || text.contains(segment.original) {
+                return segment.translation
             }
         }
 
-        // 更新已完成的文本長度
-        if response.lastCompleteOffset > 0 {
-            completedTextLength = response.lastCompleteOffset
+        // 合併所有相關 segments 的翻譯
+        var matchedTranslations: [String] = []
+        var remainingText = text
+        for segment in segments {
+            if remainingText.hasPrefix(segment.original) {
+                if let translation = segment.translation {
+                    matchedTranslations.append(translation)
+                }
+                remainingText = String(remainingText.dropFirst(segment.original.count)).trimmingCharacters(in: .whitespaces)
+            }
         }
+        if !matchedTranslations.isEmpty {
+            return matchedTranslations.joined(separator: " ")
+        }
+
+        return nil
     }
 
     /// SmartTranslateResponse 結構（用於解碼）
@@ -645,39 +690,37 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     }
                 }
 
-                // ⭐️ 計算還沒被確認的部分（智能分句可能已經處理了一些）
-                // 找出還沒發送過的文本
-                var unconfirmedText = transcriptText
-                for confirmed in confirmedSegments {
-                    if let range = unconfirmedText.range(of: confirmed) {
-                        unconfirmedText.removeSubrange(range)
-                    }
-                }
-                unconfirmedText = unconfirmedText.trimmingCharacters(in: .whitespaces)
+                // ⭐️ 計算還沒被確認的部分（基於字符位置）
+                if confirmedTextLength < transcriptText.count {
+                    let startIdx = transcriptText.index(transcriptText.startIndex, offsetBy: confirmedTextLength, limitedBy: transcriptText.endIndex) ?? transcriptText.endIndex
+                    let unconfirmedText = String(transcriptText[startIdx...]).trimmingCharacters(in: .whitespaces)
 
-                if !unconfirmedText.isEmpty {
-                    // 發送剩餘的文本作為 final
-                    let transcript = TranscriptMessage(
-                        text: unconfirmedText,
-                        isFinal: true,
-                        confidence: response.confidence ?? 0,
-                        language: response.detectedLanguage
-                    )
-                    transcriptSubject.send(transcript)
-                    print("✅ [Final 剩餘] \(unconfirmedText)")
+                    // ⭐️ 過濾純標點符號
+                    let meaningfulChars = unconfirmedText.filter { !$0.isPunctuation && !$0.isWhitespace }
 
-                    // 翻譯剩餘文本
-                    Task {
-                        await self.translateTextDirectly(unconfirmedText, isInterim: false)
+                    if !meaningfulChars.isEmpty {
+                        // 發送剩餘的文本作為 final
+                        let transcript = TranscriptMessage(
+                            text: unconfirmedText,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0,
+                            language: response.detectedLanguage
+                        )
+                        transcriptSubject.send(transcript)
+                        print("✅ [Final 剩餘] \(unconfirmedText)")
+
+                        // 翻譯剩餘文本
+                        Task {
+                            await self.translateTextDirectly(unconfirmedText, isInterim: false)
+                        }
                     }
                 }
 
                 // ⭐️ 重置所有狀態（準備下一輪）
                 currentInterimText = ""
                 lastInterimLength = 0
-                completedTextLength = 0
-                confirmedSegments = []
-                confirmedTranslations = []
+                confirmedTextLength = 0
+                lastConfirmedText = ""
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
