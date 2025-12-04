@@ -490,39 +490,26 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// ⭐️ 調用智能翻譯 + 分句 API
-    /// Cerebras 會同時翻譯並判斷哪些句子「語義完整」
+    /// Cerebras 會自動判斷輸入語言並翻譯到另一種語言
+    /// 不需要客戶端判斷語言，完全由 LLM 處理
     private func callSmartTranslateAPI(text: String) async {
         let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
 
         guard let url = URL(string: smartTranslateURL) else { return }
 
-        // ⭐️ 使用精確的語言檢測（支援日文假名識別）
-        let detectedLang = detectLanguageFromText(text)
-
-        // ⭐️ 判斷翻譯方向：
-        // - 如果檢測到的語言 == 來源語言 → 翻譯到目標語言
-        // - 如果檢測到的語言 == 目標語言 → 翻譯到來源語言（反向翻譯）
-        // - 否則翻譯到目標語言
-        let targetLang: String
-        if detectedLang == currentSourceLang.rawValue {
-            // 說的是來源語言，翻譯到目標語言
-            targetLang = currentTargetLang.rawValue
-        } else if detectedLang == currentTargetLang.rawValue {
-            // 說的是目標語言，反向翻譯到來源語言
-            targetLang = currentSourceLang.rawValue
-        } else {
-            // 檢測到其他語言，翻譯到目標語言
-            targetLang = currentTargetLang.rawValue
-        }
-        print("🔀 [翻譯方向] 檢測: \(detectedLang) | 來源: \(currentSourceLang.rawValue) 目標: \(currentTargetLang.rawValue) → 翻譯到: \(targetLang)")
+        // ⭐️ 簡化：直接傳遞語言對，讓 LLM 自己判斷輸入是哪種語言
+        // LLM 會自動翻譯到另一種語言
+        print("🌐 [Smart-Translate] 語言對: \(currentSourceLang.rawValue) ↔ \(currentTargetLang.rawValue)")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // ⭐️ 傳遞兩個語言，讓 LLM 自己判斷輸入是哪種並翻譯到另一種
         let body: [String: Any] = [
             "text": text,
-            "targetLang": targetLang,
+            "sourceLang": currentSourceLang.rawValue,
+            "targetLang": currentTargetLang.rawValue,
             "mode": "streaming"
         ]
 
@@ -635,24 +622,22 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
-    /// 直接翻譯文本
+    /// 直接翻譯文本（備用方案，當 smart-translate 失敗時使用）
     /// - Parameters:
     ///   - text: 要翻譯的文本
     ///   - isInterim: 是否為 interim 翻譯（用於分句判斷，預設 true）
     private func translateTextDirectly(_ text: String, isInterim: Bool = true) async {
-        // ⭐️ 使用精確的語言檢測（支援日文假名識別）
+        // ⭐️ 使用本地語言檢測作為備用方案
+        // 注意：這只用於 smart-translate 失敗時，正常情況下 LLM 會自己判斷
         let detectedLang = detectLanguageFromText(text)
 
-        // ⭐️ 判斷翻譯方向（與 callSmartTranslateAPI 相同邏輯）
+        // ⭐️ 判斷翻譯方向
         let translateTo: String
         if detectedLang == currentSourceLang.rawValue {
-            // 說的是來源語言，翻譯到目標語言
             translateTo = currentTargetLang.rawValue
         } else if detectedLang == currentTargetLang.rawValue {
-            // 說的是目標語言，反向翻譯到來源語言
             translateTo = currentSourceLang.rawValue
         } else {
-            // 檢測到其他語言，翻譯到目標語言
             translateTo = currentTargetLang.rawValue
         }
 
