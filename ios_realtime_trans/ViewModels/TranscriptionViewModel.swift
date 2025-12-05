@@ -497,21 +497,46 @@ final class TranscriptionViewModel {
             print("🔍 [翻譯匹配] [\(i)] \"\(t.text.prefix(30))...\" | 匹配: \(match)")
         }
 
+        // ⭐️ 先嘗試精確匹配
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
-            // ⭐️ 只有當翻譯不存在時才播放 TTS（避免 interim + final 翻譯都觸發）
+            // 精確匹配到 final 結果
             let existingTranslation = transcripts[index].translation
             if existingTranslation == nil || existingTranslation?.isEmpty == true {
                 shouldPlayTTS = true
             }
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
-        } else if interimTranscript != nil {
-            // ⭐️ 沒有匹配到 final 結果，更新 interim 翻譯
-            // 不需要精確匹配，因為 interim 可能已經變長（定時翻譯延遲導致）
+            print("✅ [翻譯匹配] 精確匹配到 transcripts[\(index)]")
+        }
+        // ⭐️ 再嘗試模糊匹配（前綴匹配，處理標點差異）
+        else if let index = transcripts.firstIndex(where: {
+            $0.text.hasPrefix(sourceText) || sourceText.hasPrefix($0.text)
+        }) {
+            let existingTranslation = transcripts[index].translation
+            if existingTranslation == nil || existingTranslation?.isEmpty == true {
+                shouldPlayTTS = true
+            }
+            detectedLanguage = transcripts[index].language
+            transcripts[index].translation = translatedText
+            print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]")
+        }
+        // ⭐️ 只有當 sourceText 和 interimTranscript 匹配時才更新 interim
+        else if let interim = interimTranscript,
+                (interim.text == sourceText ||
+                 interim.text.hasPrefix(sourceText) ||
+                 sourceText.hasPrefix(interim.text)) {
             interimTranscript?.translation = translatedText
-            detectedLanguage = interimTranscript?.language
-            // interim 結果不播放 TTS
+            detectedLanguage = interim.language
             print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
+        }
+        // ⭐️ 完全不匹配，丟棄這個翻譯（可能是舊的 async 回調）
+        else {
+            print("⚠️ [翻譯匹配] 無法匹配，丟棄翻譯")
+            print("   sourceText: \(sourceText.prefix(30))...")
+            if let interim = interimTranscript {
+                print("   interimText: \(interim.text.prefix(30))...")
+            }
+            return  // ⭐️ 直接返回，不播放 TTS
         }
 
         // ⭐️ 根據 TTS 播放模式決定是否播放
