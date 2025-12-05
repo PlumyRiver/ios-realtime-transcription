@@ -450,6 +450,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         return (traditionalText, wasConverted)
     }
 
+    /// ⭐️ 檢查文本是否為純標點符號或空白
+    /// 用於過濾無意義的 transcript（如單獨的句號、問號）
+    private func isPunctuationOnly(_ text: String) -> Bool {
+        let meaningfulChars = text.filter { !$0.isPunctuation && !$0.isWhitespace }
+        return meaningfulChars.isEmpty
+    }
+
     /// 發送 commit 信號（結束當前語句）
     private func sendCommit() {
         guard connectionState == .connected else { return }
@@ -587,6 +594,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// - 這樣可以避免「I can speak」+「English」的切分問題
     private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
         guard !response.segments.isEmpty else { return }
+
+        // ⭐️ 過濾純標點符號（避免單獨的句號、問號成為氣泡）
+        guard !isPunctuationOnly(originalText) else {
+            print("⚠️ [智能翻譯] 跳過純標點: \"\(originalText)\"")
+            return
+        }
 
         // ⭐️ 防止 race condition：如果已經 commit，忽略這個舊的回調
         guard !isCommitted else {
@@ -763,6 +776,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let rawText = response.text, !rawText.isEmpty else { return }
 
+                // ⭐️ 過濾純標點符號（避免單獨的句號、問號成為氣泡）
+                guard !isPunctuationOnly(rawText) else {
+                    print("⋯ [partial] 跳過純標點: \"\(rawText)\"")
+                    return
+                }
+
                 // ⭐️ 收到新的 partial，解除 commit 狀態
                 // 這樣新的翻譯回調才會被處理
                 isCommitted = false
@@ -789,6 +808,17 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "committed_transcript_with_timestamps":
                 guard let rawText = response.text, !rawText.isEmpty else { return }
 
+                // ⭐️ 過濾純標點符號（在簡繁轉換之前過濾，避免無意義處理）
+                guard !isPunctuationOnly(rawText) else {
+                    print("🔒 [VAD Commit] 跳過純標點: \"\(rawText)\"")
+                    // 重置狀態
+                    currentInterimText = ""
+                    lastInterimLength = 0
+                    pendingSegments = []
+                    pendingSourceText = ""
+                    return
+                }
+
                 // ⭐️ 標記為已 commit，讓後續的 async 翻譯回調被忽略
                 isCommitted = true
 
@@ -807,17 +837,6 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     for word in words.prefix(3) {
                         print("   📍 \(word.text ?? "") @ \(word.start ?? 0)s")
                     }
-                }
-
-                // ⭐️ 過濾純標點符號
-                let meaningfulChars = transcriptText.filter { !$0.isPunctuation && !$0.isWhitespace }
-                guard !meaningfulChars.isEmpty else {
-                    // 純標點，跳過
-                    currentInterimText = ""
-                    lastInterimLength = 0
-                    pendingSegments = []
-                    pendingSourceText = ""
-                    return
                 }
 
                 // ⭐️ VAD commit 時確認句子
