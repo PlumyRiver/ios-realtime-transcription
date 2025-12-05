@@ -682,7 +682,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         // ⭐️ 顯示 LLM 檢測的語言方向
         let langInfo = response.detectedLang.map { "\($0) → \(response.translatedTo ?? "?")" } ?? "?"
-        print("✂️ [智能翻譯] \(response.segments.count) 段 (\(langInfo)) (interim 模式)")
+        print("✂️ [智能翻譯] \(response.segments.count) 段 (\(langInfo))")
 
         // ⭐️ 保存分句結果（等待 VAD commit 時使用）
         pendingSegments = response.segments.compactMap { segment in
@@ -694,19 +694,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         pendingConfirmOffset = response.lastCompleteOffset
         pendingSourceText = originalText  // ⭐️ 記錄這個翻譯對應的原文
 
-        // ⭐️ 在 interim 階段：整段文本作為 interim 發送
-        // 不切分，保持完整性
-        // ⭐️ 使用 LLM 檢測的語言（如果有），否則本地檢測
-        let detectedLanguage = response.detectedLang ?? detectLanguageFromText(originalText)
-        let transcript = TranscriptMessage(
-            text: originalText,
-            isFinal: false,
-            confidence: 0.7,
-            language: detectedLanguage
-        )
-        transcriptSubject.send(transcript)
-
-        // ⭐️ 合併所有翻譯作為 interim 翻譯
+        // ⭐️ 只發送翻譯結果（轉錄已在 partial_transcript 時立即發送）
+        // 這樣實現「轉錄先顯示，翻譯異步更新」
         // 過濾掉錯誤佔位符（[請稍候]、[翻譯失敗] 等）
         let validTranslations = response.segments.compactMap { $0.translation }.filter { translation in
             !translation.hasPrefix("[") || !translation.hasSuffix("]")
@@ -714,7 +703,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         let allTranslations = validTranslations.joined(separator: " ")
         if !allTranslations.isEmpty {
             translationSubject.send((originalText, allTranslations))
-            print("⏳ [interim] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
+            print("🌐 [翻譯] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
         }
     }
 
@@ -871,10 +860,21 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     print("⋯ [partial] \(transcriptText.prefix(30))...")
                 }
 
-                // ⭐️ 只更新 currentInterimText，不發送 interim
-                // interim 由 processSmartTranslateResponse 統一發送（帶翻譯）
-                // 避免重複發送導致 UI 混亂
+                // 更新 currentInterimText（用於定時翻譯和自動提升）
                 currentInterimText = transcriptText
+
+                // ⭐️ 立即發送 interim 轉錄（不等翻譯）
+                // 讓轉錄盡快顯示在 UI 上，翻譯稍後異步更新
+                let detectedLanguage = response.detectedLanguage ?? detectLanguageFromText(transcriptText)
+                let transcript = TranscriptMessage(
+                    text: transcriptText,
+                    isFinal: false,
+                    confidence: 0.7,
+                    language: detectedLanguage,
+                    converted: wasConverted,
+                    originalText: wasConverted ? rawText : nil
+                )
+                transcriptSubject.send(transcript)
 
             case "committed_transcript":
                 // ⭐️ 忽略此訊息，只處理 committed_transcript_with_timestamps
