@@ -457,6 +457,27 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         return meaningfulChars.isEmpty
     }
 
+    /// ⭐️ 檢查翻譯是否為錯誤佔位符
+    /// 用於過濾 [請稀候]、[翻譯失敗] 等佔位符
+    private func isErrorPlaceholder(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        // 檢查是否為 [xxx] 格式的佔位符
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            return true
+        }
+        return false
+    }
+
+    /// ⭐️ 從 pendingSegments 獲取有效翻譯（過濾佔位符）
+    private func getValidTranslationFromPending() -> String? {
+        let validTranslations = pendingSegments
+            .map { $0.translation }
+            .filter { !isErrorPlaceholder($0) }
+
+        guard !validTranslations.isEmpty else { return nil }
+        return validTranslations.joined(separator: " ")
+    }
+
     /// 發送 commit 信號（結束當前語句）
     private func sendCommit() {
         guard connectionState == .connected else { return }
@@ -591,13 +612,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         transcriptSubject.send(transcript)
         print("✅ [自動 Final] \(transcriptText.prefix(40))...")
 
-        // ⭐️ 使用 pendingSegments 的翻譯（如果有且匹配）
-        if !pendingSegments.isEmpty && pendingSourceText == transcriptText {
-            let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
-            translationSubject.send((transcriptText, combinedTranslation))
-            print("   🌐 使用已有翻譯: \(combinedTranslation.prefix(40))...")
+        // ⭐️ 使用 pendingSegments 的翻譯（如果有且匹配，且不是佔位符）
+        if !pendingSegments.isEmpty && pendingSourceText == transcriptText,
+           let validTranslation = getValidTranslationFromPending() {
+            translationSubject.send((transcriptText, validTranslation))
+            print("   🌐 使用已有翻譯: \(validTranslation.prefix(40))...")
         } else {
-            // 沒有現成翻譯，異步請求
+            // 沒有現成翻譯或翻譯是佔位符，異步請求
             Task {
                 await self.translateTextDirectly(transcriptText, isInterim: false)
             }
@@ -957,11 +978,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 let isPendingPartialMatch = !pendingSegments.isEmpty && transcriptText.hasPrefix(pendingSourceText) && pendingSourceText != transcriptText
                 let isPendingReverseMatch = !pendingSegments.isEmpty && pendingSourceText.hasPrefix(transcriptText) && pendingSourceText != transcriptText
 
-                if isPendingExactMatch {
-                    // ✅ 完全匹配：直接使用 pendingSegments 的翻譯
-                    let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
-                    translationSubject.send((transcriptText, combinedTranslation))
-                    print("✅ [確認] 完全匹配: \(transcriptText.prefix(40))... → \(combinedTranslation.prefix(40))...")
+                if isPendingExactMatch, let validTranslation = getValidTranslationFromPending() {
+                    // ✅ 完全匹配且翻譯有效：直接使用 pendingSegments 的翻譯
+                    translationSubject.send((transcriptText, validTranslation))
+                    print("✅ [確認] 完全匹配: \(transcriptText.prefix(40))... → \(validTranslation.prefix(40))...")
                 } else if isPendingPartialMatch {
                     // ⚠️ 部分匹配：翻譯不完整（句子說完後才 commit，但最後一次翻譯是在句子中間）
                     // 需要重新翻譯完整句子
@@ -971,11 +991,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     Task {
                         await self.translateTextDirectly(transcriptText, isInterim: false)
                     }
-                } else if isPendingReverseMatch {
+                } else if isPendingReverseMatch, let validTranslation = getValidTranslationFromPending() {
                     // ⚠️ 異常情況：VAD commit 的文本比翻譯的原文短
                     // 可能是 ElevenLabs 截斷了文本，使用現有翻譯但記錄警告
-                    let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
-                    translationSubject.send((transcriptText, combinedTranslation))
+                    translationSubject.send((transcriptText, validTranslation))
                     print("⚠️ [確認] 異常：commit 文本較短，使用現有翻譯")
                     print("   commit: \(transcriptText.prefix(50))...")
                     print("   翻譯原文: \(pendingSourceText.prefix(50))...")
