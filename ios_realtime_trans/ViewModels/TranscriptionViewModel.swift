@@ -516,20 +516,25 @@ final class TranscriptionViewModel {
     }
 
     /// 處理翻譯結果
+    /// ⭐️ 關鍵改進：防止跨語言錯配
+    /// 問題：當用戶說了兩句不同語言（如先中文後英文），
+    ///       翻譯結果（英文）可能會錯配到第二句（也是英文）
+    /// 解決：模糊匹配時檢查語言是否一致，只匹配同語言的 transcript
     private func handleTranslation(sourceText: String, translatedText: String) {
         // 找到對應的轉錄並添加翻譯
         var shouldPlayTTS = false
         var detectedLanguage: String? = nil
 
         // ⭐️ DEBUG: 打印匹配信息
-        print("🔍 [翻譯匹配] sourceText: \"\(sourceText)\"")
+        print("🔍 [翻譯匹配] sourceText: \"\(sourceText.prefix(50))\"")
+        print("🔍 [翻譯匹配] translatedText: \"\(translatedText.prefix(50))\"")
         print("🔍 [翻譯匹配] transcripts 數量: \(transcripts.count)")
-        for (i, t) in transcripts.suffix(3).enumerated() {
-            let match = t.text == sourceText
-            print("🔍 [翻譯匹配] [\(i)] \"\(t.text.prefix(30))...\" | 匹配: \(match)")
-        }
 
-        // ⭐️ 先嘗試精確匹配
+        // ⭐️ 檢測 sourceText 的語言（用於防止跨語言錯配）
+        let sourceTextLang = detectLanguageFromText(sourceText)
+        print("🔍 [翻譯匹配] sourceText 語言: \(sourceTextLang)")
+
+        // ⭐️ 先嘗試精確匹配（最可靠）
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
             // 精確匹配到 final 結果
             let existingTranslation = transcripts[index].translation
@@ -541,8 +546,22 @@ final class TranscriptionViewModel {
             print("✅ [翻譯匹配] 精確匹配到 transcripts[\(index)]")
         }
         // ⭐️ 再嘗試模糊匹配（前綴匹配，處理標點差異）
-        else if let index = transcripts.firstIndex(where: {
-            $0.text.hasPrefix(sourceText) || sourceText.hasPrefix($0.text)
+        // ⭐️ 改進：只匹配語言相同的 transcript，防止跨語言錯配
+        else if let index = transcripts.firstIndex(where: { transcript in
+            let textMatch = transcript.text.hasPrefix(sourceText) || sourceText.hasPrefix(transcript.text)
+            guard textMatch else { return false }
+
+            // ⭐️ 語言檢查：防止跨語言錯配
+            // 如果 transcript 有語言標記，確保與 sourceText 語言一致
+            if let transcriptLang = transcript.language {
+                let transcriptLangBase = transcriptLang.split(separator: "-").first.map(String.init) ?? transcriptLang
+                let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
+                if transcriptLangBase != sourceTextLangBase {
+                    print("⚠️ [翻譯匹配] 語言不匹配，跳過: transcript=\(transcriptLangBase), source=\(sourceTextLangBase)")
+                    return false
+                }
+            }
+            return true
         }) {
             let existingTranslation = transcripts[index].translation
             if existingTranslation == nil || existingTranslation?.isEmpty == true {
@@ -550,24 +569,43 @@ final class TranscriptionViewModel {
             }
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
-            print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]")
+            print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（語言一致）")
         }
         // ⭐️ 只有當 sourceText 和 interimTranscript 匹配時才更新 interim
-        else if let interim = interimTranscript,
-                (interim.text == sourceText ||
-                 interim.text.hasPrefix(sourceText) ||
-                 sourceText.hasPrefix(interim.text)) {
-            interimTranscript?.translation = translatedText
-            detectedLanguage = interim.language
-            print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
+        // ⭐️ 同樣加入語言檢查
+        else if let interim = interimTranscript {
+            let textMatch = interim.text == sourceText ||
+                           interim.text.hasPrefix(sourceText) ||
+                           sourceText.hasPrefix(interim.text)
+
+            // ⭐️ 語言檢查
+            var langMatch = true
+            if let interimLang = interim.language {
+                let interimLangBase = interimLang.split(separator: "-").first.map(String.init) ?? interimLang
+                let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
+                langMatch = interimLangBase == sourceTextLangBase
+            }
+
+            if textMatch && langMatch {
+                interimTranscript?.translation = translatedText
+                detectedLanguage = interim.language
+                print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
+            } else if textMatch && !langMatch {
+                print("⚠️ [翻譯匹配] interim 語言不匹配，丟棄")
+                print("   interim 語言: \(interim.language ?? "nil")")
+                print("   sourceText 語言: \(sourceTextLang)")
+                return
+            } else {
+                print("⚠️ [翻譯匹配] 無法匹配，丟棄翻譯")
+                print("   sourceText: \(sourceText.prefix(30))...")
+                print("   interimText: \(interim.text.prefix(30))...")
+                return
+            }
         }
         // ⭐️ 完全不匹配，丟棄這個翻譯（可能是舊的 async 回調）
         else {
-            print("⚠️ [翻譯匹配] 無法匹配，丟棄翻譯")
+            print("⚠️ [翻譯匹配] 無法匹配，丟棄翻譯（無 interim）")
             print("   sourceText: \(sourceText.prefix(30))...")
-            if let interim = interimTranscript {
-                print("   interimText: \(interim.text.prefix(30))...")
-            }
             return  // ⭐️ 直接返回，不播放 TTS
         }
 
@@ -581,6 +619,47 @@ final class TranscriptionViewModel {
             let targetLangCode = getTargetLanguageCode(for: translatedText)
             enqueueTTS(text: translatedText, languageCode: targetLangCode)
         }
+    }
+
+    /// ⭐️ 簡單的語言檢測（用於防止跨語言錯配）
+    /// 根據文本中的字符類型判斷主要語言
+    private func detectLanguageFromText(_ text: String) -> String {
+        var chineseCount = 0
+        var japaneseCount = 0
+        var koreanCount = 0
+        var latinCount = 0
+
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if value >= 0x4E00 && value <= 0x9FFF {
+                // CJK 統一漢字
+                chineseCount += 1
+            } else if (value >= 0x3040 && value <= 0x309F) || (value >= 0x30A0 && value <= 0x30FF) {
+                // 平假名 + 片假名
+                japaneseCount += 1
+            } else if value >= 0xAC00 && value <= 0xD7AF {
+                // 韓文音節
+                koreanCount += 1
+            } else if (value >= 0x0041 && value <= 0x005A) || (value >= 0x0061 && value <= 0x007A) {
+                // 拉丁字母 (A-Z, a-z)
+                latinCount += 1
+            }
+        }
+
+        // 如果有日文假名，優先判斷為日文
+        if japaneseCount > 0 {
+            return "ja"
+        }
+        // 如果有韓文，判斷為韓文
+        if koreanCount > 0 {
+            return "ko"
+        }
+        // 中文字多於拉丁字，判斷為中文
+        if chineseCount > latinCount {
+            return "zh"
+        }
+        // 預設為英文
+        return "en"
     }
 
     /// 根據 TTS 播放模式判斷是否應該播放
