@@ -32,6 +32,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var lastInterimLength: Int = 0  // 上次 interim 長度（用於檢測是否變長）
     private var lastTranslatedText: String = ""  // 上次翻譯的文本（避免重複翻譯）
 
+    /// ⭐️ Interim 自動提升為 Final 機制
+    /// 當 interim 持續一段時間沒有變長時，自動提升為 final
+    private var lastInterimGrowthTime: Date = Date()  // 上次 interim 變長的時間
+    private let interimStaleThreshold: TimeInterval = 1.0  // 停滯閾值：1 秒
+
     /// ⭐️ 智能分句：基於字符位置追蹤（避免 LLM 分段不一致問題）
     private var confirmedTextLength: Int = 0  // 已確認（發送為 final）的字符長度
     private var lastConfirmedText: String = ""  // 上次確認的完整文本（用於比對）
@@ -146,14 +151,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         sendCount = 0
 
         // 重置翻譯狀態
-        currentInterimText = ""
-        lastInterimLength = 0
+        resetInterimState()
         lastTranslatedText = ""
-        confirmedTextLength = 0  // 重置分句狀態
-        lastConfirmedText = ""
-        pendingConfirmOffset = 0
-        pendingSegments = []
-        pendingSourceText = ""
         isCommitted = false  // 重置 commit 狀態
 
         // 發送結束信號
@@ -518,31 +517,105 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// 檢查並調用智能翻譯（含分句判斷）
+    /// ⭐️ 新增：Interim 停滯超過 1 秒自動提升為 Final
     private func checkAndTranslateInterim() {
         let currentLength = currentInterimText.count
+        let now = Date()
 
-        // 條件 1: 檢查是否有新增（長度變長）
-        guard currentLength > lastInterimLength else {
-            return  // 沒有變長，不翻譯
-        }
+        // ⭐️ 情況 1: 長度變長 → 翻譯並重置計時
+        if currentLength > lastInterimLength {
+            // 更新長度記錄
+            let previousLength = lastInterimLength
+            lastInterimLength = currentLength
+            lastInterimGrowthTime = now  // ⭐️ 重置停滯計時
 
-        // 條件 2: 文本不為空且與上次翻譯不同
-        guard !currentInterimText.isEmpty, currentInterimText != lastTranslatedText else {
+            // 條件檢查：文本不為空且與上次翻譯不同
+            guard !currentInterimText.isEmpty, currentInterimText != lastTranslatedText else {
+                return
+            }
+
+            lastTranslatedText = currentInterimText
+
+            print("📝 [智能翻譯] 長度變長 \(previousLength) → \(currentLength)，調用 smart-translate")
+
+            // 調用智能翻譯 API
+            Task {
+                await callSmartTranslateAPI(text: currentInterimText)
+            }
             return
         }
 
-        let previousLength = lastInterimLength
-
-        // 更新長度記錄
-        lastInterimLength = currentLength
-        lastTranslatedText = currentInterimText
-
-        print("📝 [智能翻譯] 長度變長 \(previousLength) → \(currentLength)，調用 smart-translate")
-
-        // ⭐️ 調用智能翻譯 API（含分句判斷）
-        Task {
-            await callSmartTranslateAPI(text: currentInterimText)
+        // ⭐️ 情況 2: 長度沒變，檢查是否停滯超過閾值
+        // 條件：有內容、未 commit、停滯超過 1 秒
+        guard !currentInterimText.isEmpty,
+              !isCommitted,
+              currentLength > 0 else {
+            return
         }
+
+        let staleDuration = now.timeIntervalSince(lastInterimGrowthTime)
+        if staleDuration >= interimStaleThreshold {
+            // ⭐️ 停滯超過 1 秒，自動提升為 final
+            print("⏰ [自動 Final] interim 停滯 \(String(format: "%.1f", staleDuration)) 秒，自動提升為 final")
+            promoteInterimToFinal()
+        }
+    }
+
+    /// ⭐️ 將當前 interim 提升為 final（用於停滯超時）
+    private func promoteInterimToFinal() {
+        guard !currentInterimText.isEmpty, !isCommitted else { return }
+
+        let transcriptText = currentInterimText
+
+        // 標記為已提升（防止重複）
+        isCommitted = true
+
+        // ⭐️ 過濾純標點符號
+        guard !isPunctuationOnly(transcriptText) else {
+            print("⚠️ [自動 Final] 跳過純標點: \"\(transcriptText)\"")
+            resetInterimState()
+            return
+        }
+
+        // ⭐️ 語言檢測
+        let detectedLanguage = detectLanguageFromText(transcriptText)
+
+        // 發送 final transcript
+        let transcript = TranscriptMessage(
+            text: transcriptText,
+            isFinal: true,
+            confidence: 0.85,  // 自動提升的信心度稍低
+            language: detectedLanguage
+        )
+        transcriptSubject.send(transcript)
+        print("✅ [自動 Final] \(transcriptText.prefix(40))...")
+
+        // ⭐️ 使用 pendingSegments 的翻譯（如果有且匹配）
+        if !pendingSegments.isEmpty && pendingSourceText == transcriptText {
+            let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
+            translationSubject.send((transcriptText, combinedTranslation))
+            print("   🌐 使用已有翻譯: \(combinedTranslation.prefix(40))...")
+        } else {
+            // 沒有現成翻譯，異步請求
+            Task {
+                await self.translateTextDirectly(transcriptText, isInterim: false)
+            }
+        }
+
+        // 重置狀態
+        resetInterimState()
+    }
+
+    /// ⭐️ 重置 interim 相關狀態
+    private func resetInterimState() {
+        currentInterimText = ""
+        lastInterimLength = 0
+        confirmedTextLength = 0
+        lastConfirmedText = ""
+        pendingConfirmOffset = 0
+        pendingSegments = []
+        pendingSourceText = ""
+        lastInterimGrowthTime = Date()  // 重置計時
     }
 
     /// ⭐️ 調用智能翻譯 + 分句 API
@@ -815,11 +888,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 // ⭐️ 過濾純標點符號（在簡繁轉換之前過濾，避免無意義處理）
                 guard !isPunctuationOnly(rawText) else {
                     print("🔒 [VAD Commit] 跳過純標點: \"\(rawText)\"")
-                    // 重置狀態
-                    currentInterimText = ""
-                    lastInterimLength = 0
-                    pendingSegments = []
-                    pendingSourceText = ""
+                    resetInterimState()
                     return
                 }
 
@@ -915,13 +984,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 }
 
                 // ⭐️ 重置所有狀態（準備下一輪）
-                currentInterimText = ""
-                lastInterimLength = 0
-                confirmedTextLength = 0
-                lastConfirmedText = ""
-                pendingConfirmOffset = 0
-                pendingSegments = []
-                pendingSourceText = ""
+                resetInterimState()
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
