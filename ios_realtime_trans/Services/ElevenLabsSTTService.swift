@@ -403,6 +403,53 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         return currentSourceLang.rawValue
     }
 
+    /// ⭐️ 簡體中文轉繁體中文
+    /// 使用 iOS 內建的 ICU StringTransform
+    /// - Parameter text: 原始文本（可能包含簡體字）
+    /// - Returns: 轉換後的繁體文本
+    private func convertToTraditionalChinese(_ text: String) -> String {
+        // 使用 CFStringTransform 進行簡繁轉換
+        let mutableString = NSMutableString(string: text)
+
+        // "Simplified-Traditional" 是 ICU transform ID
+        // 將簡體中文轉換為繁體中文
+        CFStringTransform(mutableString, nil, "Simplified-Traditional" as CFString, false)
+
+        return mutableString as String
+    }
+
+    /// ⭐️ 檢測文本是否包含簡體中文字符
+    /// 通過比較轉換前後是否相同來判斷
+    private func containsSimplifiedChinese(_ text: String) -> Bool {
+        let traditional = convertToTraditionalChinese(text)
+        return traditional != text
+    }
+
+    /// ⭐️ 處理中文文本：如果是簡體則轉換為繁體
+    /// - Parameters:
+    ///   - text: 原始文本
+    ///   - language: 檢測到的語言代碼
+    /// - Returns: (處理後的文本, 是否進行了轉換)
+    private func processChineseText(_ text: String, language: String?) -> (text: String, converted: Bool) {
+        // 只對中文進行處理
+        let lang = language ?? ""
+        let isChinese = lang.hasPrefix("zh") || lang == "cmn" || detectLanguageFromText(text) == "zh"
+
+        guard isChinese else {
+            return (text, false)
+        }
+
+        // 檢查是否需要轉換
+        let traditionalText = convertToTraditionalChinese(text)
+        let wasConverted = traditionalText != text
+
+        if wasConverted {
+            print("🔄 [簡→繁] \(text) → \(traditionalText)")
+        }
+
+        return (traditionalText, wasConverted)
+    }
+
     /// 發送 commit 信號（結束當前語句）
     private func sendCommit() {
         guard connectionState == .connected else { return }
@@ -714,17 +761,24 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 print("✅ [ElevenLabs] Session 開始: \(response.sessionId ?? "N/A")")
 
             case "partial_transcript":
-                guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
+                guard let rawText = response.text, !rawText.isEmpty else { return }
 
                 // ⭐️ 收到新的 partial，解除 commit 狀態
                 // 這樣新的翻譯回調才會被處理
                 isCommitted = false
 
+                // ⭐️ 簡體轉繁體（如果是中文）
+                let (transcriptText, wasConverted) = processChineseText(rawText, language: response.detectedLanguage)
+                if wasConverted {
+                    print("⋯ [partial] \(rawText.prefix(20))... → \(transcriptText.prefix(20))...")
+                } else {
+                    print("⋯ [partial] \(transcriptText.prefix(30))...")
+                }
+
                 // ⭐️ 只更新 currentInterimText，不發送 interim
                 // interim 由 processSmartTranslateResponse 統一發送（帶翻譯）
                 // 避免重複發送導致 UI 混亂
                 currentInterimText = transcriptText
-                print("⋯ [partial] \(transcriptText.prefix(30))...")
 
             case "committed_transcript":
                 // ⭐️ 忽略此訊息，只處理 committed_transcript_with_timestamps
@@ -733,12 +787,19 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 print("📝 [ElevenLabs] committed (等待 with_timestamps): \(transcriptText.prefix(30))...")
 
             case "committed_transcript_with_timestamps":
-                guard let transcriptText = response.text, !transcriptText.isEmpty else { return }
+                guard let rawText = response.text, !rawText.isEmpty else { return }
 
                 // ⭐️ 標記為已 commit，讓後續的 async 翻譯回調被忽略
                 isCommitted = true
 
-                print("🔒 [VAD Commit] 確認句子: \(transcriptText.prefix(40))...")
+                // ⭐️ 簡體轉繁體（如果是中文）
+                let (transcriptText, wasConverted) = processChineseText(rawText, language: response.detectedLanguage)
+
+                if wasConverted {
+                    print("🔒 [VAD Commit] 確認句子: \(rawText.prefix(30))... → \(transcriptText.prefix(30))...")
+                } else {
+                    print("🔒 [VAD Commit] 確認句子: \(transcriptText.prefix(40))...")
+                }
                 print("   🌐 detected_language: \(response.detectedLanguage ?? "nil")")
 
                 // 打印時間戳
@@ -776,7 +837,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     text: transcriptText,
                     isFinal: true,
                     confidence: response.confidence ?? 0.9,
-                    language: detectedLanguage
+                    language: detectedLanguage,
+                    converted: wasConverted,  // ⭐️ 記錄是否進行了簡繁轉換
+                    originalText: wasConverted ? rawText : nil  // ⭐️ 保存原始簡體文本
                 )
                 transcriptSubject.send(transcript)
 
