@@ -634,7 +634,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         transcriptSubject.send(transcript)
 
         // ⭐️ 合併所有翻譯作為 interim 翻譯
-        let allTranslations = response.segments.compactMap { $0.translation }.joined(separator: " ")
+        // 過濾掉錯誤佔位符（[請稍候]、[翻譯失敗] 等）
+        let validTranslations = response.segments.compactMap { $0.translation }.filter { translation in
+            !translation.hasPrefix("[") || !translation.hasSuffix("]")
+        }
+        let allTranslations = validTranslations.joined(separator: " ")
         if !allTranslations.isEmpty {
             translationSubject.send((originalText, allTranslations))
             print("⏳ [interim] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
