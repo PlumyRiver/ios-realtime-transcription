@@ -281,7 +281,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         urlComponents.queryItems = [
             URLQueryItem(name: "model_id", value: modelId),
             URLQueryItem(name: "token", value: token),
-            URLQueryItem(name: "language_code", value: mapLanguageCode(sourceLang)),
+            // ⭐️ 使用 auto 自動檢測語言，支援雙向翻譯場景
+            // 如果固定為某語言（如 zh），說英文時會被錯誤識別
+            URLQueryItem(name: "language_code", value: "auto"),
             URLQueryItem(name: "include_timestamps", value: "true"),
             URLQueryItem(name: "commit_strategy", value: "vad"),  // ⭐️ 使用 VAD 自動 commit
             URLQueryItem(name: "vad_silence_threshold_secs", value: "1.0"),  // 1 秒靜音後 commit
