@@ -20,6 +20,7 @@
 
 import Foundation
 import AVFoundation
+import AVFAudio
 import Combine
 import WebRTC
 
@@ -253,6 +254,25 @@ final class WebRTCAudioManager: NSObject {
             print("❌ [WebRTC] 更新輸出路由失敗: \(error)")
         }
         rtcAudioSession.unlockForConfiguration()
+    }
+
+    // MARK: - Voice Isolation
+
+    /// 顯示系統麥克風模式選擇器（Voice Isolation、Wide Spectrum、Standard）
+    /// 需要在麥克風正在使用時調用
+    func showMicrophoneModeSelector() {
+        AVCaptureDevice.showSystemUserInterface(.microphoneModes)
+        print("🎤 [WebRTC] 顯示麥克風模式選擇器")
+    }
+
+    /// 獲取當前偏好的麥克風模式
+    var preferredMicrophoneMode: AVCaptureDevice.MicrophoneMode {
+        AVCaptureDevice.preferredMicrophoneMode
+    }
+
+    /// 獲取當前啟用的麥克風模式
+    var activeMicrophoneMode: AVCaptureDevice.MicrophoneMode {
+        AVCaptureDevice.activeMicrophoneMode
     }
 
     // MARK: - Permission
@@ -728,6 +748,17 @@ extension WebRTCAudioManager: RTCAudioDeviceModuleDelegate {
         guard let inputSource = source else {
             print("⚠️ [WebRTC Delegate] Source 為 nil，無法安裝 tap")
             return 0
+        }
+
+        // ⭐️ 啟用 Voice Processing（支援系統 Voice Isolation）
+        let inputNode = engine.inputNode
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+            inputNode.isVoiceProcessingAGCEnabled = true
+            inputNode.isVoiceProcessingBypassed = false
+            print("✅ [WebRTC Delegate] Voice Processing 已啟用（支援 Voice Isolation）")
+        } catch {
+            print("⚠️ [WebRTC Delegate] Voice Processing 啟用失敗: \(error)")
         }
 
         // 創建 Mixer 節點用於 tap

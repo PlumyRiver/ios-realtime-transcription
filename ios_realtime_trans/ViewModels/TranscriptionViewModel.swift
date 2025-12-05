@@ -7,6 +7,7 @@
 
 import Foundation
 import Combine
+import AVFoundation
 
 /// 連接狀態
 enum ConnectionStatus {
@@ -304,6 +305,32 @@ final class TranscriptionViewModel {
         isSpeakerMode.toggle()
         // AudioManager 會通過 didSet 自動同步
         print("🔊 [ViewModel] 擴音模式: \(isSpeakerMode ? "開啟" : "關閉")")
+    }
+
+    // MARK: - Voice Isolation
+
+    /// 顯示系統麥克風模式選擇器（Voice Isolation、Wide Spectrum、Standard）
+    /// 需要在錄音中調用
+    func showMicrophoneModeSelector() {
+        guard isRecording else {
+            print("⚠️ [ViewModel] 請先開始錄音再設定麥克風模式")
+            return
+        }
+        audioManager.showMicrophoneModeSelector()
+    }
+
+    /// 獲取當前麥克風模式的顯示名稱
+    var currentMicrophoneModeDisplayName: String {
+        switch audioManager.activeMicrophoneMode {
+        case .standard:
+            return "標準"
+        case .wideSpectrum:
+            return "寬頻譜"
+        case .voiceIsolation:
+            return "人聲隔離"
+        @unknown default:
+            return "未知"
+        }
     }
 
     // MARK: - Input Mode Methods
