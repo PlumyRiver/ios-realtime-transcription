@@ -782,16 +782,39 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
                 // ⭐️ 使用 pendingSegments 的翻譯（如果有，且原文匹配）
                 // 防止 race condition：pendingSegments 可能是上一句話的翻譯
-                let isPendingMatch = !pendingSegments.isEmpty &&
-                    (pendingSourceText == transcriptText ||
-                     transcriptText.hasPrefix(pendingSourceText) ||
-                     pendingSourceText.hasPrefix(transcriptText))
+                //
+                // ⭐️ 關鍵判斷：翻譯是否完整
+                // 情況 1：pendingSourceText == transcriptText（完全匹配，翻譯應該完整）
+                // 情況 2：pendingSourceText 是 transcriptText 的前綴（翻譯不完整，需重新翻譯）
+                // 情況 3：transcriptText 是 pendingSourceText 的前綴（異常情況）
+                // 情況 4：完全不匹配（上一句的翻譯）
 
-                if isPendingMatch {
-                    // ✅ pendingSegments 匹配當前句子
+                let isPendingExactMatch = !pendingSegments.isEmpty && pendingSourceText == transcriptText
+                let isPendingPartialMatch = !pendingSegments.isEmpty && transcriptText.hasPrefix(pendingSourceText) && pendingSourceText != transcriptText
+                let isPendingReverseMatch = !pendingSegments.isEmpty && pendingSourceText.hasPrefix(transcriptText) && pendingSourceText != transcriptText
+
+                if isPendingExactMatch {
+                    // ✅ 完全匹配：直接使用 pendingSegments 的翻譯
                     let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
                     translationSubject.send((transcriptText, combinedTranslation))
-                    print("✅ [確認] \(transcriptText) → \(combinedTranslation)")
+                    print("✅ [確認] 完全匹配: \(transcriptText.prefix(40))... → \(combinedTranslation.prefix(40))...")
+                } else if isPendingPartialMatch {
+                    // ⚠️ 部分匹配：翻譯不完整（句子說完後才 commit，但最後一次翻譯是在句子中間）
+                    // 需要重新翻譯完整句子
+                    print("⚠️ [確認] 翻譯不完整，需重新翻譯")
+                    print("   最終句子: \(transcriptText.prefix(50))...")
+                    print("   已翻譯部分: \(pendingSourceText.prefix(50))...")
+                    Task {
+                        await self.translateTextDirectly(transcriptText, isInterim: false)
+                    }
+                } else if isPendingReverseMatch {
+                    // ⚠️ 異常情況：VAD commit 的文本比翻譯的原文短
+                    // 可能是 ElevenLabs 截斷了文本，使用現有翻譯但記錄警告
+                    let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
+                    translationSubject.send((transcriptText, combinedTranslation))
+                    print("⚠️ [確認] 異常：commit 文本較短，使用現有翻譯")
+                    print("   commit: \(transcriptText.prefix(50))...")
+                    print("   翻譯原文: \(pendingSourceText.prefix(50))...")
                 } else {
                     // ⚠️ pendingSegments 不匹配（可能是上一句的翻譯），重新翻譯
                     if !pendingSegments.isEmpty {
@@ -799,7 +822,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                         print("   期望: \(transcriptText.prefix(30))...")
                         print("   實際: \(pendingSourceText.prefix(30))...")
                     }
-                    print("✅ [確認] \(transcriptText) (需要重新翻譯)")
+                    print("✅ [確認] \(transcriptText.prefix(40))... (需要重新翻譯)")
                     Task {
                         await self.translateTextDirectly(transcriptText, isInterim: false)
                     }

@@ -427,19 +427,24 @@ final class TranscriptionViewModel {
             // 最終結果：添加到列表末尾（最新的在下面）
             var finalTranscript = transcript
 
-            // ⭐️ 保留 interim 的翻譯（定時翻譯的結果）
-            // 同時觸發 TTS 播放（因為 handleTranslation 會跳過已有翻譯的情況）
-            if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
-                finalTranscript.translation = interimTranslation
-                print("✅ [Final] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+            // ⭐️ Chirp3 模式：保留 interim 的翻譯（定時翻譯的結果）
+            // ⭐️ ElevenLabs 模式：不保留，讓 service 層決定是否重新翻譯完整句子
+            //    ElevenLabs 在 VAD commit 時會判斷翻譯是否完整，不完整則重新翻譯
+            if sttProvider == .chirp3 {
+                if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
+                    finalTranscript.translation = interimTranslation
+                    print("✅ [Final/Chirp3] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
 
-                // ⭐️ 從 interim 保留翻譯時，觸發 TTS 播放
-                let detectedLanguage = interimTranscript?.language
-                if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
-                    let targetLangCode = getTargetLanguageCode(for: interimTranslation)
-                    enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
+                    // ⭐️ 從 interim 保留翻譯時，觸發 TTS 播放
+                    let detectedLanguage = interimTranscript?.language
+                    if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
+                        let targetLangCode = getTargetLanguageCode(for: interimTranslation)
+                        enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
+                    }
                 }
             }
+            // ElevenLabs 模式：等待 service 層發送完整翻譯
+            // 不在這裡保留 interim 翻譯，避免不完整翻譯覆蓋後續的完整翻譯
 
             transcripts.append(finalTranscript)
             interimTranscript = nil
