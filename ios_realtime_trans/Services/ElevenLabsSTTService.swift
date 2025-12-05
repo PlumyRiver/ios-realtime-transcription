@@ -41,6 +41,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     ///       只有 ElevenLabs VAD commit 時才真正確認句子
     private var pendingConfirmOffset: Int = 0  // 待確認的 offset（等待 VAD commit）
     private var pendingSegments: [(original: String, translation: String)] = []  // 待確認的分句結果
+    private var pendingSourceText: String = ""  // ⭐️ pendingSegments 對應的原文（用於 VAD commit 時驗證）
 
     /// ⭐️ 防止 race condition：VAD commit 後忽略舊的 async 翻譯回調
     /// 當 VAD commit 時設為 true，收到新 partial 時設為 false
@@ -152,6 +153,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         lastConfirmedText = ""
         pendingConfirmOffset = 0
         pendingSegments = []
+        pendingSourceText = ""
         isCommitted = false  // 重置 commit 狀態
 
         // 發送結束信號
@@ -557,6 +559,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             return nil
         }
         pendingConfirmOffset = response.lastCompleteOffset
+        pendingSourceText = originalText  // ⭐️ 記錄這個翻譯對應的原文
 
         // ⭐️ 在 interim 階段：整段文本作為 interim 發送
         // 不切分，保持完整性
@@ -752,6 +755,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     currentInterimText = ""
                     lastInterimLength = 0
                     pendingSegments = []
+                    pendingSourceText = ""
                     return
                 }
 
@@ -776,15 +780,26 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 )
                 transcriptSubject.send(transcript)
 
-                // ⭐️ 使用 pendingSegments 的翻譯（如果有）
-                if !pendingSegments.isEmpty {
-                    // 合併所有翻譯
+                // ⭐️ 使用 pendingSegments 的翻譯（如果有，且原文匹配）
+                // 防止 race condition：pendingSegments 可能是上一句話的翻譯
+                let isPendingMatch = !pendingSegments.isEmpty &&
+                    (pendingSourceText == transcriptText ||
+                     transcriptText.hasPrefix(pendingSourceText) ||
+                     pendingSourceText.hasPrefix(transcriptText))
+
+                if isPendingMatch {
+                    // ✅ pendingSegments 匹配當前句子
                     let combinedTranslation = pendingSegments.map { $0.translation }.joined(separator: " ")
                     translationSubject.send((transcriptText, combinedTranslation))
                     print("✅ [確認] \(transcriptText) → \(combinedTranslation)")
                 } else {
-                    // 沒有翻譯結果，調用翻譯 API
-                    print("✅ [確認] \(transcriptText)")
+                    // ⚠️ pendingSegments 不匹配（可能是上一句的翻譯），重新翻譯
+                    if !pendingSegments.isEmpty {
+                        print("⚠️ [確認] pendingSegments 不匹配，忽略舊翻譯")
+                        print("   期望: \(transcriptText.prefix(30))...")
+                        print("   實際: \(pendingSourceText.prefix(30))...")
+                    }
+                    print("✅ [確認] \(transcriptText) (需要重新翻譯)")
                     Task {
                         await self.translateTextDirectly(transcriptText, isInterim: false)
                     }
@@ -797,6 +812,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 lastConfirmedText = ""
                 pendingConfirmOffset = 0
                 pendingSegments = []
+                pendingSourceText = ""
 
             case "auth_error", "quota_exceeded_error", "throttled_error", "rate_limited_error":
                 let errorMsg = response.message ?? "認證或配額錯誤"
