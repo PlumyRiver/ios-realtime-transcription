@@ -885,6 +885,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "committed_transcript_with_timestamps":
                 guard let rawText = response.text, !rawText.isEmpty else { return }
 
+                // ⭐️ 防止重複：如果已經被自動提升為 final，跳過 VAD commit
+                // 場景：用戶停止說話 → 1秒後自動 final → VAD 也發送 commit
+                // 這時 isCommitted = true，避免同一句話出現兩次
+                if isCommitted {
+                    print("⚠️ [VAD Commit] 已被自動提升，跳過: \"\(rawText.prefix(30))...\"")
+                    return
+                }
+
                 // ⭐️ 過濾純標點符號（在簡繁轉換之前過濾，避免無意義處理）
                 guard !isPunctuationOnly(rawText) else {
                     print("🔒 [VAD Commit] 跳過純標點: \"\(rawText)\"")
