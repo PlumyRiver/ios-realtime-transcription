@@ -6,10 +6,25 @@
 //
 
 import SwiftUI
+import UIKit
+
+/// ⭐️ 用於追蹤 ScrollView 滾動位置的 PreferenceKey
+struct ScrollOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
 
 struct ContentView: View {
     @State private var viewModel = TranscriptionViewModel()
     @State private var showSettings = false
+
+    /// ⭐️ 用戶是否正在查看舊訊息（手動往上滾動）
+    @State private var isUserScrolledUp = false
+
+    /// ⭐️ 是否已經預取過 token（防止重複預取）
+    @State private var hasPreFetchedToken = false
 
     var body: some View {
         NavigationStack {
@@ -44,11 +59,43 @@ struct ContentView: View {
                                 )
                                 .id("interim")
                             }
+                            // ⭐️ 底部錨點（用於檢測滾動位置）
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottomAnchor")
                         }
                         .padding()
+                        // ⭐️ 使用 GeometryReader 追蹤內容位置
+                        .background(
+                            GeometryReader { geometry in
+                                Color.clear
+                                    .preference(
+                                        key: ScrollOffsetPreferenceKey.self,
+                                        value: geometry.frame(in: .named("scrollView")).maxY
+                                    )
+                            }
+                        )
                     }
+                    .coordinateSpace(name: "scrollView")
+                    // ⭐️ 檢測手勢：用戶向下滑動表示在查看舊訊息
+                    .simultaneousGesture(
+                        DragGesture()
+                            .onChanged { value in
+                                if value.translation.height > 30 {
+                                    // 用戶向下滑動（往上看舊訊息）
+                                    if !isUserScrolledUp {
+                                        isUserScrolledUp = true
+                                        print("📜 [Scroll] 用戶開始查看舊訊息")
+                                    }
+                                }
+                            }
+                    )
                     .onChange(of: viewModel.transcripts.count) { _, _ in
-                        // 自動滾動到最新訊息
+                        // ⭐️ 只有在用戶沒有往上滾動時才自動滾動
+                        guard !isUserScrolledUp else {
+                            print("📜 [Scroll] 用戶正在查看舊訊息，不自動滾動")
+                            return
+                        }
                         if let lastId = viewModel.transcripts.last?.id {
                             withAnimation {
                                 proxy.scrollTo(lastId, anchor: .bottom)
@@ -56,9 +103,46 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: viewModel.interimTranscript) { _, _ in
-                        // 滾動到 interim
+                        // ⭐️ 只有在用戶沒有往上滾動時才自動滾動
+                        guard !isUserScrolledUp else { return }
                         withAnimation {
                             proxy.scrollTo("interim", anchor: .bottom)
+                        }
+                    }
+                    // ⭐️ 「返回最新」指示條（細長、低調、置中）
+                    .overlay(alignment: .bottom) {
+                        if isUserScrolledUp {
+                            Button {
+                                isUserScrolledUp = false
+                                withAnimation {
+                                    if viewModel.interimTranscript != nil {
+                                        proxy.scrollTo("interim", anchor: .bottom)
+                                    } else if let lastId = viewModel.transcripts.last?.id {
+                                        proxy.scrollTo(lastId, anchor: .bottom)
+                                    } else {
+                                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 10, weight: .semibold))
+                                    Text("新訊息")
+                                        .font(.system(size: 11, weight: .medium))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 10, weight: .semibold))
+                                }
+                                .foregroundStyle(.white.opacity(0.9))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.black.opacity(0.5))
+                                )
+                            }
+                            .padding(.bottom, 8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                            .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
                         }
                     }
                 }
@@ -90,6 +174,13 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView(viewModel: viewModel)
             }
+            // ⭐️ App 出現時預取 ElevenLabs token（只執行一次）
+            .onAppear {
+                if !hasPreFetchedToken {
+                    hasPreFetchedToken = true
+                    viewModel.prefetchElevenLabsToken()
+                }
+            }
         }
     }
 }
@@ -105,6 +196,8 @@ struct ConversationBubbleView: View {
 
     /// 隱藏狀態
     @State private var isHidden: Bool = false
+    /// 複製反饋狀態
+    @State private var showCopiedFeedback: Bool = false
 
     /// 判斷是否為來源語言（用戶說的話）
     /// 根據 Chirp3 返回的語言代碼與用戶設定的來源語言比較
@@ -170,16 +263,16 @@ struct ConversationBubbleView: View {
                 Spacer(minLength: 60)
             }
         }
-        .opacity(transcript.isFinal ? 1.0 : 0.8)
+        // ⭐️ 不再使用透明度區分 interim/final，讓所有氣泡看起來一樣
     }
 
     /// 氣泡內容
     private var bubbleContent: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // 原文
+            // 原文（⭐️ 不再區分 interim/final 的顏色）
             Text(transcript.text)
                 .font(.body)
-                .foregroundStyle(transcript.isFinal ? textColor : textColor.opacity(0.7))
+                .foregroundStyle(textColor)
 
             // 翻譯（較小字體）
             if let translation = transcript.translation {
@@ -188,21 +281,17 @@ struct ConversationBubbleView: View {
                     .foregroundStyle(secondaryTextColor)
             }
 
-            // 元數據行
+            // 元數據行（⭐️ 簡化：不顯示 TypingIndicator，interim 和 final 看起來完全一樣）
             HStack(spacing: 6) {
                 if let language = transcript.language {
                     Text(languageDisplayName(language))
                         .font(.caption2)
                 }
 
-                if transcript.isFinal && transcript.confidence > 0 {
+                if transcript.confidence > 0 {
                     Text("·")
                     Text("\(Int(transcript.confidence * 100))%")
                         .font(.caption2)
-                }
-
-                if !transcript.isFinal {
-                    TypingIndicator()
                 }
             }
             .foregroundStyle(isSourceLanguage ? Color.white.opacity(0.6) : Color.gray)
@@ -228,13 +317,22 @@ struct ConversationBubbleView: View {
         .cornerRadius(12)
     }
 
-    /// 控制按鈕組（播放 + 隱藏/顯示）
+    /// 控制按鈕組（複製 + 播放 + 隱藏/顯示）
     private var controlButtons: some View {
         VStack(spacing: 6) {
+            // 複製按鈕
+            Button {
+                copyAllContent()
+            } label: {
+                Image(systemName: showCopiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
+                    .font(.title3)
+                    .foregroundStyle(showCopiedFeedback ? .green : .gray)
+            }
+
             // 播放按鈕
             Button {
-                let langCode = mapLanguageCode(targetLang.rawValue)
-                onPlayTTS?(transcript.translation!, langCode)
+                // ⭐️ 直接使用 Language enum 的 azureLocale 屬性
+                onPlayTTS?(transcript.translation!, targetLang.azureLocale)
             } label: {
                 Image(systemName: "play.circle.fill")
                     .font(.title2)
@@ -250,6 +348,26 @@ struct ConversationBubbleView: View {
                 Image(systemName: isHidden ? "eye.fill" : "xmark.circle.fill")
                     .font(.title3)
                     .foregroundStyle(isHidden ? .green : .gray)
+            }
+        }
+    }
+
+    /// 複製原文和翻譯到剪貼簿
+    private func copyAllContent() {
+        var content = transcript.text
+        if let translation = transcript.translation {
+            content += "\n\n" + translation
+        }
+
+        UIPasteboard.general.string = content
+
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showCopiedFeedback = true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showCopiedFeedback = false
             }
         }
     }
@@ -273,27 +391,6 @@ struct ConversationBubbleView: View {
             "vi": "Tiếng Việt"
         ]
         return names[base] ?? code
-    }
-
-    private func mapLanguageCode(_ lang: String) -> String {
-        // 映射簡單語言代碼到 Azure TTS 完整格式
-        let mapping: [String: String] = [
-            "zh": "zh-TW",
-            "en": "en-US",
-            "ja": "ja-JP",
-            "ko": "ko-KR",
-            "es": "es-ES",
-            "fr": "fr-FR",
-            "de": "de-DE",
-            "it": "it-IT",
-            "pt": "pt-BR",
-            "ru": "ru-RU",
-            "ar": "ar-SA",
-            "hi": "hi-IN",
-            "th": "th-TH",
-            "vi": "vi-VN"
-        ]
-        return mapping[lang] ?? "zh-TW"
     }
 
 }
@@ -380,25 +477,17 @@ struct BottomControlBar: View {
 struct LanguageSelectorRow: View {
     @Bindable var viewModel: TranscriptionViewModel
 
+    // 控制全螢幕語言選擇器
+    @State private var showSourcePicker = false
+    @State private var showTargetPicker = false
+
     var body: some View {
         HStack(spacing: 12) {
             // 語言選擇器
             HStack(spacing: 8) {
-                // 來源語言
-                Menu {
-                    ForEach(Language.allCases, id: \.self) { lang in
-                        Button {
-                            viewModel.sourceLang = lang
-                        } label: {
-                            HStack {
-                                Text(lang.flag)
-                                Text(lang.displayName)
-                                if viewModel.sourceLang == lang {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
+                // 來源語言按鈕
+                Button {
+                    showSourcePicker = true
                 } label: {
                     HStack(spacing: 4) {
                         Text(viewModel.sourceLang.flag)
@@ -415,21 +504,9 @@ struct LanguageSelectorRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                // 目標語言
-                Menu {
-                    ForEach(Language.allCases, id: \.self) { lang in
-                        Button {
-                            viewModel.targetLang = lang
-                        } label: {
-                            HStack {
-                                Text(lang.flag)
-                                Text(lang.displayName)
-                                if viewModel.targetLang == lang {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
+                // 目標語言按鈕
+                Button {
+                    showTargetPicker = true
                 } label: {
                     HStack(spacing: 4) {
                         Text(viewModel.targetLang.flag)
@@ -452,6 +529,28 @@ struct LanguageSelectorRow: View {
 
             // ⭐️ 模式切換開關（仿開講AI設計）
             InputModeToggle(viewModel: viewModel)
+        }
+        // 來源語言全螢幕選擇器
+        .fullScreenCover(isPresented: $showSourcePicker) {
+            LanguagePickerSheet(
+                selectedLanguage: Binding(
+                    get: { viewModel.sourceLang },
+                    set: { viewModel.sourceLang = $0 }
+                ),
+                title: "選擇來源語言",
+                includeAuto: true
+            )
+        }
+        // 目標語言全螢幕選擇器
+        .fullScreenCover(isPresented: $showTargetPicker) {
+            LanguagePickerSheet(
+                selectedLanguage: Binding(
+                    get: { viewModel.targetLang },
+                    set: { viewModel.targetLang = $0 }
+                ),
+                title: "選擇目標語言",
+                includeAuto: false
+            )
         }
     }
 }
@@ -512,6 +611,9 @@ struct DualIconControlRow: View {
     @State private var isPressed: Bool = false
     @State private var pulseAnimation: Bool = false
 
+    /// ⭐️ 預先初始化 Haptic Feedback Generator，避免第一次點擊延遲
+    private let hapticGenerator = UIImpactFeedbackGenerator(style: .light)
+
     /// 按鈕尺寸（兩者相同）
     private let buttonSize: CGFloat = 80
     private let iconSize: CGFloat = 32
@@ -565,6 +667,8 @@ struct DualIconControlRow: View {
         .padding(.vertical, 8)
         .onAppear {
             if isVADMode { pulseAnimation = true }
+            // ⭐️ 預熱 Haptic Engine，避免第一次點擊延遲
+            hapticGenerator.prepare()
         }
         .onChange(of: isVADMode) { _, newValue in
             pulseAnimation = newValue
@@ -594,10 +698,22 @@ struct DualIconControlRow: View {
 
     private var speakerButton: some View {
         Button {
+            // ⭐️ 診斷：記錄點擊時間
+            let startTime = CFAbsoluteTimeGetCurrent()
+
             // 切換到下一個 TTS 播放模式
             viewModel.ttsPlaybackMode = viewModel.ttsPlaybackMode.next()
-            let generator = UIImpactFeedbackGenerator(style: .light)
-            generator.impactOccurred()
+
+            // ⭐️ 診斷：記錄狀態更新完成時間
+            let stateUpdateTime = CFAbsoluteTimeGetCurrent()
+            print("⏱️ [TTS按鈕] 狀態更新耗時: \(String(format: "%.3f", (stateUpdateTime - startTime) * 1000))ms")
+
+            // 使用預先初始化的 generator，避免延遲
+            hapticGenerator.impactOccurred()
+
+            // ⭐️ 診斷：記錄總耗時
+            let endTime = CFAbsoluteTimeGetCurrent()
+            print("⏱️ [TTS按鈕] 總耗時: \(String(format: "%.3f", (endTime - startTime) * 1000))ms")
         } label: {
             ZStack {
                 // 外圈（活躍時有光暈）
@@ -1208,6 +1324,87 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                // ⭐️ VAD 靈敏度設定（ElevenLabs 專用）
+                if viewModel.sttProvider == .elevenLabs {
+                    Section("語音偵測靈敏度（VAD）") {
+                        // 即時音量顯示
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("麥克風音量")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(Int(viewModel.currentMicVolume * 100))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            }
+
+                            // 音量條
+                            VADVolumeMeter(
+                                currentVolume: viewModel.currentMicVolume,
+                                vadThreshold: viewModel.vadThreshold
+                            )
+                        }
+                        .padding(.vertical, 4)
+
+                        // VAD 閾值滑桿
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("VAD 閾值")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text(vadSensitivityLabel(viewModel.vadThreshold))
+                                    .font(.caption)
+                                    .foregroundStyle(vadSensitivityColor(viewModel.vadThreshold))
+                                    .fontWeight(.medium)
+                            }
+
+                            HStack {
+                                Image(systemName: "ear")
+                                    .foregroundStyle(.green)
+                                    .font(.caption)
+
+                                Slider(value: $viewModel.vadThreshold, in: 0.1...0.8, step: 0.05)
+
+                                Image(systemName: "ear.trianglebadge.exclamationmark")
+                                    .foregroundStyle(.red)
+                                    .font(.caption)
+                            }
+
+                            Text("音量超過閾值線（虛線）才會觸發語音識別")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+
+                        // 最小語音長度
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("最小語音長度")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(viewModel.minSpeechDurationMs) ms")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                            }
+
+                            Picker("", selection: $viewModel.minSpeechDurationMs) {
+                                Text("100 ms（敏感）").tag(100)
+                                Text("200 ms").tag(200)
+                                Text("300 ms（建議）").tag(300)
+                                Text("500 ms（嚴格）").tag(500)
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text("語音必須持續超過此時間才會被識別，可過濾短噪音")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
                 Section("伺服器設定") {
                     TextField("伺服器 URL", text: $viewModel.serverURL)
                         .textContentType(.URL)
@@ -1252,6 +1449,12 @@ struct SettingsView: View {
             }
             .onAppear {
                 volumeValue = viewModel.ttsVolume
+                // ⭐️ 設定頁面出現時啟用音量監測
+                viewModel.isVolumeMonitoringEnabled = true
+            }
+            .onDisappear {
+                // ⭐️ 設定頁面消失時禁用音量監測，避免不必要的 UI 更新
+                viewModel.isVolumeMonitoringEnabled = false
             }
         }
     }
@@ -1263,6 +1466,36 @@ struct SettingsView: View {
             return .orange
         } else {
             return .red
+        }
+    }
+
+    /// VAD 靈敏度標籤
+    private func vadSensitivityLabel(_ threshold: Float) -> String {
+        if threshold < 0.25 {
+            return "非常敏感"
+        } else if threshold < 0.4 {
+            return "敏感"
+        } else if threshold < 0.55 {
+            return "標準"
+        } else if threshold < 0.7 {
+            return "嚴格"
+        } else {
+            return "非常嚴格"
+        }
+    }
+
+    /// VAD 靈敏度顏色
+    private func vadSensitivityColor(_ threshold: Float) -> Color {
+        if threshold < 0.25 {
+            return .red
+        } else if threshold < 0.4 {
+            return .orange
+        } else if threshold < 0.55 {
+            return .blue
+        } else if threshold < 0.7 {
+            return .purple
+        } else {
+            return .gray
         }
     }
 
@@ -1288,6 +1521,63 @@ struct SettingsView: View {
         case .elevenLabs:
             return .blue
         }
+    }
+}
+
+// MARK: - VAD 音量條視圖
+
+/// 顯示即時麥克風音量和 VAD 閾值的視覺化組件
+struct VADVolumeMeter: View {
+    let currentVolume: Float
+    let vadThreshold: Float
+
+    /// 音量條顏色（根據是否超過閾值變化）
+    private var volumeBarColor: Color {
+        if currentVolume >= vadThreshold {
+            return .green  // 超過閾值：綠色（會觸發 VAD）
+        } else {
+            return .gray   // 低於閾值：灰色（不會觸發）
+        }
+    }
+
+    /// 閾值線顏色
+    private var thresholdLineColor: Color {
+        currentVolume >= vadThreshold ? .green : .orange
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                // 背景
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(.systemGray5))
+
+                // 音量條
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(
+                        LinearGradient(
+                            colors: [volumeBarColor.opacity(0.7), volumeBarColor],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(0, geometry.size.width * CGFloat(currentVolume)))
+                    .animation(.easeOut(duration: 0.1), value: currentVolume)
+
+                // VAD 閾值線（虛線）
+                Rectangle()
+                    .fill(thresholdLineColor)
+                    .frame(width: 2)
+                    .offset(x: geometry.size.width * CGFloat(vadThreshold) - 1)
+
+                // 閾值標籤
+                Text("閾值")
+                    .font(.system(size: 8))
+                    .foregroundStyle(thresholdLineColor)
+                    .offset(x: geometry.size.width * CGFloat(vadThreshold) - 12, y: -14)
+            }
+        }
+        .frame(height: 24)
     }
 }
 

@@ -147,6 +147,32 @@ final class TranscriptionViewModel {
         }
     }
 
+    // MARK: - VAD 設定
+
+    /// ⭐️ VAD 閾值（0.0 ~ 1.0）
+    /// 越高越嚴格，需要更大聲音才會觸發語音識別
+    var vadThreshold: Float = 0.3 {
+        didSet {
+            elevenLabsService.vadThreshold = vadThreshold
+            print("🎚️ [VAD] 閾值調整: \(vadThreshold)")
+        }
+    }
+
+    /// ⭐️ 最小語音長度（毫秒）
+    var minSpeechDurationMs: Int = 100 {
+        didSet {
+            elevenLabsService.minSpeechDurationMs = minSpeechDurationMs
+            print("🎚️ [VAD] 最小語音長度: \(minSpeechDurationMs)ms")
+        }
+    }
+
+    /// ⭐️ 即時麥克風音量（0.0 ~ 1.0）
+    /// 注意：此變數更新頻繁，僅在設定頁面顯示時啟用更新
+    var currentMicVolume: Float = 0.0
+
+    /// ⭐️ 是否啟用音量監測更新（設定頁面開啟時才啟用）
+    var isVolumeMonitoringEnabled: Bool = false
+
     // MARK: - Private Properties
 
     /// ⭐️ 雙 STT 服務
@@ -181,6 +207,13 @@ final class TranscriptionViewModel {
 
     init() {
         setupSubscriptions()
+        // ⭐️ 不在 init 中預取 token，避免 ViewModel 多次初始化導致重複預取
+        // 改為在 ContentView 的 onAppear 中手動調用
+    }
+
+    /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
+    func prefetchElevenLabsToken() {
+        elevenLabsService.prefetchToken(serverURL: serverURL)
     }
 
     // MARK: - Public Methods
@@ -424,6 +457,24 @@ final class TranscriptionViewModel {
             }
             .store(in: &cancellables)
 
+        // ⭐️ 訂閱 ElevenLabs 分句翻譯結果
+        elevenLabsService.segmentedTranslationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] (sourceText, segments) in
+                guard self?.sttProvider == .elevenLabs else { return }
+                self?.handleSegmentedTranslation(sourceText: sourceText, segments: segments)
+            }
+            .store(in: &cancellables)
+
+        // ⭐️ 訂閱 ElevenLabs 修正事件（替換上一句 Final）
+        elevenLabsService.correctionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] (oldText, newText) in
+                guard self?.sttProvider == .elevenLabs else { return }
+                self?.handleCorrection(oldText: oldText, newText: newText)
+            }
+            .store(in: &cancellables)
+
         elevenLabsService.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] errorMessage in
@@ -441,6 +492,19 @@ final class TranscriptionViewModel {
         audioManager.onEndUtterance = { [weak self] in
             self?.currentSTTService.sendEndUtterance()
         }
+
+        // ⭐️ 訂閱即時麥克風音量（節流：只在設定頁面開啟時更新）
+        audioManager.volumePublisher
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)  // 節流：最多每 100ms 更新一次
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] volume in
+                guard let self = self else { return }
+                // ⭐️ 只在設定頁面開啟時才更新 UI 變數，避免不必要的重繪
+                if self.isVolumeMonitoringEnabled {
+                    self.currentMicVolume = volume
+                }
+            }
+            .store(in: &cancellables)
     }
 
     /// 切換 STT 提供商
@@ -454,6 +518,46 @@ final class TranscriptionViewModel {
             // 最終結果：添加到列表末尾（最新的在下面）
             var finalTranscript = transcript
 
+            // ⭐️ 檢查新句子是否「包含」上一句（ElevenLabs 延續問題）
+            // 例如：上一句 "我都沒懂解說"，新句子 "我都沒懂解說，你們就算吧"
+            // 這種情況下應該刪除上一句，只保留新的完整句子
+            if let lastTranscript = transcripts.last {
+                let newText = transcript.text
+                let lastText = lastTranscript.text
+
+                // 檢查新句子是否以上一句為前綴
+                if newText.hasPrefix(lastText) && newText.count > lastText.count {
+                    // 新句子包含上一句，刪除上一句
+                    print("🔄 [合併] 新句子包含上一句，刪除舊句子")
+                    print("   舊: \"\(lastText.prefix(30))...\"")
+                    print("   新: \"\(newText.prefix(40))...\"")
+                    transcripts.removeLast()
+                }
+                // 也檢查是否有高度重疊（上一句是新句子的前綴，且重疊 >= 70%）
+                else if lastText.count >= 5 {
+                    // 找出最長的共同前綴
+                    var commonPrefixLength = 0
+                    let newChars = Array(newText)
+                    let lastChars = Array(lastText)
+                    for i in 0..<min(newChars.count, lastChars.count) {
+                        if newChars[i] == lastChars[i] {
+                            commonPrefixLength += 1
+                        } else {
+                            break
+                        }
+                    }
+
+                    // 如果共同前綴佔上一句的 70% 以上，視為重複
+                    let overlapRatio = Float(commonPrefixLength) / Float(lastText.count)
+                    if overlapRatio >= 0.7 && commonPrefixLength >= 5 {
+                        print("🔄 [合併] 新句子與上一句高度重疊 (\(Int(overlapRatio * 100))%)，刪除舊句子")
+                        print("   舊: \"\(lastText.prefix(30))...\"")
+                        print("   新: \"\(newText.prefix(40))...\"")
+                        transcripts.removeLast()
+                    }
+                }
+            }
+
             // ⭐️ Chirp3 模式：保留 interim 的翻譯（定時翻譯的結果）
             // ⭐️ ElevenLabs 模式：不保留，讓 service 層決定是否重新翻譯完整句子
             //    ElevenLabs 在 VAD commit 時會判斷翻譯是否完整，不完整則重新翻譯
@@ -465,7 +569,7 @@ final class TranscriptionViewModel {
                     // ⭐️ 從 interim 保留翻譯時，觸發 TTS 播放
                     let detectedLanguage = interimTranscript?.language
                     if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
-                        let targetLangCode = getTargetLanguageCode(for: interimTranslation)
+                        let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
                         enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
                     }
                 }
@@ -615,9 +719,133 @@ final class TranscriptionViewModel {
         }
 
         if shouldPlayTTS {
-            // 判斷翻譯的目標語言
-            let targetLangCode = getTargetLanguageCode(for: translatedText)
+            // 判斷翻譯的目標語言（根據檢測到的原文語言決定）
+            let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
             enqueueTTS(text: translatedText, languageCode: targetLangCode)
+        }
+    }
+
+    /// ⭐️ 處理 ElevenLabs 修正事件
+    /// 當 ElevenLabs 修正之前的識別結果時，替換上一句 Final
+    /// - Parameters:
+    ///   - oldText: 被修正的舊文本（上一句 Final）
+    ///   - newText: 修正後的新文本（當前 interim）
+    private func handleCorrection(oldText: String, newText: String) {
+        print("🔄 [修正] 收到修正事件")
+        print("   舊: \"\(oldText.prefix(40))...\"")
+        print("   新: \"\(newText.prefix(40))...\"")
+
+        // 找到並移除上一句 Final
+        if let index = transcripts.lastIndex(where: { $0.text == oldText }) {
+            let removedTranscript = transcripts.remove(at: index)
+            print("   ✅ 已移除 transcripts[\(index)]: \"\(removedTranscript.text.prefix(30))...\"")
+
+            // 更新統計
+            updateStats()
+        } else {
+            // 嘗試模糊匹配（可能有輕微差異）
+            if let index = transcripts.lastIndex(where: { transcript in
+                // 檢查是否有共同前綴
+                let minLength = min(transcript.text.count, oldText.count)
+                guard minLength >= 4 else { return false }
+                let transcriptPrefix = String(transcript.text.prefix(minLength / 2))
+                let oldTextPrefix = String(oldText.prefix(minLength / 2))
+                return transcriptPrefix == oldTextPrefix
+            }) {
+                let removedTranscript = transcripts.remove(at: index)
+                print("   ✅ 模糊匹配並移除 transcripts[\(index)]: \"\(removedTranscript.text.prefix(30))...\"")
+                updateStats()
+            } else {
+                print("   ⚠️ 未找到匹配的 transcript，可能已被處理")
+            }
+        }
+    }
+
+    /// ⭐️ 處理分句翻譯結果
+    /// 當後端返回多段分句翻譯時，將分句存入對應的 transcript
+    private func handleSegmentedTranslation(sourceText: String, segments: [TranslationSegment]) {
+        guard !segments.isEmpty else { return }
+
+        print("✂️ [分句翻譯匹配] sourceText: \"\(sourceText.prefix(40))...\"")
+        print("   segments: \(segments.count) 段")
+
+        // 檢測 sourceText 的語言（用於防止跨語言錯配）
+        let sourceTextLang = detectLanguageFromText(sourceText)
+        var shouldPlayTTS = false
+        var detectedLanguage: String? = nil
+
+        // ⭐️ 先嘗試精確匹配 transcripts
+        if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
+            let existingTranslation = transcripts[index].translation
+            if existingTranslation == nil || existingTranslation?.isEmpty == true {
+                shouldPlayTTS = true
+            }
+            detectedLanguage = transcripts[index].language
+            transcripts[index].translationSegments = segments
+            transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
+            print("✅ [分句翻譯] 精確匹配到 transcripts[\(index)]，\(segments.count) 段")
+        }
+        // ⭐️ 模糊匹配（前綴匹配，且語言一致）
+        else if let index = transcripts.firstIndex(where: { transcript in
+            let textMatch = transcript.text.hasPrefix(sourceText) || sourceText.hasPrefix(transcript.text)
+            guard textMatch else { return false }
+
+            // 語言檢查
+            if let transcriptLang = transcript.language {
+                let transcriptLangBase = transcriptLang.split(separator: "-").first.map(String.init) ?? transcriptLang
+                let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
+                if transcriptLangBase != sourceTextLangBase {
+                    return false
+                }
+            }
+            return true
+        }) {
+            let existingTranslation = transcripts[index].translation
+            if existingTranslation == nil || existingTranslation?.isEmpty == true {
+                shouldPlayTTS = true
+            }
+            detectedLanguage = transcripts[index].language
+            transcripts[index].translationSegments = segments
+            transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
+            print("✅ [分句翻譯] 模糊匹配到 transcripts[\(index)]，\(segments.count) 段")
+        }
+        // ⭐️ 匹配 interimTranscript
+        else if let interim = interimTranscript {
+            let textMatch = interim.text == sourceText ||
+                           interim.text.hasPrefix(sourceText) ||
+                           sourceText.hasPrefix(interim.text)
+
+            var langMatch = true
+            if let interimLang = interim.language {
+                let interimLangBase = interimLang.split(separator: "-").first.map(String.init) ?? interimLang
+                let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
+                langMatch = interimLangBase == sourceTextLangBase
+            }
+
+            if textMatch && langMatch {
+                interimTranscript?.translationSegments = segments
+                interimTranscript?.translation = segments.map { $0.translation }.joined(separator: " ")
+                detectedLanguage = interim.language
+                print("🔄 [分句翻譯] 更新 interim，\(segments.count) 段")
+            } else {
+                print("⚠️ [分句翻譯] 無法匹配 interim，丟棄")
+                return
+            }
+        } else {
+            print("⚠️ [分句翻譯] 無法匹配任何 transcript，丟棄")
+            return
+        }
+
+        // ⭐️ 根據 TTS 播放模式決定是否播放
+        if shouldPlayTTS {
+            shouldPlayTTS = shouldPlayTTSForMode(detectedLanguage: detectedLanguage)
+        }
+
+        if shouldPlayTTS {
+            // 播放合併後的翻譯
+            let fullTranslation = segments.map { $0.translation }.joined(separator: " ")
+            let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+            enqueueTTS(text: fullTranslation, languageCode: targetLangCode)
         }
     }
 
@@ -690,14 +918,34 @@ final class TranscriptionViewModel {
 
     // MARK: - TTS Methods
 
-    /// 獲取翻譯結果的目標語言代碼
-    private func getTargetLanguageCode(for text: String) -> String {
-        // 簡單判斷：如果是中文字符多，則是中文
-        let chineseCount = text.unicodeScalars.filter { $0.value >= 0x4E00 && $0.value <= 0x9FFF }.count
-        if chineseCount > text.count / 3 {
-            return "zh-TW"
+    /// 獲取翻譯結果的目標語言 Azure locale 代碼
+    /// - Parameters:
+    ///   - detectedLanguage: STT 檢測到的原文語言（如 "zh", "en", "ja" 等）
+    /// - Returns: Azure TTS locale 代碼（如 "zh-TW", "en-US", "ja-JP" 等）
+    ///
+    /// 邏輯說明：
+    /// - 如果原文是「來源語言」→ 翻譯到「目標語言」→ TTS 播放目標語言
+    /// - 如果原文是「目標語言」→ 翻譯到「來源語言」→ TTS 播放來源語言
+    private func getTargetLanguageCode(detectedLanguage: String?) -> String {
+        guard let detected = detectedLanguage else {
+            // 無法檢測，預設使用目標語言
+            return targetLang.azureLocale
         }
-        return "en-US"
+
+        // 提取基礎語言代碼（如 "zh-TW" → "zh"）
+        let detectedBase = detected.split(separator: "-").first.map(String.init) ?? detected
+
+        // 判斷原文語言，決定翻譯目標
+        if detectedBase == sourceLang.rawValue {
+            // 原文是來源語言 → 翻譯到目標語言
+            return targetLang.azureLocale
+        } else if detectedBase == targetLang.rawValue {
+            // 原文是目標語言 → 翻譯到來源語言
+            return sourceLang.azureLocale
+        } else {
+            // 無法判斷，預設使用目標語言
+            return targetLang.azureLocale
+        }
     }
 
     /// 將文本加入 TTS 播放隊列
@@ -809,12 +1057,16 @@ final class TranscriptionViewModel {
     /// - Returns: 是否連接成功
     private func waitForConnection(timeout: TimeInterval) async -> Bool {
         let startTime = Date()
-        let checkInterval: UInt64 = 100_000_000 // 100ms in nanoseconds
+        // ⭐️ 縮短輪詢間隔：50ms（原本 100ms）
+        // 更頻繁檢查可以更快響應連接成功
+        let checkInterval: UInt64 = 50_000_000 // 50ms in nanoseconds
 
         while Date().timeIntervalSince(startTime) < timeout {
             // ⭐️ 檢查當前 STT 服務的連接狀態
             switch currentSTTService.connectionState {
             case .connected:
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("⚡️ [連線] 完成（耗時 \(String(format: "%.2f", elapsed))秒）")
                 return true
             case .error:
                 return false

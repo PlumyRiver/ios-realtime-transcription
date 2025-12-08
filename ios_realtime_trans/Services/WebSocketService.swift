@@ -21,6 +21,10 @@ protocol WebSocketServiceProtocol {
     var connectionState: WebSocketConnectionState { get }
     var transcriptPublisher: AnyPublisher<TranscriptMessage, Never> { get }
     var translationPublisher: AnyPublisher<(String, String), Never> { get }
+    /// ⭐️ 分句翻譯 Publisher：(原文, 分句陣列)
+    var segmentedTranslationPublisher: AnyPublisher<(String, [TranslationSegment]), Never> { get }
+    /// ⭐️ 修正上一句 Publisher：(舊文本, 新文本)
+    var correctionPublisher: AnyPublisher<(String, String), Never> { get }
     var errorPublisher: AnyPublisher<String, Never> { get }
 
     func connect(serverURL: String, sourceLang: Language, targetLang: Language)
@@ -47,6 +51,8 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
     // Combine Publishers
     private let transcriptSubject = PassthroughSubject<TranscriptMessage, Never>()
     private let translationSubject = PassthroughSubject<(String, String), Never>()
+    /// ⭐️ 分句翻譯 Publisher（Chirp3 目前不使用，但需要符合 Protocol）
+    private let segmentedTranslationSubject = PassthroughSubject<(String, [TranslationSegment]), Never>()
     private let errorSubject = PassthroughSubject<String, Never>()
 
     var transcriptPublisher: AnyPublisher<TranscriptMessage, Never> {
@@ -55,6 +61,17 @@ final class WebSocketService: NSObject, WebSocketServiceProtocol {
 
     var translationPublisher: AnyPublisher<(String, String), Never> {
         translationSubject.eraseToAnyPublisher()
+    }
+
+    /// ⭐️ 分句翻譯 Publisher（Chirp3 不使用，返回空 Publisher）
+    var segmentedTranslationPublisher: AnyPublisher<(String, [TranslationSegment]), Never> {
+        segmentedTranslationSubject.eraseToAnyPublisher()
+    }
+
+    /// ⭐️ 修正上一句 Publisher（Chirp3 不使用）
+    private let correctionSubject = PassthroughSubject<(String, String), Never>()
+    var correctionPublisher: AnyPublisher<(String, String), Never> {
+        correctionSubject.eraseToAnyPublisher()
     }
 
     var errorPublisher: AnyPublisher<String, Never> {

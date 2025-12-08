@@ -40,45 +40,123 @@ class AzureTTSService {
     // 回調
     private var onComplete: ((Result<Data, Error>) -> Void)?
 
-    // 多語言語音（支援 41+ 語言的自動檢測）
-    private let multilingualVoices: [String: String] = [
-        "male": "en-US-RyanMultilingualNeural",
-        "female": "en-US-JennyMultilingualNeural"
-    ]
-
-    // 語言特定語音映射
+    // ⭐️ 語言特定語音映射（完整 73 種語言）
+    // 使用 Azure locale code 作為 key，確保精確匹配
     private let voiceMapping: [String: [String: String]] = [
-        "zh": ["male": "zh-TW-YunJheNeural", "female": "zh-TW-HsiaoChenNeural"],
-        "en": ["male": "en-US-GuyNeural", "female": "en-US-JennyNeural"],
-        "ja": ["male": "ja-JP-KeitaNeural", "female": "ja-JP-NanamiNeural"],
-        "ko": ["male": "ko-KR-InJoonNeural", "female": "ko-KR-SunHiNeural"],
-        "es": ["male": "es-ES-AlvaroNeural", "female": "es-ES-ElviraNeural"],
-        "fr": ["male": "fr-FR-HenriNeural", "female": "fr-FR-DeniseNeural"],
-        "de": ["male": "de-DE-ConradNeural", "female": "de-DE-KatjaNeural"],
-        "it": ["male": "it-IT-DiegoNeural", "female": "it-IT-ElsaNeural"],
-        "pt": ["male": "pt-BR-AntonioNeural", "female": "pt-BR-FranciscaNeural"],
-        "ru": ["male": "ru-RU-DmitryNeural", "female": "ru-RU-SvetlanaNeural"],
-        "th": ["male": "th-TH-NiwatNeural", "female": "th-TH-PremwadeeNeural"],
-        "vi": ["male": "vi-VN-NamMinhNeural", "female": "vi-VN-HoaiMyNeural"]
+        // ===== 🔥 台灣人最常用 TOP 20 =====
+        "zh-TW": ["male": "zh-TW-YunJheNeural", "female": "zh-TW-HsiaoChenNeural"],
+        "en-US": ["male": "en-US-GuyNeural", "female": "en-US-JennyNeural"],
+        "ja-JP": ["male": "ja-JP-KeitaNeural", "female": "ja-JP-NanamiNeural"],
+        "ko-KR": ["male": "ko-KR-InJoonNeural", "female": "ko-KR-SunHiNeural"],
+        "vi-VN": ["male": "vi-VN-NamMinhNeural", "female": "vi-VN-HoaiMyNeural"],
+        "th-TH": ["male": "th-TH-NiwatNeural", "female": "th-TH-PremwadeeNeural"],
+        "id-ID": ["male": "id-ID-ArdiNeural", "female": "id-ID-GadisNeural"],
+        "fil-PH": ["male": "fil-PH-AngeloNeural", "female": "fil-PH-BlessicaNeural"],
+        "ms-MY": ["male": "ms-MY-OsmanNeural", "female": "ms-MY-YasminNeural"],
+        "my-MM": ["male": "my-MM-ThihaNeural", "female": "my-MM-NilarNeural"],
+        "km-KH": ["male": "km-KH-PisethNeural", "female": "km-KH-SreymomNeural"],
+        "es-ES": ["male": "es-ES-AlvaroNeural", "female": "es-ES-ElviraNeural"],
+        "fr-FR": ["male": "fr-FR-HenriNeural", "female": "fr-FR-DeniseNeural"],
+        "de-DE": ["male": "de-DE-ConradNeural", "female": "de-DE-KatjaNeural"],
+        "pt-BR": ["male": "pt-BR-AntonioNeural", "female": "pt-BR-FranciscaNeural"],
+        "it-IT": ["male": "it-IT-DiegoNeural", "female": "it-IT-ElsaNeural"],
+        "ru-RU": ["male": "ru-RU-DmitryNeural", "female": "ru-RU-SvetlanaNeural"],
+        "ar-SA": ["male": "ar-SA-HamedNeural", "female": "ar-SA-ZariyahNeural"],
+        "tr-TR": ["male": "tr-TR-AhmetNeural", "female": "tr-TR-EmelNeural"],
+
+        // ===== 🌏 東南亞 =====
+        "lo-LA": ["male": "lo-LA-ChanthavongNeural", "female": "lo-LA-KeomanyNeural"],
+        "jv-ID": ["male": "jv-ID-DimasNeural", "female": "jv-ID-SitiNeural"],
+        "su-ID": ["male": "su-ID-JajangNeural", "female": "su-ID-TutiNeural"],
+
+        // ===== 🌸 東亞 =====
+        "zh-CN": ["male": "zh-CN-YunxiNeural", "female": "zh-CN-XiaoxiaoNeural"],
+        "zh-HK": ["male": "zh-HK-WanLungNeural", "female": "zh-HK-HiuGaaiNeural"],
+
+        // ===== 🕌 南亞 =====
+        "hi-IN": ["male": "hi-IN-MadhurNeural", "female": "hi-IN-SwaraNeural"],
+        "bn-IN": ["male": "bn-IN-BashkarNeural", "female": "bn-IN-TanishaaNeural"],
+        "ta-IN": ["male": "ta-IN-ValluvarNeural", "female": "ta-IN-PallaviNeural"],
+        "te-IN": ["male": "te-IN-MohanNeural", "female": "te-IN-ShrutiNeural"],
+        "mr-IN": ["male": "mr-IN-ManoharNeural", "female": "mr-IN-AarohiNeural"],
+        "gu-IN": ["male": "gu-IN-NiranjanNeural", "female": "gu-IN-DhwaniNeural"],
+        "kn-IN": ["male": "kn-IN-GaganNeural", "female": "kn-IN-SapnaNeural"],
+        "ml-IN": ["male": "ml-IN-MidhunNeural", "female": "ml-IN-SobhanaNeural"],
+        "pa-IN": ["male": "pa-IN-GurpreetNeural", "female": "pa-IN-AmritaNeural"],  // ⚠️ 注意：Azure 可能用 pa-IN
+        "si-LK": ["male": "si-LK-SameeraNeural", "female": "si-LK-ThiliniNeural"],
+        "ne-NP": ["male": "ne-NP-SagarNeural", "female": "ne-NP-HemkalaNeural"],
+        "ur-PK": ["male": "ur-PK-AsadNeural", "female": "ur-PK-UzmaNeural"],
+
+        // ===== 🕌 中東 =====
+        "fa-IR": ["male": "fa-IR-FaridNeural", "female": "fa-IR-DilaraNeural"],
+        "he-IL": ["male": "he-IL-AvriNeural", "female": "he-IL-HilaNeural"],
+        "ar-EG": ["male": "ar-EG-ShakirNeural", "female": "ar-EG-SalmaNeural"],
+
+        // ===== 🇪🇺 歐洲 =====
+        "nl-NL": ["male": "nl-NL-MaartenNeural", "female": "nl-NL-ColetteNeural"],
+        "pl-PL": ["male": "pl-PL-MarekNeural", "female": "pl-PL-AgnieszkaNeural"],
+        "uk-UA": ["male": "uk-UA-OstapNeural", "female": "uk-UA-PolinaNeural"],
+        "cs-CZ": ["male": "cs-CZ-AntoninNeural", "female": "cs-CZ-VlastaNeural"],
+        "ro-RO": ["male": "ro-RO-EmilNeural", "female": "ro-RO-AlinaNeural"],
+        "hu-HU": ["male": "hu-HU-TamasNeural", "female": "hu-HU-NoemiNeural"],
+        "el-GR": ["male": "el-GR-NestorasNeural", "female": "el-GR-AthinaNeural"],
+        "sv-SE": ["male": "sv-SE-MattiasNeural", "female": "sv-SE-SofieNeural"],
+        "da-DK": ["male": "da-DK-JeppeNeural", "female": "da-DK-ChristelNeural"],
+        "fi-FI": ["male": "fi-FI-HarriNeural", "female": "fi-FI-NooraNeural"],
+        "nb-NO": ["male": "nb-NO-FinnNeural", "female": "nb-NO-PernilleNeural"],
+        "sk-SK": ["male": "sk-SK-LukasNeural", "female": "sk-SK-ViktoriaNeural"],
+        "bg-BG": ["male": "bg-BG-BorislavNeural", "female": "bg-BG-KalinaNeural"],
+        "hr-HR": ["male": "hr-HR-SreckoNeural", "female": "hr-HR-GabrijelaNeural"],
+        "sl-SI": ["male": "sl-SI-RokNeural", "female": "sl-SI-PetraNeural"],
+        "sr-RS": ["male": "sr-RS-NicholasNeural", "female": "sr-RS-SophieNeural"],
+        "lt-LT": ["male": "lt-LT-LeonasNeural", "female": "lt-LT-OnaNeural"],
+        "lv-LV": ["male": "lv-LV-NilsNeural", "female": "lv-LV-EveritaNeural"],
+        "et-EE": ["male": "et-EE-KertNeural", "female": "et-EE-AnuNeural"],
+        "is-IS": ["male": "is-IS-GunnarNeural", "female": "is-IS-GudrunNeural"],
+        "mk-MK": ["male": "mk-MK-AleksandarNeural", "female": "mk-MK-MarijaNeural"],
+        "mt-MT": ["male": "mt-MT-JosephNeural", "female": "mt-MT-GraceNeural"],
+        "sq-AL": ["male": "sq-AL-IlirNeural", "female": "sq-AL-AnilaNeural"],
+        "bs-BA": ["male": "bs-BA-GoranNeural", "female": "bs-BA-VesnaNeural"],
+        "ca-ES": ["male": "ca-ES-EnricNeural", "female": "ca-ES-JoanaNeural"],
+        "gl-ES": ["male": "gl-ES-RoiNeural", "female": "gl-ES-SabelaNeural"],
+        "eu-ES": ["male": "eu-ES-AnderNeural", "female": "eu-ES-AinhoaNeural"],
+        "cy-GB": ["male": "cy-GB-AledNeural", "female": "cy-GB-NiaNeural"],
+        "ga-IE": ["male": "ga-IE-ColmNeural", "female": "ga-IE-OrlaNeural"],
+
+        // ===== 🌍 非洲 =====
+        "af-ZA": ["male": "af-ZA-WillemNeural", "female": "af-ZA-AdriNeural"],
+        "sw-KE": ["male": "sw-KE-RafikiNeural", "female": "sw-KE-ZuriNeural"],
+        "am-ET": ["male": "am-ET-AmehaNeural", "female": "am-ET-MekdesNeural"],
+        "zu-ZA": ["male": "zu-ZA-ThembaNeural", "female": "zu-ZA-ThandoNeural"],
+
+        // ===== 🌎 其他 =====
+        "az-AZ": ["male": "az-AZ-BabekNeural", "female": "az-AZ-BanuNeural"],
+        "kk-KZ": ["male": "kk-KZ-DauletNeural", "female": "kk-KZ-AigulNeural"],
+        "uz-UZ": ["male": "uz-UZ-SardorNeural", "female": "uz-UZ-MadinaNeural"],
+        "mn-MN": ["male": "mn-MN-BataaNeural", "female": "mn-MN-YesUINeural"],
+        "ka-GE": ["male": "ka-GE-GiorgiNeural", "female": "ka-GE-EkaNeural"],
+        "hy-AM": ["male": "hy-AM-HaykNeural", "female": "hy-AM-AnahitNeural"]
     ]
 
-    /// 選擇合適的語音
-    private func selectVoice(languageCode: String, gender: String = "female", useMultilingual: Bool = true) -> String {
-        // 優先使用多語言自動檢測語音
-        if useMultilingual {
-            return multilingualVoices[gender] ?? multilingualVoices["female"]!
-        }
-
-        // 提取語言代碼（zh-TW → zh）
-        let baseLang = languageCode.split(separator: "-").first.map(String.init) ?? languageCode
-
-        // 回退到特定語言語音
-        if let voices = voiceMapping[baseLang] {
+    /// 選擇合適的語音（根據完整 locale code）
+    private func selectVoice(languageCode: String, gender: String = "female") -> String {
+        // ⭐️ 直接使用完整 locale code 查找專用語音
+        if let voices = voiceMapping[languageCode] {
             return voices[gender] ?? voices["female"]!
         }
 
+        // 嘗試使用基礎語言代碼（如 "vi" → 找 "vi-VN"）
+        let baseLang = languageCode.split(separator: "-").first.map(String.init) ?? languageCode
+        for (locale, voices) in voiceMapping {
+            if locale.hasPrefix(baseLang + "-") {
+                print("⚠️ [TTS] 使用 \(locale) 語音替代 \(languageCode)")
+                return voices[gender] ?? voices["female"]!
+            }
+        }
+
         // 預設使用中文台灣
-        return voiceMapping["zh"]![gender]!
+        print("⚠️ [TTS] 找不到 \(languageCode) 語音，使用預設 zh-TW")
+        return voiceMapping["zh-TW"]!["female"]!
     }
 
 
@@ -190,16 +268,16 @@ class AzureTTSService {
     /// 使用 Azure TTS 合成語音（WebSocket 串流版）
     /// - Parameters:
     ///   - text: 要合成的文字
-    ///   - languageCode: 語言代碼
+    ///   - languageCode: 語言代碼（完整 Azure locale，如 "vi-VN", "zh-TW"）
     ///   - gender: 性別偏好 ("male" 或 "female")
-    ///   - useMultilingual: 是否使用多語言自動檢測
     /// - Returns: 音頻數據
-    func synthesize(text: String, languageCode: String = "zh-TW", gender: String = "female", useMultilingual: Bool = true) async throws -> Data {
+    func synthesize(text: String, languageCode: String = "zh-TW", gender: String = "female") async throws -> Data {
         guard !text.isEmpty else {
             throw TTSError.emptyText
         }
 
-        let voice = selectVoice(languageCode: languageCode, gender: gender, useMultilingual: useMultilingual)
+        // ⭐️ 使用語言專用語音（不再使用多語言語音）
+        let voice = selectVoice(languageCode: languageCode, gender: gender)
 
         print("🎙️ [TTS Stream] Synthesizing with voice: \(voice)")
         print("   Text: \(text.prefix(50))\(text.count > 50 ? "..." : "")")

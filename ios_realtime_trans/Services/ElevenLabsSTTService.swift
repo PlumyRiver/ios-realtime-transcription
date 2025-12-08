@@ -37,6 +37,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var lastInterimGrowthTime: Date = Date()  // 上次 interim 變長的時間
     private let interimStaleThreshold: TimeInterval = 1.0  // 停滯閾值：1 秒
 
+    /// ⭐️ 防止 ElevenLabs 修正行為導致重複句子
+    /// ElevenLabs 有時會在識別過程中「重寫」之前的 interim（修正識別結果）
+    /// 當自動 Final 後，新的 interim 如果與上一句高度相似，應該視為「修正」而非「新句」
+    private var lastFinalText: String = ""  // 上一句 Final 的文本
+    private var lastFinalTime: Date = Date.distantPast  // 上一句 Final 的時間
+    private let correctionTimeWindow: TimeInterval = 0.8  // 修正時間窗口：只有 0.8 秒內才可能是修正
+
     /// ⭐️ 智能分句：基於字符位置追蹤（避免 LLM 分段不一致問題）
     private var confirmedTextLength: Int = 0  // 已確認（發送為 final）的字符長度
     private var lastConfirmedText: String = ""  // 上次確認的完整文本（用於比對）
@@ -62,6 +69,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     // Combine Publishers
     private let transcriptSubject = PassthroughSubject<TranscriptMessage, Never>()
     private let translationSubject = PassthroughSubject<(String, String), Never>()
+    /// ⭐️ 分句翻譯 Publisher：(原文, 分句陣列)
+    private let segmentedTranslationSubject = PassthroughSubject<(String, [TranslationSegment]), Never>()
+    /// ⭐️ 修正上一句 Final 的 Publisher：(舊文本, 新文本)
+    /// 當 ElevenLabs 修正之前的識別結果時，用這個 Publisher 通知 ViewModel 替換上一句
+    private let correctionSubject = PassthroughSubject<(String, String), Never>()
     private let errorSubject = PassthroughSubject<String, Never>()
 
     var transcriptPublisher: AnyPublisher<TranscriptMessage, Never> {
@@ -70,6 +82,16 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     var translationPublisher: AnyPublisher<(String, String), Never> {
         translationSubject.eraseToAnyPublisher()
+    }
+
+    /// ⭐️ 分句翻譯 Publisher
+    var segmentedTranslationPublisher: AnyPublisher<(String, [TranslationSegment]), Never> {
+        segmentedTranslationSubject.eraseToAnyPublisher()
+    }
+
+    /// ⭐️ 修正上一句 Publisher：(舊文本, 新文本)
+    var correctionPublisher: AnyPublisher<(String, String), Never> {
+        correctionSubject.eraseToAnyPublisher()
     }
 
     var errorPublisher: AnyPublisher<String, Never> {
@@ -90,7 +112,102 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// ⭐️ 分句閾值：超過此長度的 final 結果會自動分句
     private let segmentThreshold = 30
 
+    // MARK: - Token 快取機制
+
+    /// ⭐️ 快取的 token（避免每次連接都重新獲取）
+    private var cachedToken: String?
+    /// ⭐️ Token 過期時間（ElevenLabs single-use token 有效期約 5 分鐘，我們保守用 3 分鐘）
+    private var tokenExpireTime: Date?
+    /// Token 有效期（秒）
+    private let tokenValidDuration: TimeInterval = 180  // 3 分鐘
+    /// ⭐️ 是否正在預取 token（防止重複預取）
+    private var isPrefetchingToken: Bool = false
+
+    /// 檢查 token 是否有效
+    private var isTokenValid: Bool {
+        guard let token = cachedToken, let expireTime = tokenExpireTime else {
+            return false
+        }
+        return !token.isEmpty && Date() < expireTime
+    }
+
+    // MARK: - VAD 設定（可調整）
+
+    /// ⭐️ VAD 閾值（0.0 ~ 1.0）
+    /// 越高越嚴格，需要更大聲音才會觸發語音識別
+    /// 0.3 = 較敏感（預設），0.5 = 中等，0.7 = 嚴格
+    var vadThreshold: Float = 0.3
+
+    /// ⭐️ 最小語音長度（毫秒）
+    /// 語音必須持續超過此時間才會被識別
+    /// 100 = 較敏感（預設），300 = 中等，500 = 嚴格
+    var minSpeechDurationMs: Int = 100
+
+    /// ⭐️ 靜音閾值（秒）
+    /// 靜音超過此時間後自動 commit
+    var vadSilenceThresholdSecs: Float = 1.0
+
     // MARK: - Public Methods
+
+    /// ⭐️ 預先獲取 token（可在 App 啟動或進入前台時調用）
+    /// 這樣用戶點擊錄音時可以跳過 token 獲取步驟
+    /// 完全不阻塞主線程
+    func prefetchToken(serverURL: String) {
+        // ⭐️ 防止重複預取（同步檢查，快速返回）
+        guard !isPrefetchingToken else {
+            return  // 靜默跳過，不打印日誌避免刷屏
+        }
+
+        // 如果 token 還有效，不需要預取
+        guard !isTokenValid else {
+            return  // 靜默跳過
+        }
+
+        // ⭐️ 標記正在預取
+        isPrefetchingToken = true
+
+        // 設定 token 端點（同步操作，很快）
+        var tokenURL = serverURL
+        if !tokenURL.hasPrefix("http://") && !tokenURL.hasPrefix("https://") {
+            if tokenURL.contains("localhost") || tokenURL.contains("127.0.0.1") {
+                tokenURL = "http://\(tokenURL)"
+            } else {
+                tokenURL = "https://\(tokenURL)"
+            }
+        }
+        let endpoint = "\(tokenURL)/elevenlabs-token"
+
+        // ⭐️ 使用 Task.detached 確保完全在背景線程執行，不阻塞 UI
+        Task.detached(priority: .background) { [weak self] in
+            guard let self = self else { return }
+
+            // 在背景線程設置 endpoint
+            await MainActor.run {
+                self.tokenEndpoint = endpoint
+            }
+
+            do {
+                print("🔄 [ElevenLabs] 背景預取 token...")
+                let startTime = Date()
+                let token = try await self.fetchToken()
+                let elapsed = Date().timeIntervalSince(startTime)
+
+                // ⭐️ 在主線程更新快取和標記
+                await MainActor.run {
+                    self.cachedToken = token
+                    self.tokenExpireTime = Date().addingTimeInterval(self.tokenValidDuration)
+                    self.isPrefetchingToken = false
+                }
+                print("✅ [ElevenLabs] Token 預取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
+            } catch {
+                // ⭐️ 失敗時也要重置標記
+                await MainActor.run {
+                    self.isPrefetchingToken = false
+                }
+                print("⚠️ [ElevenLabs] Token 預取失敗: \(error.localizedDescription)")
+            }
+        }
+    }
 
     /// 連接到 ElevenLabs Scribe v2 Realtime API
     /// - Parameters:
@@ -163,6 +280,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         urlSession?.invalidateAndCancel()
         urlSession = nil
         connectionState = .disconnected
+
+        // ⭐️ 清除 token 快取（single-use token 只能用一次，斷線後必須重新獲取）
+        cachedToken = nil
+        tokenExpireTime = nil
     }
 
     /// 發送結束語句信號（PTT 放開時調用）
@@ -237,9 +358,30 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// 獲取 token 並連接
     private func fetchTokenAndConnect(sourceLang: Language) async {
         do {
-            let token = try await fetchToken()
+            let token: String
+
+            // ⭐️ 優先使用快取的 token
+            if isTokenValid, let cached = cachedToken {
+                print("⚡️ [ElevenLabs] 使用快取 token（剩餘 \(Int(tokenExpireTime!.timeIntervalSinceNow))秒）")
+                token = cached
+            } else {
+                // 需要獲取新 token
+                let startTime = Date()
+                token = try await fetchToken()
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("🔑 [ElevenLabs] Token 獲取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
+
+                // 快取 token
+                cachedToken = token
+                tokenExpireTime = Date().addingTimeInterval(tokenValidDuration)
+            }
+
             await connectWithToken(token, sourceLang: sourceLang)
         } catch {
+            // ⭐️ Token 失敗時清除快取
+            cachedToken = nil
+            tokenExpireTime = nil
+
             await MainActor.run {
                 print("❌ [ElevenLabs] 獲取 token 失敗: \(error.localizedDescription)")
                 connectionState = .error("獲取 token 失敗")
@@ -285,11 +427,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             // ElevenLabs 會自動檢測說話者的語言，支援雙向翻譯場景
             URLQueryItem(name: "include_timestamps", value: "true"),
             URLQueryItem(name: "commit_strategy", value: "vad"),  // ⭐️ 使用 VAD 自動 commit
-            URLQueryItem(name: "vad_silence_threshold_secs", value: "1.0"),  // 1 秒靜音後 commit
-            URLQueryItem(name: "vad_threshold", value: "0.3"),  // VAD 靈敏度
-            URLQueryItem(name: "min_speech_duration_ms", value: "100"),
+            // ⭐️ 使用可調整的 VAD 參數
+            URLQueryItem(name: "vad_silence_threshold_secs", value: String(vadSilenceThresholdSecs)),
+            URLQueryItem(name: "vad_threshold", value: String(vadThreshold)),
+            URLQueryItem(name: "min_speech_duration_ms", value: String(minSpeechDurationMs)),
             URLQueryItem(name: "min_silence_duration_ms", value: "500")  // 最小靜音 500ms
         ]
+
+        print("🎚️ [ElevenLabs] VAD 設定: threshold=\(vadThreshold), minSpeech=\(minSpeechDurationMs)ms, silence=\(vadSilenceThresholdSecs)s")
 
         guard let url = urlComponents.url else {
             connectionState = .error("無效的 WebSocket URL")
@@ -312,23 +457,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// 語言代碼映射
+    /// ElevenLabs Scribe 使用 ISO 639-1/639-3 語言代碼
     private func mapLanguageCode(_ lang: Language) -> String {
         switch lang {
-        case .auto: return "auto"
-        case .zh: return "zh"
-        case .en: return "en"
-        case .ja: return "ja"
-        case .ko: return "ko"
-        case .es: return "es"
-        case .fr: return "fr"
-        case .de: return "de"
-        case .it: return "it"
-        case .pt: return "pt"
-        case .ru: return "ru"
-        case .ar: return "ar"
-        case .hi: return "hi"
-        case .th: return "th"
-        case .vi: return "vi"
+        case .isLang: return "is"  // 冰島文（is 是 Swift 保留字）
+        default: return lang.rawValue  // 其他語言直接使用 rawValue
         }
     }
 
@@ -457,6 +590,76 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         return meaningfulChars.isEmpty
     }
 
+    /// ⭐️ 檢測並清理重複模式
+    /// ElevenLabs Scribe v2 有時會在 partial 階段重複輸出相同的詞彙
+    /// 例如：「舍利子舍利子舍利子舍利子」應該被清理為「舍利子」
+    /// - Parameter text: 原始文本
+    /// - Returns: 清理後的文本
+    private func cleanRepeatedPatterns(_ text: String) -> String {
+        // ⭐️ 安全檢查：文本太短不需要清理
+        guard text.count >= 6 else { return text }
+
+        let originalText = text
+        let maxPatternLength = min(10, text.count / 3)
+
+        // ⭐️ 安全檢查：確保範圍有效
+        guard maxPatternLength >= 2 else { return text }
+
+        // 嘗試檢測不同長度的重複模式（2-10 個字符）
+        for patternLength in 2...maxPatternLength {
+            let cleaned = removeRepeatingPattern(text, patternLength: patternLength)
+            if cleaned.count < text.count * 2 / 3 {
+                // 如果清理掉了超過 1/3 的內容，說明有明顯重複
+                print("🔄 [重複清理] 發現重複模式（長度 \(patternLength)）")
+                print("   原文: \"\(originalText.prefix(50))...\"")
+                print("   清理: \"\(cleaned.prefix(50))...\"")
+                return cleaned
+            }
+        }
+
+        return text
+    }
+
+    /// 移除指定長度的重複模式
+    private func removeRepeatingPattern(_ text: String, patternLength: Int) -> String {
+        guard text.count >= patternLength * 2 else { return text }
+
+        let chars = Array(text)
+        var result: [Character] = []
+        var i = 0
+
+        while i < chars.count {
+            // 取當前位置開始的 patternLength 個字符作為潛在模式
+            let endIndex = min(i + patternLength, chars.count)
+            let potentialPattern = String(chars[i..<endIndex])
+
+            // 計算這個模式連續出現的次數
+            var repeatCount = 1
+            var checkIndex = i + patternLength
+
+            while checkIndex + patternLength <= chars.count {
+                let nextChunk = String(chars[checkIndex..<(checkIndex + patternLength)])
+                if nextChunk == potentialPattern {
+                    repeatCount += 1
+                    checkIndex += patternLength
+                } else {
+                    break
+                }
+            }
+
+            // 如果重複超過 2 次，只保留一次
+            if repeatCount > 2 {
+                result.append(contentsOf: potentialPattern)
+                i = checkIndex  // 跳過所有重複
+            } else {
+                result.append(chars[i])
+                i += 1
+            }
+        }
+
+        return String(result)
+    }
+
     /// ⭐️ 檢查翻譯是否為錯誤佔位符
     /// 用於過濾 [請稀候]、[翻譯失敗] 等佔位符
     private func isErrorPlaceholder(_ text: String) -> Bool {
@@ -476,6 +679,78 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         guard !validTranslations.isEmpty else { return nil }
         return validTranslations.joined(separator: " ")
+    }
+
+    /// ⭐️ 檢測 ElevenLabs 修正行為
+    /// ElevenLabs 有時會在識別過程中「重寫」整個 interim（不是追加，而是修正）
+    /// 例如：
+    ///   - 上一句 Final: "你在這邊幹嘛？ 對，我在測試它"
+    ///   - 新的 interim: "你在這邊有在聽我的嗎？ 對，我在測試它"  ← 這是對上一句的修正
+    ///
+    /// ⭐️ 嚴格判斷標準（避免誤判正常新句子）：
+    /// 1. 必須在 Final 後 0.8 秒內（超過這個時間窗口不可能是修正）
+    /// 2. 新 interim 必須「包含」上一句 Final 的大部分內容（>= 60%）
+    /// 3. 新 interim 的開頭必須與上一句非常相似（前 6 個字相同）
+    ///
+    /// - Returns: (isCorrectionBehavior: Bool, commonPart: String?)
+    private func detectCorrectionBehavior(_ newInterimText: String) -> (isCorrectionBehavior: Bool, commonPart: String?) {
+        guard !lastFinalText.isEmpty else { return (false, nil) }
+
+        // ⭐️ 時間窗口檢查：只有在 Final 後很短時間內才可能是修正
+        let timeSinceFinal = Date().timeIntervalSince(lastFinalTime)
+        guard timeSinceFinal < correctionTimeWindow else {
+            // 超過時間窗口，不可能是修正，是正常的新句子
+            return (false, nil)
+        }
+
+        // ⭐️ 策略：檢查新 interim 是否「包含」上一句 Final 的大部分內容
+        // 真正的修正行為特徵：
+        // - 上一句: "你在這邊幹嘛？ 對，我在測試它"
+        // - 新 interim: "你在這邊有在聽我的嗎？ 對，我在測試它，我在想辦法"
+        // - 新 interim 包含上一句的「對，我在測試它」部分
+
+        // 檢查共同前綴長度
+        var commonPrefixLength = 0
+        let lastFinalChars = Array(lastFinalText)
+        let newInterimChars = Array(newInterimText)
+
+        for i in 0..<min(lastFinalChars.count, newInterimChars.count) {
+            if lastFinalChars[i] == newInterimChars[i] {
+                commonPrefixLength += 1
+            } else {
+                break
+            }
+        }
+
+        // ⭐️ 必須滿足以下所有條件才視為修正行為：
+        // 1. 共同前綴 >= 6 個字（嚴格）
+        // 2. 新 interim 不是上一句的簡單延續（不是純粹追加）
+        // 3. 新 interim 包含上一句的後半部分（真正的重寫）
+
+        if commonPrefixLength >= 6 {
+            let commonPrefix = String(lastFinalText.prefix(commonPrefixLength))
+            let lastFinalRest = String(lastFinalText.dropFirst(commonPrefixLength))
+            let newInterimRest = String(newInterimText.dropFirst(commonPrefixLength))
+
+            // 如果新 interim 的剩餘部分包含上一句的剩餘部分，說明是重寫
+            // 例如：lastFinalRest = "幹嘛？ 對，我在測試它"
+            //       newInterimRest = "有在聽我的嗎？ 對，我在測試它，我在想辦法"
+            //       newInterimRest 包含 "對，我在測試它"
+
+            // 找出上一句後半部分在新 interim 中的位置
+            if !lastFinalRest.isEmpty && lastFinalRest.count >= 5 {
+                // 取上一句後半部分的核心內容（去掉開頭幾個字）
+                let coreOfLastFinal = String(lastFinalRest.dropFirst(min(3, lastFinalRest.count / 2)))
+                if coreOfLastFinal.count >= 4 && newInterimRest.contains(coreOfLastFinal) {
+                    print("🔄 [修正檢測] 發現修正行為（時間窗口內 \(String(format: "%.2f", timeSinceFinal))s）")
+                    print("   共同前綴: \"\(commonPrefix)\"")
+                    print("   上一句核心: \"\(coreOfLastFinal.prefix(20))...\"")
+                    return (true, commonPrefix)
+                }
+            }
+        }
+
+        return (false, nil)
     }
 
     /// 發送 commit 信號（結束當前語句）
@@ -612,6 +887,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         transcriptSubject.send(transcript)
         print("✅ [自動 Final] \(transcriptText.prefix(40))...")
 
+        // ⭐️ 記錄這次 Final 的文本和時間（用於檢測 ElevenLabs 修正行為）
+        lastFinalText = transcriptText
+        lastFinalTime = Date()
+
         // ⭐️ 使用 pendingSegments 的翻譯（如果有且匹配，且不是佔位符）
         if !pendingSegments.isEmpty && pendingSourceText == transcriptText,
            let validTranslation = getValidTranslationFromPending() {
@@ -716,16 +995,42 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         pendingConfirmOffset = response.lastCompleteOffset
         pendingSourceText = originalText  // ⭐️ 記錄這個翻譯對應的原文
 
-        // ⭐️ 只發送翻譯結果（轉錄已在 partial_transcript 時立即發送）
-        // 這樣實現「轉錄先顯示，翻譯異步更新」
-        // 過濾掉錯誤佔位符（[請稍候]、[翻譯失敗] 等）
-        let validTranslations = response.segments.compactMap { $0.translation }.filter { translation in
-            !translation.hasPrefix("[") || !translation.hasSuffix("]")
+        // ⭐️ 過濾掉錯誤佔位符（[請稍候]、[翻譯失敗] 等）
+        let validSegments = response.segments.filter { segment in
+            guard let translation = segment.translation else { return false }
+            return !(translation.hasPrefix("[") && translation.hasSuffix("]"))
         }
-        let allTranslations = validTranslations.joined(separator: " ")
-        if !allTranslations.isEmpty {
-            translationSubject.send((originalText, allTranslations))
-            print("🌐 [翻譯] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
+
+        guard !validSegments.isEmpty else {
+            print("⚠️ [智能翻譯] 所有分句都是佔位符，跳過")
+            return
+        }
+
+        // ⭐️ 發送分句翻譯結果（新增）
+        let translationSegments = validSegments.compactMap { segment -> TranslationSegment? in
+            guard let translation = segment.translation else { return nil }
+            return TranslationSegment(
+                original: segment.original,
+                translation: translation,
+                isComplete: segment.isComplete
+            )
+        }
+
+        if translationSegments.count > 1 {
+            // 多句：發送分句結果
+            segmentedTranslationSubject.send((originalText, translationSegments))
+            print("✂️ [分句翻譯] \(translationSegments.count) 段:")
+            for (i, seg) in translationSegments.enumerated() {
+                let status = seg.isComplete ? "✅" : "⏳"
+                print("   \(status) [\(i)] \"\(seg.original.prefix(20))...\" → \"\(seg.translation.prefix(25))...\"")
+            }
+        } else {
+            // 單句：使用傳統翻譯 Publisher
+            let allTranslations = validSegments.compactMap { $0.translation }.joined(separator: " ")
+            if !allTranslations.isEmpty {
+                translationSubject.send((originalText, allTranslations))
+                print("🌐 [翻譯] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
+            }
         }
     }
 
@@ -821,18 +1126,49 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     // MARK: - 訊息處理
 
     private func receiveMessage() {
-        webSocketTask?.receive { [weak self] result in
-            guard let self else { return }
+        // ⭐️ 安全檢查：確保連接仍然有效
+        guard let task = webSocketTask,
+              task.state == .running else {
+            print("⚠️ [ElevenLabs] WebSocket 任務已結束，停止接收")
+            return
+        }
+
+        task.receive { [weak self] result in
+            guard let self = self else { return }
+
+            // ⭐️ 再次檢查連接狀態
+            guard self.connectionState == .connected else {
+                print("⚠️ [ElevenLabs] 連接已斷開，停止接收")
+                return
+            }
 
             switch result {
             case .success(let message):
                 self.handleMessage(message)
-                self.receiveMessage()
+                // ⭐️ 只在連接仍然有效時繼續接收
+                if self.connectionState == .connected {
+                    self.receiveMessage()
+                }
 
             case .failure(let error):
-                print("❌ [ElevenLabs] 接收錯誤: \(error.localizedDescription)")
-                self.connectionState = .error(error.localizedDescription)
-                self.errorSubject.send(error.localizedDescription)
+                // ⭐️ 檢查是否為正常關閉
+                let errorMessage = error.localizedDescription
+                if errorMessage.contains("canceled") || errorMessage.contains("Socket is not connected") {
+                    print("📱 [ElevenLabs] 連接已關閉")
+                } else {
+                    print("❌ [ElevenLabs] 接收錯誤: \(errorMessage)")
+                }
+
+                Task { @MainActor in
+                    // ⭐️ 只在未主動斷開時設置錯誤狀態
+                    if self.connectionState != .disconnected {
+                        self.connectionState = .error(errorMessage)
+                        self.errorSubject.send(errorMessage)
+                    }
+                    // 清除 token 快取
+                    self.cachedToken = nil
+                    self.tokenExpireTime = nil
+                }
             }
         }
     }
@@ -870,12 +1206,52 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     return
                 }
 
+                // ⭐️ 清理重複模式（ElevenLabs 有時會重複輸出同一個詞）
+                let cleanedText = cleanRepeatedPatterns(rawText)
+
+                // ⭐️ 簡體轉繁體（如果是中文）
+                let (transcriptText, wasConverted) = processChineseText(cleanedText, language: response.detectedLanguage)
+
+                // ⭐️ 防止重複：如果新 partial 內容與剛才的 final 相同或高度相似，忽略它
+                // 這解決了 ElevenLabs 持續發送相同 partial 導致重複產生 final 的問題
+                if !lastFinalText.isEmpty {
+                    let timeSinceFinal = Date().timeIntervalSince(lastFinalTime)
+                    // 在 final 後 2 秒內，檢查是否為重複內容
+                    if timeSinceFinal < 2.0 {
+                        // 精確匹配
+                        if transcriptText == lastFinalText {
+                            print("⚠️ [partial] 跳過重複內容（與 final 相同）: \"\(transcriptText.prefix(30))...\"")
+                            return
+                        }
+                        // 高度相似（一個是另一個的前綴，且長度差異 < 5）
+                        let lengthDiff = abs(transcriptText.count - lastFinalText.count)
+                        if lengthDiff < 5 {
+                            if transcriptText.hasPrefix(lastFinalText) || lastFinalText.hasPrefix(transcriptText) {
+                                print("⚠️ [partial] 跳過高度相似內容: \"\(transcriptText.prefix(30))...\"")
+                                return
+                            }
+                        }
+                    }
+                }
+
+                // ⭐️ 檢測 ElevenLabs 修正行為
+                // 如果新的 interim 與上一句 Final 高度相似，說明 ElevenLabs 在修正之前的識別結果
+                let (isCorrectionBehavior, _) = detectCorrectionBehavior(transcriptText)
+
+                if isCorrectionBehavior && !lastFinalText.isEmpty {
+                    // ⭐️ 發送修正事件：讓 ViewModel 替換上一句 Final
+                    print("🔄 [partial] 檢測到修正行為，通知 ViewModel 替換上一句")
+                    print("   舊: \"\(lastFinalText.prefix(30))...\"")
+                    print("   新: \"\(transcriptText.prefix(30))...\"")
+                    correctionSubject.send((lastFinalText, transcriptText))
+                    // 清除 lastFinalText，避免重複修正
+                    lastFinalText = ""
+                }
+
                 // ⭐️ 收到新的 partial，解除 commit 狀態
                 // 這樣新的翻譯回調才會被處理
                 isCommitted = false
 
-                // ⭐️ 簡體轉繁體（如果是中文）
-                let (transcriptText, wasConverted) = processChineseText(rawText, language: response.detectedLanguage)
                 if wasConverted {
                     print("⋯ [partial] \(rawText.prefix(20))... → \(transcriptText.prefix(20))...")
                 } else {
@@ -925,8 +1301,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 // ⭐️ 標記為已 commit，讓後續的 async 翻譯回調被忽略
                 isCommitted = true
 
+                // ⭐️ 清理重複模式（ElevenLabs 有時會重複輸出同一個詞）
+                let cleanedText = cleanRepeatedPatterns(rawText)
+
                 // ⭐️ 簡體轉繁體（如果是中文）
-                let (transcriptText, wasConverted) = processChineseText(rawText, language: response.detectedLanguage)
+                let (transcriptText, wasConverted) = processChineseText(cleanedText, language: response.detectedLanguage)
 
                 if wasConverted {
                     print("🔒 [VAD Commit] 確認句子: \(rawText.prefix(30))... → \(transcriptText.prefix(30))...")
@@ -974,9 +1353,17 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 // 情況 3：transcriptText 是 pendingSourceText 的前綴（異常情況）
                 // 情況 4：完全不匹配（上一句的翻譯）
 
-                let isPendingExactMatch = !pendingSegments.isEmpty && pendingSourceText == transcriptText
-                let isPendingPartialMatch = !pendingSegments.isEmpty && transcriptText.hasPrefix(pendingSourceText) && pendingSourceText != transcriptText
-                let isPendingReverseMatch = !pendingSegments.isEmpty && pendingSourceText.hasPrefix(transcriptText) && pendingSourceText != transcriptText
+                // ⭐️ 移除末尾的 ... 進行比對（ElevenLabs 有時會加省略號）
+                let normalizedTranscript = transcriptText.trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: "...", with: "")
+                    .replacingOccurrences(of: "…", with: "")
+                let normalizedPending = pendingSourceText.trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: "...", with: "")
+                    .replacingOccurrences(of: "…", with: "")
+
+                let isPendingExactMatch = !pendingSegments.isEmpty && normalizedPending == normalizedTranscript
+                let isPendingPartialMatch = !pendingSegments.isEmpty && normalizedTranscript.hasPrefix(normalizedPending) && normalizedPending != normalizedTranscript
+                let isPendingReverseMatch = !pendingSegments.isEmpty && normalizedPending.hasPrefix(normalizedTranscript) && normalizedPending != normalizedTranscript
 
                 if isPendingExactMatch, let validTranslation = getValidTranslationFromPending() {
                     // ✅ 完全匹配且翻譯有效：直接使用 pendingSegments 的翻譯
@@ -1196,6 +1583,9 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
         Task { @MainActor in
             print("📱 [ElevenLabs] WebSocket 連接關閉 (code: \(closeCode.rawValue))")
             self.connectionState = .disconnected
+            // ⭐️ 清除 token 快取（single-use token 只能用一次）
+            self.cachedToken = nil
+            self.tokenExpireTime = nil
         }
     }
 
@@ -1209,6 +1599,9 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
                 print("❌ [ElevenLabs] URLSession 錯誤: \(error.localizedDescription)")
                 self.connectionState = .error(error.localizedDescription)
                 self.errorSubject.send(error.localizedDescription)
+                // ⭐️ 清除 token 快取（連接失敗後 token 可能已失效）
+                self.cachedToken = nil
+                self.tokenExpireTime = nil
             }
         }
     }

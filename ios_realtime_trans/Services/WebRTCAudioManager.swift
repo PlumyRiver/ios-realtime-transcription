@@ -189,6 +189,21 @@ final class WebRTCAudioManager: NSObject {
         audioDataSubject.eraseToAnyPublisher()
     }
 
+    // MARK: - 即時音量監測
+
+    /// ⭐️ 即時 RMS 音量（0.0 ~ 1.0，已正規化）
+    private(set) var currentVolume: Float = 0.0
+
+    /// ⭐️ 音量更新 Publisher（用於 UI 即時顯示）
+    private let volumeSubject = PassthroughSubject<Float, Never>()
+
+    var volumePublisher: AnyPublisher<Float, Never> {
+        volumeSubject.eraseToAnyPublisher()
+    }
+
+    /// 音量平滑係數（0.0 ~ 1.0，越高越平滑但反應越慢）
+    private let volumeSmoothingFactor: Float = 0.3
+
     /// TTS 播放完成回調
     var onTTSPlaybackFinished: (() -> Void)?
 
@@ -378,8 +393,56 @@ final class WebRTCAudioManager: NSObject {
 
     /// 處理從 tap 接收的音頻數據
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        // ⭐️ 計算並更新即時音量
+        let rms = calculateRMS(buffer)
+        updateVolume(rms)
+
         guard let data = convertToWebSocketFormat(buffer) else { return }
         audioBufferCollector.append(data)
+    }
+
+    /// ⭐️ 計算 RMS（Root Mean Square）音量
+    /// - Parameter buffer: 音頻緩衝區
+    /// - Returns: RMS 音量（0.0 ~ 1.0）
+    private func calculateRMS(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData else {
+            // 嘗試從 int16 數據計算
+            if let int16Data = buffer.int16ChannelData {
+                let frameLength = Int(buffer.frameLength)
+                guard frameLength > 0 else { return 0 }
+
+                var sum: Float = 0
+                for i in 0..<frameLength {
+                    let sample = Float(int16Data[0][i]) / 32768.0  // 正規化到 -1.0 ~ 1.0
+                    sum += sample * sample
+                }
+                let rms = sqrt(sum / Float(frameLength))
+                return min(rms * 3.0, 1.0)  // 放大並限制在 0~1
+            }
+            return 0
+        }
+
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return 0 }
+
+        var sum: Float = 0
+        for i in 0..<frameLength {
+            let sample = channelData[0][i]
+            sum += sample * sample
+        }
+
+        let rms = sqrt(sum / Float(frameLength))
+        // 將 RMS 正規化到 0~1 範圍（通常語音 RMS 在 0.01~0.3 之間）
+        return min(rms * 3.0, 1.0)
+    }
+
+    /// ⭐️ 更新音量（帶平滑處理）
+    private func updateVolume(_ newRMS: Float) {
+        // 指數移動平均（EMA）平滑
+        currentVolume = currentVolume * volumeSmoothingFactor + newRMS * (1.0 - volumeSmoothingFactor)
+
+        // 發送到 Publisher（用於 UI 更新）
+        volumeSubject.send(currentVolume)
     }
 
     /// 轉換音頻格式
@@ -638,13 +701,29 @@ final class WebRTCAudioManager: NSObject {
     }
 
     private func flushBuffer() {
+        // ⭐️ 安全檢查：確保在主線程執行
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.flushBuffer()
+            }
+            return
+        }
+
         guard !audioBufferCollector.isEmpty else { return }
 
         if isManualSendingPaused {
-            while audioBufferCollector.count > 4 {
-                audioBufferCollector.removeFirst()
+            // ⭐️ 安全檢查：避免無限循環
+            let removeCount = min(audioBufferCollector.count - 4, audioBufferCollector.count)
+            if removeCount > 0 {
+                audioBufferCollector.removeFirst(removeCount)
             }
             return
+        }
+
+        // ⭐️ 安全檢查：限制緩衝區大小，避免記憶體爆炸
+        if audioBufferCollector.count > 100 {
+            print("⚠️ [WebRTC] 緩衝區過大 (\(audioBufferCollector.count))，清理舊數據")
+            audioBufferCollector.removeFirst(audioBufferCollector.count - 20)
         }
 
         var combinedData = Data()

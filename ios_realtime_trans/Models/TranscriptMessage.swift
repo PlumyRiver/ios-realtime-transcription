@@ -110,27 +110,112 @@ enum TTSPlaybackMode: Int, CaseIterable {
 }
 
 /// 語言選項
+/// 支援 ElevenLabs Scribe v2 (STT) 和 Azure TTS 共同支援的語言
+/// 共 74 種語言（含自動檢測）
+/// 排序：台灣常用 > 東南亞 > 東亞 > 南亞 > 中東 > 歐洲 > 非洲
 enum Language: String, CaseIterable, Identifiable {
     case auto = "auto"
-    case zh = "zh"
-    case en = "en"
-    case ja = "ja"
-    case ko = "ko"
-    case es = "es"
-    case fr = "fr"
-    case de = "de"
-    case it = "it"
-    case pt = "pt"
-    case ru = "ru"
-    case ar = "ar"
-    case hi = "hi"
-    case th = "th"
-    case vi = "vi"
+
+    // ===== 🔥 台灣人最常用 TOP 20 =====
+    case zh = "zh"      // 中文
+    case en = "en"      // 英文
+    case ja = "ja"      // 日文
+    case ko = "ko"      // 韓文
+    case vi = "vi"      // 越南文
+    case th = "th"      // 泰文
+    case id = "id"      // 印尼文
+    case fil = "fil"    // 菲律賓文
+    case ms = "ms"      // 馬來文
+    case my = "my"      // 緬甸文
+    case km = "km"      // 高棉文（柬埔寨）
+    case es = "es"      // 西班牙文
+    case fr = "fr"      // 法文
+    case de = "de"      // 德文
+    case pt = "pt"      // 葡萄牙文
+    case it = "it"      // 義大利文
+    case ru = "ru"      // 俄文
+    case ar = "ar"      // 阿拉伯文
+    case tr = "tr"      // 土耳其文
+
+    // ===== 🌏 東南亞 =====
+    case lo = "lo"      // 老撾文
+    case jv = "jv"      // 爪哇文
+    case su = "su"      // 巽他文
+
+    // ===== 🌸 東亞 =====
+    // （中日韓已在 TOP 20）
+
+    // ===== 🕌 南亞 =====
+    case hi = "hi"      // 印地文
+    case bn = "bn"      // 孟加拉文
+    case ta = "ta"      // 塔米爾文
+    case te = "te"      // 泰盧固文
+    case mr = "mr"      // 馬拉地文
+    case gu = "gu"      // 古吉拉特文
+    case kn = "kn"      // 卡納達文
+    case ml = "ml"      // 馬拉雅拉姆文
+    case pa = "pa"      // 旁遮普文
+    case ur = "ur"      // 烏爾都文
+    case ne = "ne"      // 尼泊爾文
+
+    // ===== 🏜️ 中東/中亞/高加索 =====
+    case fa = "fa"      // 波斯文
+    case he = "he"      // 希伯來文
+    case hy = "hy"      // 亞美尼亞文
+    case ka = "ka"      // 喬治亞文
+    case az = "az"      // 阿塞拜疆文
+    case kk = "kk"      // 哈薩克文
+
+    // ===== 🏰 歐洲 - 西歐 =====
+    case nl = "nl"      // 荷蘭文
+    case ca = "ca"      // 加泰隆尼亞文
+    case gl = "gl"      // 加利西亞文
+    case eu = "eu"      // 巴斯克文
+    case ga = "ga"      // 愛爾蘭文
+    case cy = "cy"      // 威爾斯文
+
+    // ===== 🏰 歐洲 - 北歐 =====
+    case sv = "sv"      // 瑞典文
+    case no = "no"      // 挪威文
+    case da = "da"      // 丹麥文
+    case fi = "fi"      // 芬蘭文
+    case isLang = "is"  // 冰島文（is 是保留字）
+
+    // ===== 🏰 歐洲 - 中歐 =====
+    case pl = "pl"      // 波蘭文
+    case cs = "cs"      // 捷克文
+    case sk = "sk"      // 斯洛伐克文
+    case hu = "hu"      // 匈牙利文
+
+    // ===== 🏰 歐洲 - 東歐 =====
+    case uk = "uk"      // 烏克蘭文
+    case ro = "ro"      // 羅馬尼亞文
+    case bg = "bg"      // 保加利亞文
+    case lt = "lt"      // 立陶宛文
+    case lv = "lv"      // 拉脫維亞文
+    case et = "et"      // 愛沙尼亞文
+
+    // ===== 🏰 歐洲 - 巴爾幹 =====
+    case el = "el"      // 希臘文
+    case hr = "hr"      // 克羅地亞文
+    case sr = "sr"      // 塞爾維亞文
+    case sl = "sl"      // 斯洛維尼亞文
+    case bs = "bs"      // 波斯尼亞文
+    case mk = "mk"      // 馬其頓文
+    case sq = "sq"      // 阿爾巴尼亞文
+    case mt = "mt"      // 馬耳他文
+
+    // ===== 🌍 非洲 =====
+    case sw = "sw"      // 斯瓦希里文
+    case am = "am"      // 阿姆哈拉文
+    case zu = "zu"      // 祖魯文
+    case so = "so"      // 索馬里文
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
+        // 常用語言
         case .auto: return "🌐 自動檢測"
         case .zh: return "🇹🇼 中文"
         case .en: return "🇺🇸 英文"
@@ -146,11 +231,73 @@ enum Language: String, CaseIterable, Identifiable {
         case .hi: return "🇮🇳 印地文"
         case .th: return "🇹🇭 泰文"
         case .vi: return "🇻🇳 越南文"
+        // 歐洲語言
+        case .nl: return "🇳🇱 荷蘭文"
+        case .pl: return "🇵🇱 波蘭文"
+        case .tr: return "🇹🇷 土耳其文"
+        case .sv: return "🇸🇪 瑞典文"
+        case .cs: return "🇨🇿 捷克文"
+        case .el: return "🇬🇷 希臘文"
+        case .fi: return "🇫🇮 芬蘭文"
+        case .ro: return "🇷🇴 羅馬尼亞文"
+        case .da: return "🇩🇰 丹麥文"
+        case .bg: return "🇧🇬 保加利亞文"
+        case .sk: return "🇸🇰 斯洛伐克文"
+        case .hr: return "🇭🇷 克羅地亞文"
+        case .uk: return "🇺🇦 烏克蘭文"
+        case .he: return "🇮🇱 希伯來文"
+        case .hu: return "🇭🇺 匈牙利文"
+        case .no: return "🇳🇴 挪威文"
+        case .sl: return "🇸🇮 斯洛維尼亞文"
+        case .sr: return "🇷🇸 塞爾維亞文"
+        case .lt: return "🇱🇹 立陶宛文"
+        case .lv: return "🇱🇻 拉脫維亞文"
+        case .et: return "🇪🇪 愛沙尼亞文"
+        case .bs: return "🇧🇦 波斯尼亞文"
+        case .mk: return "🇲🇰 馬其頓文"
+        case .sq: return "🇦🇱 阿爾巴尼亞文"
+        case .mt: return "🇲🇹 馬耳他文"
+        case .isLang: return "🇮🇸 冰島文"
+        case .ga: return "🇮🇪 愛爾蘭文"
+        case .cy: return "🏴󠁧󠁢󠁷󠁬󠁳󠁿 威爾斯文"
+        case .ca: return "🇪🇸 加泰隆尼亞文"
+        case .gl: return "🇪🇸 加利西亞文"
+        case .eu: return "🇪🇸 巴斯克文"
+        // 亞洲語言
+        case .id: return "🇮🇩 印尼文"
+        case .fil: return "🇵🇭 菲律賓文"
+        case .ms: return "🇲🇾 馬來文"
+        case .ta: return "🇮🇳 塔米爾文"
+        case .bn: return "🇧🇩 孟加拉文"
+        case .gu: return "🇮🇳 古吉拉特文"
+        case .kn: return "🇮🇳 卡納達文"
+        case .ml: return "🇮🇳 馬拉雅拉姆文"
+        case .mr: return "🇮🇳 馬拉地文"
+        case .ne: return "🇳🇵 尼泊爾文"
+        case .pa: return "🇮🇳 旁遮普文"
+        case .te: return "🇮🇳 泰盧固文"
+        case .ur: return "🇵🇰 烏爾都文"
+        case .fa: return "🇮🇷 波斯文"
+        case .hy: return "🇦🇲 亞美尼亞文"
+        case .ka: return "🇬🇪 喬治亞文"
+        case .az: return "🇦🇿 阿塞拜疆文"
+        case .kk: return "🇰🇿 哈薩克文"
+        case .my: return "🇲🇲 緬甸文"
+        case .km: return "🇰🇭 高棉文"
+        case .lo: return "🇱🇦 老撾文"
+        case .jv: return "🇮🇩 爪哇文"
+        case .su: return "🇮🇩 巽他文"
+        // 非洲語言
+        case .sw: return "🇰🇪 斯瓦希里文"
+        case .am: return "🇪🇹 阿姆哈拉文"
+        case .zu: return "🇿🇦 祖魯文"
+        case .so: return "🇸🇴 索馬里文"
         }
     }
 
     var flag: String {
         switch self {
+        // 常用語言
         case .auto: return "🌐"
         case .zh: return "🇹🇼"
         case .en: return "🇺🇸"
@@ -166,12 +313,74 @@ enum Language: String, CaseIterable, Identifiable {
         case .hi: return "🇮🇳"
         case .th: return "🇹🇭"
         case .vi: return "🇻🇳"
+        // 歐洲語言
+        case .nl: return "🇳🇱"
+        case .pl: return "🇵🇱"
+        case .tr: return "🇹🇷"
+        case .sv: return "🇸🇪"
+        case .cs: return "🇨🇿"
+        case .el: return "🇬🇷"
+        case .fi: return "🇫🇮"
+        case .ro: return "🇷🇴"
+        case .da: return "🇩🇰"
+        case .bg: return "🇧🇬"
+        case .sk: return "🇸🇰"
+        case .hr: return "🇭🇷"
+        case .uk: return "🇺🇦"
+        case .he: return "🇮🇱"
+        case .hu: return "🇭🇺"
+        case .no: return "🇳🇴"
+        case .sl: return "🇸🇮"
+        case .sr: return "🇷🇸"
+        case .lt: return "🇱🇹"
+        case .lv: return "🇱🇻"
+        case .et: return "🇪🇪"
+        case .bs: return "🇧🇦"
+        case .mk: return "🇲🇰"
+        case .sq: return "🇦🇱"
+        case .mt: return "🇲🇹"
+        case .isLang: return "🇮🇸"
+        case .ga: return "🇮🇪"
+        case .cy: return "🏴󠁧󠁢󠁷󠁬󠁳󠁿"
+        case .ca: return "🇪🇸"
+        case .gl: return "🇪🇸"
+        case .eu: return "🇪🇸"
+        // 亞洲語言
+        case .id: return "🇮🇩"
+        case .fil: return "🇵🇭"
+        case .ms: return "🇲🇾"
+        case .ta: return "🇮🇳"
+        case .bn: return "🇧🇩"
+        case .gu: return "🇮🇳"
+        case .kn: return "🇮🇳"
+        case .ml: return "🇮🇳"
+        case .mr: return "🇮🇳"
+        case .ne: return "🇳🇵"
+        case .pa: return "🇮🇳"
+        case .te: return "🇮🇳"
+        case .ur: return "🇵🇰"
+        case .fa: return "🇮🇷"
+        case .hy: return "🇦🇲"
+        case .ka: return "🇬🇪"
+        case .az: return "🇦🇿"
+        case .kk: return "🇰🇿"
+        case .my: return "🇲🇲"
+        case .km: return "🇰🇭"
+        case .lo: return "🇱🇦"
+        case .jv: return "🇮🇩"
+        case .su: return "🇮🇩"
+        // 非洲語言
+        case .sw: return "🇰🇪"
+        case .am: return "🇪🇹"
+        case .zu: return "🇿🇦"
+        case .so: return "🇸🇴"
         }
     }
 
     /// 簡短名稱（用於底部控制欄）
     var shortName: String {
         switch self {
+        // 常用語言
         case .auto: return "自動"
         case .zh: return "中文"
         case .en: return "英文"
@@ -187,7 +396,182 @@ enum Language: String, CaseIterable, Identifiable {
         case .hi: return "印地"
         case .th: return "泰文"
         case .vi: return "越文"
+        // 歐洲語言
+        case .nl: return "荷蘭"
+        case .pl: return "波蘭"
+        case .tr: return "土耳其"
+        case .sv: return "瑞典"
+        case .cs: return "捷克"
+        case .el: return "希臘"
+        case .fi: return "芬蘭"
+        case .ro: return "羅馬尼亞"
+        case .da: return "丹麥"
+        case .bg: return "保加利亞"
+        case .sk: return "斯洛伐克"
+        case .hr: return "克羅地亞"
+        case .uk: return "烏克蘭"
+        case .he: return "希伯來"
+        case .hu: return "匈牙利"
+        case .no: return "挪威"
+        case .sl: return "斯洛維尼亞"
+        case .sr: return "塞爾維亞"
+        case .lt: return "立陶宛"
+        case .lv: return "拉脫維亞"
+        case .et: return "愛沙尼亞"
+        case .bs: return "波斯尼亞"
+        case .mk: return "馬其頓"
+        case .sq: return "阿爾巴尼亞"
+        case .mt: return "馬耳他"
+        case .isLang: return "冰島"
+        case .ga: return "愛爾蘭"
+        case .cy: return "威爾斯"
+        case .ca: return "加泰隆尼亞"
+        case .gl: return "加利西亞"
+        case .eu: return "巴斯克"
+        // 亞洲語言
+        case .id: return "印尼"
+        case .fil: return "菲律賓"
+        case .ms: return "馬來"
+        case .ta: return "塔米爾"
+        case .bn: return "孟加拉"
+        case .gu: return "古吉拉特"
+        case .kn: return "卡納達"
+        case .ml: return "馬拉雅拉姆"
+        case .mr: return "馬拉地"
+        case .ne: return "尼泊爾"
+        case .pa: return "旁遮普"
+        case .te: return "泰盧固"
+        case .ur: return "烏爾都"
+        case .fa: return "波斯"
+        case .hy: return "亞美尼亞"
+        case .ka: return "喬治亞"
+        case .az: return "阿塞拜疆"
+        case .kk: return "哈薩克"
+        case .my: return "緬甸"
+        case .km: return "高棉"
+        case .lo: return "老撾"
+        case .jv: return "爪哇"
+        case .su: return "巽他"
+        // 非洲語言
+        case .sw: return "斯瓦希里"
+        case .am: return "阿姆哈拉"
+        case .zu: return "祖魯"
+        case .so: return "索馬里"
         }
+    }
+
+    /// Azure TTS 完整 locale 代碼
+    /// 用於 Azure Speech Service 的語音合成
+    var azureLocale: String {
+        switch self {
+        // 🔥 台灣常用 TOP 20
+        case .auto: return "zh-TW"      // 預設台灣中文
+        case .zh: return "zh-TW"        // 繁體中文-台灣
+        case .en: return "en-US"        // 英文-美國
+        case .ja: return "ja-JP"        // 日文-日本
+        case .ko: return "ko-KR"        // 韓文-韓國
+        case .vi: return "vi-VN"        // 越南文
+        case .th: return "th-TH"        // 泰文
+        case .id: return "id-ID"        // 印尼文
+        case .fil: return "fil-PH"      // 菲律賓文
+        case .ms: return "ms-MY"        // 馬來文
+        case .my: return "my-MM"        // 緬甸文
+        case .km: return "km-KH"        // 高棉文
+        case .es: return "es-ES"        // 西班牙文-西班牙
+        case .fr: return "fr-FR"        // 法文-法國
+        case .de: return "de-DE"        // 德文-德國
+        case .pt: return "pt-BR"        // 葡萄牙文-巴西
+        case .it: return "it-IT"        // 義大利文
+        case .ru: return "ru-RU"        // 俄文
+        case .ar: return "ar-SA"        // 阿拉伯文-沙烏地
+        case .tr: return "tr-TR"        // 土耳其文
+
+        // 🌏 東南亞
+        case .lo: return "lo-LA"        // 老撾文
+        case .jv: return "jv-ID"        // 爪哇文
+        case .su: return "su-ID"        // 巽他文
+
+        // 🕌 南亞
+        case .hi: return "hi-IN"        // 印地文
+        case .bn: return "bn-IN"        // 孟加拉文-印度
+        case .ta: return "ta-IN"        // 塔米爾文-印度
+        case .te: return "te-IN"        // 泰盧固文
+        case .mr: return "mr-IN"        // 馬拉地文
+        case .gu: return "gu-IN"        // 古吉拉特文
+        case .kn: return "kn-IN"        // 卡納達文
+        case .ml: return "ml-IN"        // 馬拉雅拉姆文
+        case .pa: return "pa-IN"        // 旁遮普文
+        case .ur: return "ur-PK"        // 烏爾都文-巴基斯坦
+        case .ne: return "ne-NP"        // 尼泊爾文
+
+        // 🏜️ 中東/中亞/高加索
+        case .fa: return "fa-IR"        // 波斯文
+        case .he: return "he-IL"        // 希伯來文
+        case .hy: return "hy-AM"        // 亞美尼亞文
+        case .ka: return "ka-GE"        // 喬治亞文
+        case .az: return "az-AZ"        // 阿塞拜疆文
+        case .kk: return "kk-KZ"        // 哈薩克文
+
+        // 🏰 歐洲 - 西歐
+        case .nl: return "nl-NL"        // 荷蘭文
+        case .ca: return "ca-ES"        // 加泰隆尼亞文
+        case .gl: return "gl-ES"        // 加利西亞文
+        case .eu: return "eu-ES"        // 巴斯克文
+        case .ga: return "ga-IE"        // 愛爾蘭文
+        case .cy: return "cy-GB"        // 威爾斯文
+
+        // 🏰 歐洲 - 北歐
+        case .sv: return "sv-SE"        // 瑞典文
+        case .no: return "nb-NO"        // 挪威文（書面語）
+        case .da: return "da-DK"        // 丹麥文
+        case .fi: return "fi-FI"        // 芬蘭文
+        case .isLang: return "is-IS"    // 冰島文
+
+        // 🏰 歐洲 - 中歐
+        case .pl: return "pl-PL"        // 波蘭文
+        case .cs: return "cs-CZ"        // 捷克文
+        case .sk: return "sk-SK"        // 斯洛伐克文
+        case .hu: return "hu-HU"        // 匈牙利文
+
+        // 🏰 歐洲 - 東歐
+        case .uk: return "uk-UA"        // 烏克蘭文
+        case .ro: return "ro-RO"        // 羅馬尼亞文
+        case .bg: return "bg-BG"        // 保加利亞文
+        case .lt: return "lt-LT"        // 立陶宛文
+        case .lv: return "lv-LV"        // 拉脫維亞文
+        case .et: return "et-EE"        // 愛沙尼亞文
+
+        // 🏰 歐洲 - 巴爾幹
+        case .el: return "el-GR"        // 希臘文
+        case .hr: return "hr-HR"        // 克羅地亞文
+        case .sr: return "sr-RS"        // 塞爾維亞文
+        case .sl: return "sl-SI"        // 斯洛維尼亞文
+        case .bs: return "bs-BA"        // 波斯尼亞文
+        case .mk: return "mk-MK"        // 馬其頓文
+        case .sq: return "sq-AL"        // 阿爾巴尼亞文
+        case .mt: return "mt-MT"        // 馬耳他文
+
+        // 🌍 非洲
+        case .sw: return "sw-KE"        // 斯瓦希里文-肯亞
+        case .am: return "am-ET"        // 阿姆哈拉文
+        case .zu: return "zu-ZA"        // 祖魯文
+        case .so: return "so-SO"        // 索馬里文
+        }
+    }
+}
+
+/// 翻譯分句結構
+struct TranslationSegment: Identifiable, Equatable {
+    let id: UUID
+    let original: String      // 原文片段
+    let translation: String   // 翻譯片段
+    let isComplete: Bool      // 語義是否完整
+
+    init(id: UUID = UUID(), original: String, translation: String, isComplete: Bool = true) {
+        self.id = id
+        self.original = original
+        self.translation = translation
+        self.isComplete = isComplete
     }
 }
 
@@ -204,6 +588,23 @@ struct TranscriptMessage: Identifiable, Equatable {
     let timestamp: Date
     var translation: String?
 
+    /// ⭐️ 分句翻譯結果（當有多個句子時使用）
+    var translationSegments: [TranslationSegment]?
+
+    /// ⭐️ 合併的翻譯文本（優先使用 translationSegments，否則使用 translation）
+    var displayTranslation: String? {
+        if let segments = translationSegments, !segments.isEmpty {
+            return segments.map { $0.translation }.joined(separator: " ")
+        }
+        return translation
+    }
+
+    /// ⭐️ 是否有分句翻譯
+    var hasSegmentedTranslation: Bool {
+        guard let segments = translationSegments else { return false }
+        return segments.count > 1
+    }
+
     init(
         id: UUID = UUID(),
         text: String,
@@ -214,7 +615,8 @@ struct TranscriptMessage: Identifiable, Equatable {
         originalText: String? = nil,
         speakerTag: Int? = nil,
         timestamp: Date = Date(),
-        translation: String? = nil
+        translation: String? = nil,
+        translationSegments: [TranslationSegment]? = nil
     ) {
         self.id = id
         self.text = text
@@ -226,6 +628,7 @@ struct TranscriptMessage: Identifiable, Equatable {
         self.speakerTag = speakerTag
         self.timestamp = timestamp
         self.translation = translation
+        self.translationSegments = translationSegments
     }
 
     /// 信心度等級
