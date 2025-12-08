@@ -158,6 +158,13 @@ final class TranscriptionViewModel {
         }
     }
 
+    /// ⭐️ 麥克風增益（1.0 ~ 4.0）
+    /// 放大送入 ElevenLabs 的音頻，讓細微聲音更容易被偵測
+    var microphoneGain: Float {
+        get { audioManager.microphoneGain }
+        set { audioManager.microphoneGain = newValue }
+    }
+
     /// ⭐️ 最小語音長度（毫秒）
     var minSpeechDurationMs: Int = 100 {
         didSet {
@@ -199,9 +206,101 @@ final class TranscriptionViewModel {
     /// ⭐️ 當前正在合成的文本（用於去重）
     private var currentSynthesizingText: String?
 
+    // MARK: - Streaming TTS 系統
+    // ⭐️ 支援 interim 翻譯時就開始播放，避免等待 final
+
+    /// Streaming TTS 狀態追蹤
+    /// 記錄當前 utterance 已播放到哪個位置
+    private var streamingTTSState = StreamingTTSState()
+
+    /// Streaming TTS 配置
+    private struct StreamingTTSConfig {
+        /// 最小分段長度（字符數）- 太短的片段不值得單獨播放
+        static let minSegmentLength = 3
+        /// ⭐️ interim 穩定等待時間（秒）- 收到 interim 後等待這麼久才開始播放
+        /// 如果在這段時間內收到新的 interim，會重新計時
+        static let interimStabilityDelay: TimeInterval = 1.0
+        /// 分句標點符號
+        static let sentenceEnders: Set<Character> = ["。", "！", "？", ".", "!", "?", "，", ",", "；", ";"]
+    }
+
+    /// Streaming TTS 狀態
+    private struct StreamingTTSState {
+        /// 當前 utterance 的 ID（用來識別是否為同一句話）
+        var currentUtteranceId: String = ""
+        /// 已播放的翻譯內容（完整的已播放文本）
+        var playedTranslation: String = ""
+        /// 上一次的原文（用於檢測修正）
+        var lastSourceText: String = ""
+        /// 上一次更新時間
+        var lastUpdateTime: Date = .distantPast
+        /// 是否已經完成這個 utterance 的播放
+        var isCompleted: Bool = false
+        /// 待播放的隊列（分段）
+        var pendingSegments: [String] = []
+        /// ⭐️ 等待穩定的翻譯內容（等待 1 秒穩定後播放）
+        var pendingTranslation: String = ""
+        /// ⭐️ 等待穩定的語言代碼
+        var pendingLanguageCode: String = ""
+
+        mutating func reset() {
+            currentUtteranceId = ""
+            playedTranslation = ""
+            lastSourceText = ""
+            lastUpdateTime = .distantPast
+            isCompleted = false
+            pendingSegments = []
+            pendingTranslation = ""
+            pendingLanguageCode = ""
+        }
+
+        /// 檢測是否為新的 utterance（原文完全不同或不是前綴關係）
+        mutating func isNewUtterance(sourceText: String) -> Bool {
+            // 如果是第一次，視為新 utterance
+            if lastSourceText.isEmpty {
+                return true
+            }
+
+            // 如果新原文是舊原文的延續（前綴關係），不是新 utterance
+            if sourceText.hasPrefix(lastSourceText) {
+                return false
+            }
+
+            // 如果舊原文是新原文的前綴（可能是 ElevenLabs 修正），也不是新 utterance
+            if lastSourceText.hasPrefix(sourceText) {
+                return false
+            }
+
+            // 否則是新 utterance
+            return true
+        }
+
+        /// 檢測原文是否被修正（前面的字改變了）
+        func isSourceCorrected(sourceText: String) -> Bool {
+            guard !lastSourceText.isEmpty else { return false }
+
+            // 如果新原文是舊原文的延續，沒有修正
+            if sourceText.hasPrefix(lastSourceText) {
+                return false
+            }
+
+            // 如果舊原文是新原文的前綴，也沒有修正（只是截斷）
+            if lastSourceText.hasPrefix(sourceText) {
+                return false
+            }
+
+            // 其他情況都視為修正
+            return true
+        }
+    }
+
     private var cancellables = Set<AnyCancellable>()
     private var durationTimer: Timer?
     private var startTime: Date?
+
+    /// ⭐️ Streaming TTS 穩定計時器
+    /// 收到 interim 後等待 1 秒，如果沒有新的更新才開始播放
+    private var streamingTTSTimer: Timer?
 
     // MARK: - Initialization
 
@@ -331,6 +430,9 @@ final class TranscriptionViewModel {
         interimTranscript = nil
         ttsQueue.removeAll()
         isProcessingTTS = false
+
+        // ⭐️ 重置 Streaming TTS 狀態
+        resetStreamingTTSState()
     }
 
     /// 切換擴音模式
@@ -626,7 +728,6 @@ final class TranscriptionViewModel {
     /// 解決：模糊匹配時檢查語言是否一致，只匹配同語言的 transcript
     private func handleTranslation(sourceText: String, translatedText: String) {
         // 找到對應的轉錄並添加翻譯
-        var shouldPlayTTS = false
         var detectedLanguage: String? = nil
 
         // ⭐️ DEBUG: 打印匹配信息
@@ -641,10 +742,6 @@ final class TranscriptionViewModel {
         // ⭐️ 先嘗試精確匹配（最可靠）
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
             // 精確匹配到 final 結果
-            let existingTranslation = transcripts[index].translation
-            if existingTranslation == nil || existingTranslation?.isEmpty == true {
-                shouldPlayTTS = true
-            }
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
             print("✅ [翻譯匹配] 精確匹配到 transcripts[\(index)]")
@@ -667,10 +764,6 @@ final class TranscriptionViewModel {
             }
             return true
         }) {
-            let existingTranslation = transcripts[index].translation
-            if existingTranslation == nil || existingTranslation?.isEmpty == true {
-                shouldPlayTTS = true
-            }
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
             print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（語言一致）")
@@ -713,16 +806,20 @@ final class TranscriptionViewModel {
             return  // ⭐️ 直接返回，不播放 TTS
         }
 
-        // ⭐️ 根據 TTS 播放模式決定是否播放
-        if shouldPlayTTS {
-            shouldPlayTTS = shouldPlayTTSForMode(detectedLanguage: detectedLanguage)
-        }
+        // ⭐️ 使用 Streaming TTS：支援 interim 時就開始播放
+        // 判斷是否為 final（匹配到 transcripts 陣列中的 = final，匹配到 interimTranscript = interim）
+        let isFinal = interimTranscript?.text != sourceText
 
-        if shouldPlayTTS {
-            // 判斷翻譯的目標語言（根據檢測到的原文語言決定）
-            let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
-            enqueueTTS(text: translatedText, languageCode: targetLangCode)
-        }
+        // 判斷翻譯的目標語言
+        let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+
+        // 使用 Streaming TTS 處理（會自動判斷是否需要播放、去重、增量播放）
+        handleStreamingTTS(
+            sourceText: sourceText,
+            translatedText: translatedText,
+            languageCode: targetLangCode,
+            isFinal: isFinal
+        )
     }
 
     /// ⭐️ 處理 ElevenLabs 修正事件
@@ -946,6 +1043,195 @@ final class TranscriptionViewModel {
             // 無法判斷，預設使用目標語言
             return targetLang.azureLocale
         }
+    }
+
+    // MARK: - Streaming TTS 處理
+
+    /// ⭐️ Streaming TTS：處理 interim 翻譯，增量播放
+    /// 核心邏輯：
+    /// - interim：等待 1 秒穩定後才開始播放（如果 1 秒內有新 interim 則重新計時）
+    /// - final：立即播放，不等待
+    /// - Parameters:
+    ///   - sourceText: 原文（用於追蹤 utterance）
+    ///   - translatedText: 翻譯後的完整文本
+    ///   - languageCode: TTS 語言代碼
+    ///   - isFinal: 是否為最終結果
+    private func handleStreamingTTS(sourceText: String, translatedText: String, languageCode: String, isFinal: Bool) {
+        // 檢查 TTS 播放模式
+        let detectedLanguage = detectLanguageFromText(sourceText)
+        guard shouldPlayTTSForMode(detectedLanguage: detectedLanguage) else {
+            return
+        }
+
+        // ⭐️ 檢測是否為新的 utterance
+        if streamingTTSState.isNewUtterance(sourceText: sourceText) {
+            print("🆕 [Streaming TTS] 新 utterance 開始")
+            print("   舊原文: \"\(streamingTTSState.lastSourceText.prefix(30))...\"")
+            print("   新原文: \"\(sourceText.prefix(30))...\"")
+
+            // 取消之前的計時器
+            streamingTTSTimer?.invalidate()
+            streamingTTSTimer = nil
+
+            // 重置狀態
+            streamingTTSState.reset()
+            streamingTTSState.currentUtteranceId = UUID().uuidString
+        }
+
+        // ⭐️ 檢測原文是否被修正（前面的字改變了）
+        if streamingTTSState.isSourceCorrected(sourceText: sourceText) {
+            print("🔄 [Streaming TTS] 原文被修正，只播放新增部分")
+            print("   舊原文: \"\(streamingTTSState.lastSourceText.prefix(30))...\"")
+            print("   新原文: \"\(sourceText.prefix(30))...\"")
+        }
+
+        // 更新狀態
+        streamingTTSState.lastSourceText = sourceText
+        streamingTTSState.lastUpdateTime = Date()
+
+        // ⭐️ 計算需要播放的新增內容
+        let newContent = calculateNewTTSContent(fullTranslation: translatedText)
+
+        if newContent.isEmpty {
+            if isFinal {
+                streamingTTSState.isCompleted = true
+                streamingTTSTimer?.invalidate()
+                streamingTTSTimer = nil
+                print("✅ [Streaming TTS] utterance 完成（無新內容）")
+            }
+            return
+        }
+
+        // ⭐️ Final 結果：立即播放，不等待
+        if isFinal {
+            // 取消計時器（Final 已到達，不需要等待）
+            streamingTTSTimer?.invalidate()
+            streamingTTSTimer = nil
+
+            // 立即播放
+            enqueueTTS(text: newContent, languageCode: languageCode)
+            streamingTTSState.playedTranslation = translatedText
+            streamingTTSState.isCompleted = true
+            print("🎵 [Streaming TTS] Final 立即播放: \"\(newContent.prefix(30))...\"")
+            return
+        }
+
+        // ⭐️ Interim 結果：等待 1 秒穩定後才播放
+        // 保存待播放的內容（每次收到新 interim 都會更新）
+        streamingTTSState.pendingTranslation = translatedText
+        streamingTTSState.pendingLanguageCode = languageCode
+
+        // 取消之前的計時器（重新計時）
+        streamingTTSTimer?.invalidate()
+
+        print("⏳ [Streaming TTS] 等待穩定 (\(StreamingTTSConfig.interimStabilityDelay)秒): \"\(newContent.prefix(30))...\"")
+
+        // 設置新的計時器：1 秒後如果沒有新的 interim 就播放
+        streamingTTSTimer = Timer.scheduledTimer(withTimeInterval: StreamingTTSConfig.interimStabilityDelay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+
+            // 確保在主線程執行
+            DispatchQueue.main.async {
+                self.playPendingStreamingTTS()
+            }
+        }
+    }
+
+    /// ⭐️ 播放等待中的 Streaming TTS（計時器觸發時調用）
+    private func playPendingStreamingTTS() {
+        let pendingTranslation = streamingTTSState.pendingTranslation
+        let languageCode = streamingTTSState.pendingLanguageCode
+
+        guard !pendingTranslation.isEmpty else {
+            print("⚠️ [Streaming TTS] 計時器觸發但無待播放內容")
+            return
+        }
+
+        // 計算需要播放的新增內容
+        let newContent = calculateNewTTSContent(fullTranslation: pendingTranslation)
+
+        guard !newContent.isEmpty else {
+            print("⚠️ [Streaming TTS] 計時器觸發但無新增內容")
+            return
+        }
+
+        // 播放
+        enqueueTTS(text: newContent, languageCode: languageCode)
+        streamingTTSState.playedTranslation = pendingTranslation
+
+        print("🎵 [Streaming TTS] 穩定後播放: \"\(newContent.prefix(30))...\"")
+        print("   已播放總長度: \(streamingTTSState.playedTranslation.count) 字符")
+    }
+
+    /// 計算需要播放的新增內容
+    /// - Parameter fullTranslation: 完整的翻譯文本
+    /// - Returns: 需要播放的新增部分
+    private func calculateNewTTSContent(fullTranslation: String) -> String {
+        let playedText = streamingTTSState.playedTranslation
+
+        // 如果沒有已播放內容，返回全部
+        if playedText.isEmpty {
+            return fullTranslation
+        }
+
+        // ⭐️ 情況 1：新翻譯是已播放內容的延續（最常見）
+        if fullTranslation.hasPrefix(playedText) {
+            let newPart = String(fullTranslation.dropFirst(playedText.count))
+            return newPart.trimmingCharacters(in: .whitespaces)
+        }
+
+        // ⭐️ 情況 2：已播放內容是新翻譯的前綴（翻譯被截斷，不應發生）
+        if playedText.hasPrefix(fullTranslation) {
+            // 新翻譯比已播放的短，不播放任何內容
+            return ""
+        }
+
+        // ⭐️ 情況 3：翻譯被修正（前面的內容改變了）
+        // 找出共同前綴，只播放後面的部分
+        let commonPrefixLength = findCommonPrefixLength(playedText, fullTranslation)
+
+        if commonPrefixLength > 0 {
+            // 有共同前綴，播放新翻譯中超出共同前綴的部分
+            // 但要考慮已播放的部分
+            let newPart = String(fullTranslation.dropFirst(max(commonPrefixLength, playedText.count)))
+            if !newPart.isEmpty {
+                print("🔀 [Streaming TTS] 翻譯有修正，播放差異: \"\(newPart.prefix(20))...\"")
+                return newPart.trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        // ⭐️ 情況 4：完全不同的翻譯
+        // 這不應該發生（應該是新 utterance），但為了安全起見
+        print("⚠️ [Streaming TTS] 翻譯完全不同，重新開始")
+        streamingTTSState.playedTranslation = ""
+        return fullTranslation
+    }
+
+    /// 找出兩個字串的共同前綴長度
+    private func findCommonPrefixLength(_ str1: String, _ str2: String) -> Int {
+        let chars1 = Array(str1)
+        let chars2 = Array(str2)
+        var length = 0
+
+        for i in 0..<min(chars1.count, chars2.count) {
+            if chars1[i] == chars2[i] {
+                length += 1
+            } else {
+                break
+            }
+        }
+
+        return length
+    }
+
+    /// 重置 Streaming TTS 狀態（在停止錄音時調用）
+    private func resetStreamingTTSState() {
+        // 取消計時器
+        streamingTTSTimer?.invalidate()
+        streamingTTSTimer = nil
+
+        streamingTTSState.reset()
+        print("🔄 [Streaming TTS] 狀態已重置")
     }
 
     /// 將文本加入 TTS 播放隊列

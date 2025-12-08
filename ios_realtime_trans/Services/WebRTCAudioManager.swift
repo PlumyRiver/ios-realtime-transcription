@@ -125,6 +125,23 @@ final class WebRTCAudioManager: NSObject {
         }
     }
 
+    // MARK: - 麥克風增益設定
+
+    /// ⭐️ 麥克風增益（1.0 = 原始音量，2.0 = 兩倍，最大 4.0）
+    /// 用於放大細微聲音，讓 ElevenLabs 更容易偵測
+    static let maxMicGain: Float = 4.0
+    static let defaultMicGain: Float = 1.0
+
+    var microphoneGain: Float = 1.0 {
+        didSet {
+            let clamped = min(max(microphoneGain, 1.0), Self.maxMicGain)
+            if microphoneGain != clamped {
+                microphoneGain = clamped
+            }
+            print("🎤 [WebRTC] 麥克風增益: \(microphoneGain)x")
+        }
+    }
+
     // MARK: - WebRTC Components
 
     /// PeerConnection Factory
@@ -393,12 +410,50 @@ final class WebRTCAudioManager: NSObject {
 
     /// 處理從 tap 接收的音頻數據
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        // ⭐️ 如果有設定麥克風增益，先放大音頻
+        if microphoneGain > 1.0 {
+            amplifyInputBuffer(buffer, gain: microphoneGain)
+        }
+
         // ⭐️ 計算並更新即時音量
         let rms = calculateRMS(buffer)
         updateVolume(rms)
 
         guard let data = convertToWebSocketFormat(buffer) else { return }
         audioBufferCollector.append(data)
+    }
+
+    /// ⭐️ 放大輸入音頻緩衝區（in-place 修改）
+    private func amplifyInputBuffer(_ buffer: AVAudioPCMBuffer, gain: Float) {
+        guard gain > 1.0 else { return }
+
+        // Float 格式
+        if let floatChannelData = buffer.floatChannelData {
+            let channelCount = Int(buffer.format.channelCount)
+            let frameLength = Int(buffer.frameLength)
+
+            for channel in 0..<channelCount {
+                let samples = floatChannelData[channel]
+                for frame in 0..<frameLength {
+                    // 放大並限制在 -1.0 ~ 1.0
+                    samples[frame] = min(max(samples[frame] * gain, -1.0), 1.0)
+                }
+            }
+        }
+        // Int16 格式
+        else if let int16ChannelData = buffer.int16ChannelData {
+            let channelCount = Int(buffer.format.channelCount)
+            let frameLength = Int(buffer.frameLength)
+
+            for channel in 0..<channelCount {
+                let samples = int16ChannelData[channel]
+                for frame in 0..<frameLength {
+                    // 放大並限制在 Int16 範圍
+                    let amplified = Float(samples[frame]) * gain
+                    samples[frame] = Int16(min(max(amplified, -32768), 32767))
+                }
+            }
+        }
     }
 
     /// ⭐️ 計算 RMS（Root Mean Square）音量

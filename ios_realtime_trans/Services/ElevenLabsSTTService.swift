@@ -892,14 +892,23 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         lastFinalTime = Date()
 
         // ⭐️ 使用 pendingSegments 的翻譯（如果有且匹配，且不是佔位符）
-        if !pendingSegments.isEmpty && pendingSourceText == transcriptText,
+        // ⭐️ 修復：需要正規化後比較，避免因為空格或省略號導致不匹配
+        let normalizedTranscript = transcriptText.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "...", with: "")
+            .replacingOccurrences(of: "…", with: "")
+        let normalizedPending = pendingSourceText.trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: "...", with: "")
+            .replacingOccurrences(of: "…", with: "")
+
+        if !pendingSegments.isEmpty && normalizedPending == normalizedTranscript,
            let validTranslation = getValidTranslationFromPending() {
             translationSubject.send((transcriptText, validTranslation))
             print("   🌐 使用已有翻譯: \(validTranslation.prefix(40))...")
         } else {
-            // 沒有現成翻譯或翻譯是佔位符，異步請求
+            // 沒有現成翻譯或翻譯是佔位符，使用可靠的翻譯方法
+            print("   🌐 需要重新翻譯...")
             Task {
-                await self.translateTextDirectly(transcriptText, isInterim: false)
+                await self.translateAndSendFinal(transcriptText)
             }
         }
 
@@ -1105,6 +1114,88 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
 
         await callTranslationAPI(text: text, targetLang: translateTo, isInterim: isInterim)
+    }
+
+    /// ⭐️ 翻譯並發送 Final 結果（確保翻譯不會丟失）
+    /// 專門用於 VAD commit 時需要重新翻譯的情況
+    /// 會嘗試 smart-translate，失敗則使用 translate API，最後使用重試機制
+    private func translateAndSendFinal(_ text: String) async {
+        let maxRetries = 2
+        var lastError: Error?
+
+        for attempt in 0..<maxRetries {
+            do {
+                // 嘗試使用 smart-translate API
+                let translation = try await fetchSmartTranslation(text: text)
+
+                if !translation.isEmpty && !isErrorPlaceholder(translation) {
+                    await MainActor.run {
+                        translationSubject.send((text, translation))
+                        print("✅ [翻譯成功] \(text.prefix(30))... → \(translation.prefix(40))...")
+                    }
+                    return
+                } else {
+                    // 翻譯為空或是佔位符，嘗試備用 API
+                    throw TranslationError.emptyResult
+                }
+
+            } catch {
+                lastError = error
+                print("⚠️ [翻譯重試] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
+
+                // 如果不是最後一次嘗試，等待一下再重試
+                if attempt < maxRetries - 1 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                }
+            }
+        }
+
+        // 所有重試都失敗，嘗試使用簡單翻譯 API
+        print("⚠️ [翻譯] smart-translate 失敗，嘗試 translate API")
+        await translateTextDirectly(text, isInterim: false)
+    }
+
+    /// 翻譯錯誤類型
+    private enum TranslationError: Error {
+        case emptyResult
+        case networkError
+    }
+
+    /// 獲取 smart-translate 翻譯結果（純函數，不發送 Publisher）
+    private func fetchSmartTranslation(text: String) async throws -> String {
+        let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
+
+        guard let url = URL(string: smartTranslateURL) else {
+            throw TranslationError.networkError
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 5.0  // 5 秒超時
+
+        let body: [String: Any] = [
+            "text": text,
+            "sourceLang": currentSourceLang.rawValue,
+            "targetLang": currentTargetLang.rawValue,
+            "mode": "streaming"
+        ]
+
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await URLSession.shared.data(for: request)
+
+        let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
+
+        // 合併所有有效的翻譯
+        let translations = response.segments
+            .compactMap { $0.translation }
+            .filter { !isErrorPlaceholder($0) }
+
+        guard !translations.isEmpty else {
+            throw TranslationError.emptyResult
+        }
+
+        return translations.joined(separator: " ")
     }
 
     private func sendPing() {
@@ -1371,12 +1462,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     print("✅ [確認] 完全匹配: \(transcriptText.prefix(40))... → \(validTranslation.prefix(40))...")
                 } else if isPendingPartialMatch {
                     // ⚠️ 部分匹配：翻譯不完整（句子說完後才 commit，但最後一次翻譯是在句子中間）
-                    // 需要重新翻譯完整句子
-                    print("⚠️ [確認] 翻譯不完整，需重新翻譯")
+                    // ⭐️ 修復：同步等待翻譯完成，確保翻譯不會丟失
+                    print("⚠️ [確認] 翻譯不完整，同步重新翻譯")
                     print("   最終句子: \(transcriptText.prefix(50))...")
                     print("   已翻譯部分: \(pendingSourceText.prefix(50))...")
                     Task {
-                        await self.translateTextDirectly(transcriptText, isInterim: false)
+                        await self.translateAndSendFinal(transcriptText)
                     }
                 } else if isPendingReverseMatch, let validTranslation = getValidTranslationFromPending() {
                     // ⚠️ 異常情況：VAD commit 的文本比翻譯的原文短
@@ -1392,9 +1483,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                         print("   期望: \(transcriptText.prefix(30))...")
                         print("   實際: \(pendingSourceText.prefix(30))...")
                     }
-                    print("✅ [確認] \(transcriptText.prefix(40))... (需要重新翻譯)")
+                    // ⭐️ 修復：同步等待翻譯完成，確保翻譯不會丟失
+                    print("✅ [確認] \(transcriptText.prefix(40))... (同步翻譯中...)")
                     Task {
-                        await self.translateTextDirectly(transcriptText, isInterim: false)
+                        await self.translateAndSendFinal(transcriptText)
                     }
                 }
 

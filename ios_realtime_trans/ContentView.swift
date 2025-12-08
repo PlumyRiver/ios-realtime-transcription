@@ -1326,6 +1326,48 @@ struct SettingsView: View {
 
                 // ⭐️ VAD 靈敏度設定（ElevenLabs 專用）
                 if viewModel.sttProvider == .elevenLabs {
+                    Section("麥克風增益") {
+                        // ⭐️ 麥克風增益設定
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("輸入增益")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(String(format: "%.1f", viewModel.microphoneGain))x")
+                                    .font(.caption)
+                                    .foregroundStyle(micGainColor(viewModel.microphoneGain))
+                                    .fontWeight(.medium)
+                                    .monospacedDigit()
+                            }
+
+                            HStack {
+                                Image(systemName: "mic")
+                                    .foregroundStyle(.secondary)
+                                    .font(.caption)
+
+                                Slider(value: $viewModel.microphoneGain, in: 1.0...4.0, step: 0.1)
+
+                                Image(systemName: "mic.fill")
+                                    .foregroundStyle(.blue)
+                                    .font(.caption)
+                            }
+
+                            Text("放大送入語音識別的音頻，讓細微聲音更容易被偵測（1.0x = 原始音量）")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+
+                        // 快捷按鈕
+                        HStack(spacing: 12) {
+                            MicGainPresetButton(label: "1x", value: 1.0, current: $viewModel.microphoneGain)
+                            MicGainPresetButton(label: "1.5x", value: 1.5, current: $viewModel.microphoneGain)
+                            MicGainPresetButton(label: "2x", value: 2.0, current: $viewModel.microphoneGain)
+                            MicGainPresetButton(label: "3x", value: 3.0, current: $viewModel.microphoneGain)
+                            MicGainPresetButton(label: "4x", value: 4.0, current: $viewModel.microphoneGain)
+                        }
+                    }
+
                     Section("語音偵測靈敏度（VAD）") {
                         // 即時音量顯示
                         VStack(alignment: .leading, spacing: 8) {
@@ -1522,6 +1564,19 @@ struct SettingsView: View {
             return .blue
         }
     }
+
+    /// 根據麥克風增益返回對應顏色
+    private func micGainColor(_ gain: Float) -> Color {
+        if gain <= 1.0 {
+            return .secondary
+        } else if gain < 2.0 {
+            return .blue
+        } else if gain < 3.0 {
+            return .orange
+        } else {
+            return .red
+        }
+    }
 }
 
 // MARK: - VAD 音量條視圖
@@ -1606,6 +1661,33 @@ struct VolumePresetButton: View {
                 .padding(.vertical, 8)
                 .background(isSelected ? Color.blue : Color(.systemGray5))
                 .cornerRadius(8)
+        }
+    }
+}
+
+// MARK: - 麥克風增益預設按鈕
+
+struct MicGainPresetButton: View {
+    let label: String
+    let value: Float
+    @Binding var current: Float
+
+    private var isSelected: Bool {
+        abs(current - value) < 0.05
+    }
+
+    var body: some View {
+        Button {
+            current = value
+        } label: {
+            Text(label)
+                .font(.caption)
+                .fontWeight(isSelected ? .bold : .regular)
+                .foregroundStyle(isSelected ? .white : .primary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(isSelected ? Color.blue : Color(.systemGray5))
+                .cornerRadius(6)
         }
     }
 }
