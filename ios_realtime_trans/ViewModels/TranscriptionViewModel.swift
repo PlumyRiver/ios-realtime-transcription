@@ -66,11 +66,14 @@ final class TranscriptionViewModel {
     var wordCount: Int = 0
     var recordingDuration: Int = 0
 
+    /// ⭐️ 是否在通話中（連接中或錄音中都算通話中，讓 UI 立即切換）
     var isRecording: Bool {
-        if case .recording = status {
+        switch status {
+        case .connecting, .recording:
             return true
+        default:
+            return false
         }
-        return false
     }
 
     /// 擴音模式狀態（默認開啟，提升 TTS 音量）
@@ -99,6 +102,11 @@ final class TranscriptionViewModel {
     /// TTS 播放中
     var isPlayingTTS: Bool {
         audioManager.isPlayingTTS
+    }
+
+    /// ⭐️ 當前正在播放的 TTS 文本
+    var currentPlayingTTSText: String? {
+        audioManager.currentTTSText
     }
 
     /// ⭐️ Push-to-Talk：是否正在按住說話
@@ -143,6 +151,17 @@ final class TranscriptionViewModel {
                         await startRecording()
                     }
                 }
+            }
+        }
+    }
+
+    /// ⭐️ 翻譯模型選擇（預設 Gemini 3 Flash）
+    var translationProvider: TranslationProvider = .gemini {
+        didSet {
+            if oldValue != translationProvider {
+                print("🔄 [翻譯] 切換模型: \(oldValue.displayName) → \(translationProvider.displayName)")
+                // 更新 ElevenLabs 服務的翻譯模型
+                elevenLabsService.translationProvider = translationProvider
             }
         }
     }
@@ -196,6 +215,9 @@ final class TranscriptionViewModel {
 
     /// ⭐️ 使用 WebRTC AEC3 音頻管理器（全雙工回音消除）
     private let audioManager = WebRTCAudioManager.shared
+
+    /// ⭐️ Session 服務（對話記錄儲存到 Firestore）
+    private let sessionService = SessionService.shared
 
     /// TTS 服務
     private let ttsService = AzureTTSService()
@@ -320,7 +342,43 @@ final class TranscriptionViewModel {
     /// 是否正在處理連接/斷開
     private var isProcessing = false
 
-    /// 切換錄音狀態
+    /// ⭐️ 開始通話（同步方法，立即更新 UI）
+    @MainActor
+    func beginCall() {
+        guard !isProcessing else {
+            print("⚠️ 正在處理中，忽略重複觸發")
+            return
+        }
+        // 立即設置狀態，UI 會立即切換
+        status = .connecting
+    }
+
+    /// ⭐️ 結束通話（同步方法，立即更新 UI）
+    @MainActor
+    func endCall() {
+        // 立即設置狀態，UI 會立即切換
+        status = .disconnected
+        // 在背景執行清理
+        Task.detached { [weak self] in
+            await self?.performStopRecording()
+        }
+    }
+
+    /// ⭐️ 執行連接（在背景調用）
+    func performStartRecording() async {
+        guard !isProcessing else { return }
+        isProcessing = true
+        defer { isProcessing = false }
+        await startRecording()
+    }
+
+    /// ⭐️ 執行斷開（在背景調用）
+    @MainActor
+    private func performStopRecording() {
+        stopRecording()
+    }
+
+    /// 切換錄音狀態（保留兼容性）
     @MainActor
     func toggleRecording() async {
         // 防止重複觸發
@@ -352,14 +410,24 @@ final class TranscriptionViewModel {
     /// 開始錄音
     @MainActor
     private func startRecording() async {
+        // ⭐️ 立即設置連接狀態，讓 UI 先切換（順暢體驗）
+        status = .connecting
+
+        // ⭐️ 讓出主線程，讓 UI 有機會更新
+        await Task.yield()
+
+        // ⭐️ 檢查用戶額度（至少需要 100 額度才能開始）
+        guard AuthService.shared.hasEnoughCredits(100) else {
+            status = .error("額度不足，請購買額度")
+            return
+        }
+
         // 請求麥克風權限
         let granted = await audioManager.requestPermission()
         guard granted else {
             status = .error("請允許使用麥克風")
             return
         }
-
-        status = .connecting
 
         print("🔌 開始連接伺服器: \(serverURL) (使用 \(sttProvider.displayName))")
 
@@ -399,14 +467,37 @@ final class TranscriptionViewModel {
 
             print("🔊 [WebRTC AEC3] 全雙工模式啟動（獨立錄音 + 播放引擎，AEC3 回音消除）")
 
-            // ⭐️ VAD 模式：自動開始發送音頻
+            status = .recording
+            startDurationTimer()
+
+            // ⭐️ 無論是否登入，都啟動計費會話（確保 usage 被記錄）
+            BillingService.shared.startSession()
+
+            // ⭐️ VAD 模式：先開始發送音頻，這會觸發 BillingService.startAudioSending()
+            // 這樣 startSTTTimer() 會知道要立即開始計費
             if inputMode == .vad {
                 audioManager.startSending()
                 print("🎙️ [ViewModel] VAD 模式：自動開始持續監聽")
             }
 
-            status = .recording
-            startDurationTimer()
+            BillingService.shared.startSTTTimer()
+
+            // ⭐️ 只有登入用戶才創建 Firebase Session 記錄
+            if let uid = AuthService.shared.currentUser?.uid {
+                Task {
+                    do {
+                        let sessionId = try await sessionService.createSession(
+                            uid: uid,
+                            sourceLang: sourceLang.rawValue,
+                            targetLang: targetLang.rawValue,
+                            provider: sttProvider.rawValue
+                        )
+                        print("✅ [ViewModel] 創建 Session: \(sessionId)")
+                    } catch {
+                        print("⚠️ [ViewModel] 創建 Session 失敗: \(error.localizedDescription)")
+                    }
+                }
+            }
         } catch {
             status = .error(error.localizedDescription)
             currentSTTService.disconnect()
@@ -416,7 +507,13 @@ final class TranscriptionViewModel {
     /// 停止錄音
     @MainActor
     private func stopRecording() {
+        // ⭐️ 立即設置狀態，讓 UI 先切換（順暢體驗）
+        status = .disconnected
+
         stopDurationTimer()
+
+        // ⭐️ 停止 STT 計時
+        BillingService.shared.stopSTTTimer()
 
         // ⭐️ 使用統一的 AudioManager
         audioManager.stopRecording()
@@ -424,7 +521,6 @@ final class TranscriptionViewModel {
 
         // ⭐️ 斷開當前 STT 服務
         currentSTTService.disconnect()
-        status = .disconnected
 
         // 清除 interim 和 TTS 隊列
         interimTranscript = nil
@@ -433,6 +529,23 @@ final class TranscriptionViewModel {
 
         // ⭐️ 重置 Streaming TTS 狀態
         resetStreamingTTSState()
+
+        // ⭐️ 結束 Session（保存對話記錄）
+        // 注意：扣款已改為即時扣款（在 BillingService 中處理），這裡不再扣款
+        Task {
+            // 結束 Session 並獲取用量統計（僅用於記錄）
+            let usage = await sessionService.endSession()
+            print("✅ [ViewModel] 結束 Session")
+
+            // ⭐️ 即時扣款模式：不在這裡扣款，僅記錄總用量
+            if let usage = usage {
+                print("💰 [ViewModel] 本次會話總用量:")
+                print("   STT: \(String(format: "%.2f", usage.sttDurationSeconds))秒")
+                print("   LLM: \(usage.llmInputTokens)+\(usage.llmOutputTokens) tokens")
+                print("   TTS: \(usage.ttsCharCount) chars")
+                print("   總額度: \(usage.totalCreditsUsed)")
+            }
+        }
     }
 
     /// 切換擴音模式
@@ -682,6 +795,10 @@ final class TranscriptionViewModel {
             transcripts.append(finalTranscript)
             interimTranscript = nil
             updateStats()
+
+            // ⭐️ 保存對話到 Session（判斷是否為來源語言）
+            let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
+            sessionService.addConversation(finalTranscript, isSource: isSource)
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
             // 注意：ElevenLabs 使用 VAD 自動 commit，不需要 Pseudo-Final 機制
@@ -709,6 +826,10 @@ final class TranscriptionViewModel {
                     )
                     transcripts.append(pseudoFinal)
                     updateStats()
+
+                    // ⭐️ 保存 Pseudo-Final 到 Session
+                    let isSource = isSourceLanguage(detectedLanguage: pseudoFinal.language)
+                    sessionService.addConversation(pseudoFinal, isSource: isSource)
                 }
             }
 
@@ -806,20 +927,24 @@ final class TranscriptionViewModel {
             return  // ⭐️ 直接返回，不播放 TTS
         }
 
-        // ⭐️ 使用 Streaming TTS：支援 interim 時就開始播放
+        // ⭐️ 只在 Final 時播放 TTS（不使用 Streaming TTS）
         // 判斷是否為 final（匹配到 transcripts 陣列中的 = final，匹配到 interimTranscript = interim）
         let isFinal = interimTranscript?.text != sourceText
 
-        // 判斷翻譯的目標語言
-        let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+        // 只有 final 才播放 TTS
+        if isFinal {
+            // 檢查 TTS 播放模式
+            guard shouldPlayTTSForMode(detectedLanguage: detectedLanguage) else {
+                return
+            }
 
-        // 使用 Streaming TTS 處理（會自動判斷是否需要播放、去重、增量播放）
-        handleStreamingTTS(
-            sourceText: sourceText,
-            translatedText: translatedText,
-            languageCode: targetLangCode,
-            isFinal: isFinal
-        )
+            // 判斷翻譯的目標語言
+            let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+
+            // 加入 TTS 播放隊列
+            enqueueTTS(text: translatedText, languageCode: targetLangCode)
+            print("🎵 [TTS] Final 播放: \"\(translatedText.prefix(30))...\"")
+        }
     }
 
     /// ⭐️ 處理 ElevenLabs 修正事件
@@ -1043,6 +1168,19 @@ final class TranscriptionViewModel {
             // 無法判斷，預設使用目標語言
             return targetLang.azureLocale
         }
+    }
+
+    /// ⭐️ 判斷是否為來源語言（用於 Session 記錄的 position）
+    /// - Parameter detectedLanguage: STT 檢測到的語言代碼
+    /// - Returns: true = 來源語言（用戶說的，position: right），false = 目標語言（對方說的，position: left）
+    private func isSourceLanguage(detectedLanguage: String?) -> Bool {
+        guard let detected = detectedLanguage else {
+            // 無法檢測，預設為來源語言
+            return true
+        }
+
+        let detectedBase = detected.split(separator: "-").first.map(String.init) ?? detected
+        return detectedBase == sourceLang.rawValue
     }
 
     // MARK: - Streaming TTS 處理
@@ -1307,10 +1445,19 @@ final class TranscriptionViewModel {
     }
 
     /// 停止當前 TTS 播放
+    /// 停止所有 TTS（清空隊列）
     func stopCurrentTTS() {
         audioManager.stopTTS()
         ttsQueue.removeAll()
         isProcessingTTS = false
+    }
+
+    /// ⭐️ 停止當前 TTS 並播放下一個（不清空隊列）
+    func skipCurrentTTS() {
+        print("⏭️ [TTS] 跳過當前播放，播放下一個")
+        audioManager.stopTTS()
+        // 不清空隊列，繼續播放下一個
+        processNextTTS()
     }
 
     /// 更新統計數據

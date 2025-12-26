@@ -55,6 +55,23 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var pendingSegments: [(original: String, translation: String)] = []  // 待確認的分句結果
     private var pendingSourceText: String = ""  // ⭐️ pendingSegments 對應的原文（用於 VAD commit 時驗證）
 
+    // MARK: - ⭐️ 分句累積機制（核心改進）
+    // 目的：避免重複翻譯已完成的分句，實現增量翻譯
+    // 流程：
+    //   1. 每次 smart-translate 返回後，將 isComplete=true 的分句加入 confirmedSegments
+    //   2. 下次調用 smart-translate 時，只翻譯新增的部分
+    //   3. VAD Commit 時，優先使用 confirmedSegments，只翻譯增量部分
+
+    /// ⭐️ 已確認的分句累積器（isComplete=true 的分句）
+    /// 這些分句不會再次發送給 LLM 翻譯
+    private var confirmedSegments: [(original: String, translation: String)] = []
+
+    /// ⭐️ 已確認分句的原文長度總和（用於快速判斷是否有新內容）
+    private var confirmedOriginalLength: Int = 0
+
+    /// ⭐️ 當前未完成的分句（isComplete=false 的最後一個分句）
+    private var pendingIncompleteSegment: (original: String, translation: String)?
+
     /// ⭐️ 防止 race condition：VAD commit 後忽略舊的 async 翻譯回調
     /// 當 VAD commit 時設為 true，收到新 partial 時設為 false
     private var isCommitted: Bool = false
@@ -65,6 +82,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// 當前語言設定
     private var currentSourceLang: Language = .zh
     private var currentTargetLang: Language = .en
+
+    /// ⭐️ 翻譯模型提供商（可由用戶選擇）
+    var translationProvider: TranslationProvider = .gemini
 
     // Combine Publishers
     private let transcriptSubject = PassthroughSubject<TranscriptMessage, Never>()
@@ -916,7 +936,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         resetInterimState()
     }
 
-    /// ⭐️ 重置 interim 相關狀態
+    /// ⭐️ 重置 interim 相關狀態（包括分句累積器）
     private func resetInterimState() {
         currentInterimText = ""
         lastInterimLength = 0
@@ -926,30 +946,52 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         pendingSegments = []
         pendingSourceText = ""
         lastInterimGrowthTime = Date()  // 重置計時
+
+        // ⭐️ 重置分句累積器
+        let previousConfirmedCount = confirmedSegments.count
+        confirmedSegments = []
+        confirmedOriginalLength = 0
+        pendingIncompleteSegment = nil
+
+        if previousConfirmedCount > 0 {
+            print("🔄 [重置] 清除 \(previousConfirmedCount) 個已確認分句")
+        }
     }
 
     /// ⭐️ 調用智能翻譯 + 分句 API
     /// Cerebras 會自動判斷輸入語言並翻譯到另一種語言
     /// 不需要客戶端判斷語言，完全由 LLM 處理
-    private func callSmartTranslateAPI(text: String) async {
+    /// ⭐️ 分句一致性：傳遞 previousSegments 讓 LLM 保持前文分句邊界
+    private func callSmartTranslateAPI(text: String, includePreviousSegments: Bool = true) async {
         let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
 
         guard let url = URL(string: smartTranslateURL) else { return }
 
         // ⭐️ 簡化：直接傳遞語言對，讓 LLM 自己判斷輸入是哪種語言
         // LLM 會自動翻譯到另一種語言
-        print("🌐 [Smart-Translate] 語言對: \(currentSourceLang.rawValue) ↔ \(currentTargetLang.rawValue)")
+        let prevCount = includePreviousSegments ? confirmedSegments.count : 0
+        print("🌐 [Smart-Translate] 語言對: \(currentSourceLang.rawValue) ↔ \(currentTargetLang.rawValue), 前文分句: \(prevCount) 段")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        // ⭐️ 傳遞兩個語言，讓 LLM 自己判斷輸入是哪種並翻譯到另一種
+        // ⭐️ 構建前文分句陣列（讓 LLM 保持分句一致性）
+        var previousSegmentsArray: [[String: Any]] = []
+        if includePreviousSegments && !confirmedSegments.isEmpty {
+            previousSegmentsArray = confirmedSegments.map { segment in
+                ["original": segment.original, "translation": segment.translation]
+            }
+        }
+
+        // ⭐️ 傳遞兩個語言 + 前文分句 + 翻譯模型，讓 LLM 保持分句一致性
         let body: [String: Any] = [
             "text": text,
             "sourceLang": currentSourceLang.rawValue,
             "targetLang": currentTargetLang.rawValue,
-            "mode": "streaming"
+            "mode": "streaming",
+            "previousSegments": previousSegmentsArray,
+            "provider": translationProvider.rawValue  // ⭐️ 傳遞用戶選擇的翻譯模型
         ]
 
         do {
@@ -958,6 +1000,15 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
             // 解析智能翻譯結果（使用類別級別的 SmartTranslateResponse）
             let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
+
+            // ⭐️ 記錄 LLM token 用量（用於計費，根據 provider 使用對應價格）
+            if let usage = response.usage {
+                BillingService.shared.recordLLMUsage(
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    provider: translationProvider
+                )
+            }
 
             await MainActor.run {
                 processSmartTranslateResponse(response, originalText: text)
@@ -970,11 +1021,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
     }
 
-    /// ⭐️ 處理智能翻譯響應
-    /// 新策略：在 interim 階段「只翻譯，不確認」
-    /// - 所有內容都作為 interim 發送（包括 LLM 認為 complete 的）
-    /// - 只有 ElevenLabs VAD commit 時才真正確認句子
-    /// - 這樣可以避免「I can speak」+「English」的切分問題
+    /// ⭐️ 處理智能翻譯響應（核心改進：增量分句累積）
+    /// 新策略：
+    /// 1. 將 isComplete=true 的分句加入 confirmedSegments（不重複）
+    /// 2. 保留最後一個 isComplete=false 的分句作為 pending
+    /// 3. Interim 顯示時合併 confirmed + pending
+    /// 4. VAD Commit 時優先使用 confirmedSegments
     private func processSmartTranslateResponse(_ response: SmartTranslateResponse, originalText: String) {
         guard !response.segments.isEmpty else { return }
 
@@ -990,19 +1042,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             return
         }
 
-        // ⭐️ 顯示 LLM 檢測的語言方向
+        // ⭐️ 顯示 LLM 檢測的語言方向和增量標識
         let langInfo = response.detectedLang.map { "\($0) → \(response.translatedTo ?? "?")" } ?? "?"
-        print("✂️ [智能翻譯] \(response.segments.count) 段 (\(langInfo))")
-
-        // ⭐️ 保存分句結果（等待 VAD commit 時使用）
-        pendingSegments = response.segments.compactMap { segment in
-            if let translation = segment.translation {
-                return (original: segment.original, translation: translation)
-            }
-            return nil
-        }
-        pendingConfirmOffset = response.lastCompleteOffset
-        pendingSourceText = originalText  // ⭐️ 記錄這個翻譯對應的原文
+        let incrementalInfo = (response.isIncremental == true) ? " [增量: 前文\(response.previousSegmentsCount ?? 0)段]" : ""
+        print("✂️ [智能翻譯] \(response.segments.count) 段 (\(langInfo))\(incrementalInfo)")
 
         // ⭐️ 過濾掉錯誤佔位符（[請稍候]、[翻譯失敗] 等）
         let validSegments = response.segments.filter { segment in
@@ -1015,31 +1058,104 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             return
         }
 
-        // ⭐️ 發送分句翻譯結果（新增）
-        let translationSegments = validSegments.compactMap { segment -> TranslationSegment? in
-            guard let translation = segment.translation else { return nil }
-            return TranslationSegment(
-                original: segment.original,
-                translation: translation,
-                isComplete: segment.isComplete
-            )
+        // ⭐️ 核心改進：增量分句累積
+        // 將新的 isComplete=true 分句加入 confirmedSegments（避免重複）
+        var newConfirmedCount = 0
+        for segment in validSegments where segment.isComplete {
+            guard let translation = segment.translation else { continue }
+
+            // 檢查是否已經在 confirmedSegments 中（避免重複）
+            let alreadyConfirmed = confirmedSegments.contains { confirmed in
+                confirmed.original == segment.original
+            }
+
+            if !alreadyConfirmed {
+                confirmedSegments.append((original: segment.original, translation: translation))
+                confirmedOriginalLength += segment.original.count
+                newConfirmedCount += 1
+                print("   ✅ [累積] 新確認: \"\(segment.original.prefix(20))...\" → \"\(translation.prefix(25))...\"")
+            }
         }
 
-        if translationSegments.count > 1 {
-            // 多句：發送分句結果
-            segmentedTranslationSubject.send((originalText, translationSegments))
-            print("✂️ [分句翻譯] \(translationSegments.count) 段:")
-            for (i, seg) in translationSegments.enumerated() {
-                let status = seg.isComplete ? "✅" : "⏳"
-                print("   \(status) [\(i)] \"\(seg.original.prefix(20))...\" → \"\(seg.translation.prefix(25))...\"")
-            }
+        // ⭐️ 保存最後一個未完成的分句
+        if let lastSegment = validSegments.last, !lastSegment.isComplete, let translation = lastSegment.translation {
+            pendingIncompleteSegment = (original: lastSegment.original, translation: translation)
+            print("   ⏳ [待定] \"\(lastSegment.original.prefix(20))...\" → \"\(translation.prefix(25))...\"")
         } else {
-            // 單句：使用傳統翻譯 Publisher
-            let allTranslations = validSegments.compactMap { $0.translation }.joined(separator: " ")
-            if !allTranslations.isEmpty {
-                translationSubject.send((originalText, allTranslations))
-                print("🌐 [翻譯] \(originalText.prefix(30))... → \(allTranslations.prefix(40))...")
+            pendingIncompleteSegment = nil
+        }
+
+        // ⭐️ 同時保存完整的 pendingSegments（用於 VAD commit 時的精確匹配）
+        pendingSegments = validSegments.compactMap { segment in
+            if let translation = segment.translation {
+                return (original: segment.original, translation: translation)
             }
+            return nil
+        }
+        pendingConfirmOffset = response.lastCompleteOffset ?? 0
+        pendingSourceText = originalText
+
+        // ⭐️ 構建顯示用的翻譯（合併 confirmed + pending）
+        var displayTranslations: [String] = []
+
+        // 1. 已確認的分句翻譯
+        for confirmed in confirmedSegments {
+            displayTranslations.append(confirmed.translation)
+        }
+
+        // 2. 未完成的分句翻譯（如果有且不在 confirmed 中）
+        if let pending = pendingIncompleteSegment {
+            let alreadyIncluded = confirmedSegments.contains { $0.original == pending.original }
+            if !alreadyIncluded {
+                displayTranslations.append(pending.translation)
+            }
+        }
+
+        let combinedTranslation = displayTranslations.joined(separator: " ")
+
+        // ⭐️ 構建完整的分句列表（confirmedSegments + 當前 pending）
+        // 這樣 UI 才能看到完整的一對一配對
+        var allSegments: [TranslationSegment] = []
+
+        // 1. 已確認的分句
+        for confirmed in confirmedSegments {
+            allSegments.append(TranslationSegment(
+                original: confirmed.original,
+                translation: confirmed.translation,
+                isComplete: true
+            ))
+        }
+
+        // 2. 當前未完成的分句（如果有且不在 confirmed 中）
+        if let pending = pendingIncompleteSegment {
+            let alreadyIncluded = confirmedSegments.contains { $0.original == pending.original }
+            if !alreadyIncluded {
+                allSegments.append(TranslationSegment(
+                    original: pending.original,
+                    translation: pending.translation,
+                    isComplete: false
+                ))
+            }
+        }
+
+        // ⭐️ 發送分句翻譯結果（只要有多個累積分句就發送）
+        if allSegments.count > 1 {
+            // 多句：發送完整的累積分句結果
+            segmentedTranslationSubject.send((originalText, allSegments))
+            print("✂️ [分句翻譯] \(allSegments.count) 段 (一對一配對):")
+            for (i, seg) in allSegments.enumerated() {
+                let status = seg.isComplete ? "✅" : "⏳"
+                print("   \(status) [\(i)] 「\(seg.original.prefix(20))」→「\(seg.translation.prefix(25))」")
+            }
+        } else if !combinedTranslation.isEmpty {
+            // 單句：使用傳統翻譯 Publisher
+            translationSubject.send((originalText, combinedTranslation))
+            print("🌐 [翻譯] \(originalText.prefix(30))... → \(combinedTranslation.prefix(40))...")
+        }
+
+        // ⭐️ 統計信息
+        if newConfirmedCount > 0 {
+            print("📊 [分句累積] 本次新增 \(newConfirmedCount) 個確認分句，總計 \(confirmedSegments.count) 個 (\(confirmedOriginalLength) 字)")
         }
     }
 
@@ -1079,18 +1195,30 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private struct SmartTranslateResponse: Decodable {
         let segments: [Segment]
         let lastCompleteIndex: Int
-        let lastCompleteOffset: Int
+        let lastCompleteOffset: Int?  // ⭐️ API 可能不返回此欄位
         let latencyMs: Int?
         // ⭐️ 新增欄位：LLM 檢測到的語言和翻譯目標
         let detectedLang: String?
         let translatedTo: String?
         let originalText: String?
         let error: String?
+        // ⭐️ 新增欄位：token 使用量（用於計費）
+        let usage: TokenUsage?
+        // ⭐️ 新增欄位：增量處理標識（客戶端需要合併 previousSegments）
+        let isIncremental: Bool?
+        let previousSegmentsCount: Int?
+        let processedText: String?
 
         struct Segment: Decodable {
             let original: String
             let translation: String?
             let isComplete: Bool
+        }
+
+        struct TokenUsage: Decodable {
+            let inputTokens: Int
+            let outputTokens: Int
+            let totalTokens: Int
         }
     }
 
@@ -1114,6 +1242,40 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         }
 
         await callTranslationAPI(text: text, targetLang: translateTo, isInterim: isInterim)
+    }
+
+    /// ⭐️ 增量翻譯並發送（只翻譯新增部分，合併已確認翻譯）
+    /// 用於 VAD Commit 時，已有部分翻譯但有增量的情況
+    /// - Parameters:
+    ///   - fullText: 完整的 Final 文本
+    ///   - confirmedTranslation: 已確認分句的翻譯
+    ///   - incrementalText: 需要翻譯的增量部分
+    private func translateIncrementalAndSend(fullText: String, confirmedTranslation: String, incrementalText: String) async {
+        print("🔄 [增量翻譯] 只翻譯增量: \"\(incrementalText.prefix(30))...\"")
+
+        do {
+            // 只翻譯增量部分
+            let incrementalTranslation = try await fetchSmartTranslation(text: incrementalText)
+
+            if !incrementalTranslation.isEmpty && !isErrorPlaceholder(incrementalTranslation) {
+                // 合併已確認翻譯 + 增量翻譯
+                let combinedTranslation = confirmedTranslation + " " + incrementalTranslation
+
+                await MainActor.run {
+                    translationSubject.send((fullText, combinedTranslation))
+                    print("✅ [增量翻譯] 成功合併:")
+                    print("   已確認: \(confirmedTranslation.prefix(30))...")
+                    print("   增量: \(incrementalTranslation.prefix(30))...")
+                }
+                return
+            }
+        } catch {
+            print("⚠️ [增量翻譯] 失敗: \(error.localizedDescription)")
+        }
+
+        // 增量翻譯失敗，回退到完整翻譯
+        print("⚠️ [增量翻譯] 回退到完整翻譯")
+        await translateAndSendFinal(fullText)
     }
 
     /// ⭐️ 翻譯並發送 Final 結果（確保翻譯不會丟失）
@@ -1178,7 +1340,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             "text": text,
             "sourceLang": currentSourceLang.rawValue,
             "targetLang": currentTargetLang.rawValue,
-            "mode": "streaming"
+            "mode": "streaming",
+            "provider": translationProvider.rawValue  // ⭐️ 傳遞用戶選擇的翻譯模型
         ]
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -1425,66 +1588,64 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     detectedLanguage = detectLanguageFromText(transcriptText)
                 }
 
-                let transcript = TranscriptMessage(
-                    text: transcriptText,
-                    isFinal: true,
-                    confidence: response.confidence ?? 0.9,
-                    language: detectedLanguage,
-                    converted: wasConverted,  // ⭐️ 記錄是否進行了簡繁轉換
-                    originalText: wasConverted ? rawText : nil  // ⭐️ 保存原始簡體文本
-                )
-                transcriptSubject.send(transcript)
+                // ⭐️⭐️⭐️ 核心改進：每個分句 = 獨立對話框 ⭐️⭐️⭐️
+                // 不再發送一個包含完整文本的 transcript
+                // 而是為每個 confirmedSegments 分句發送獨立的 final transcript（帶翻譯）
 
-                // ⭐️ 使用 pendingSegments 的翻譯（如果有，且原文匹配）
-                // 防止 race condition：pendingSegments 可能是上一句話的翻譯
-                //
-                // ⭐️ 關鍵判斷：翻譯是否完整
-                // 情況 1：pendingSourceText == transcriptText（完全匹配，翻譯應該完整）
-                // 情況 2：pendingSourceText 是 transcriptText 的前綴（翻譯不完整，需重新翻譯）
-                // 情況 3：transcriptText 是 pendingSourceText 的前綴（異常情況）
-                // 情況 4：完全不匹配（上一句的翻譯）
+                print("📊 [VAD Commit] 分句累積狀態:")
+                print("   已確認分句: \(confirmedSegments.count) 個 (\(confirmedOriginalLength) 字)")
 
-                // ⭐️ 移除末尾的 ... 進行比對（ElevenLabs 有時會加省略號）
-                let normalizedTranscript = transcriptText.trimmingCharacters(in: .whitespaces)
-                    .replacingOccurrences(of: "...", with: "")
-                    .replacingOccurrences(of: "…", with: "")
-                let normalizedPending = pendingSourceText.trimmingCharacters(in: .whitespaces)
-                    .replacingOccurrences(of: "...", with: "")
-                    .replacingOccurrences(of: "…", with: "")
-
-                let isPendingExactMatch = !pendingSegments.isEmpty && normalizedPending == normalizedTranscript
-                let isPendingPartialMatch = !pendingSegments.isEmpty && normalizedTranscript.hasPrefix(normalizedPending) && normalizedPending != normalizedTranscript
-                let isPendingReverseMatch = !pendingSegments.isEmpty && normalizedPending.hasPrefix(normalizedTranscript) && normalizedPending != normalizedTranscript
-
-                if isPendingExactMatch, let validTranslation = getValidTranslationFromPending() {
-                    // ✅ 完全匹配且翻譯有效：直接使用 pendingSegments 的翻譯
-                    translationSubject.send((transcriptText, validTranslation))
-                    print("✅ [確認] 完全匹配: \(transcriptText.prefix(40))... → \(validTranslation.prefix(40))...")
-                } else if isPendingPartialMatch {
-                    // ⚠️ 部分匹配：翻譯不完整（句子說完後才 commit，但最後一次翻譯是在句子中間）
-                    // ⭐️ 修復：同步等待翻譯完成，確保翻譯不會丟失
-                    print("⚠️ [確認] 翻譯不完整，同步重新翻譯")
-                    print("   最終句子: \(transcriptText.prefix(50))...")
-                    print("   已翻譯部分: \(pendingSourceText.prefix(50))...")
-                    Task {
-                        await self.translateAndSendFinal(transcriptText)
+                if !confirmedSegments.isEmpty {
+                    // ⭐️ 為每個已確認分句發送獨立的 final 對話框
+                    print("🎯 [VAD Commit] 發送 \(confirmedSegments.count) 個獨立對話框:")
+                    for (index, segment) in confirmedSegments.enumerated() {
+                        var segmentTranscript = TranscriptMessage(
+                            text: segment.original,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0.9,
+                            language: detectedLanguage,
+                            converted: wasConverted,
+                            originalText: nil
+                        )
+                        segmentTranscript.translation = segment.translation
+                        transcriptSubject.send(segmentTranscript)
+                        print("   [\(index + 1)] 「\(segment.original.prefix(20))」→「\(segment.translation.prefix(25))」")
                     }
-                } else if isPendingReverseMatch, let validTranslation = getValidTranslationFromPending() {
-                    // ⚠️ 異常情況：VAD commit 的文本比翻譯的原文短
-                    // 可能是 ElevenLabs 截斷了文本，使用現有翻譯但記錄警告
-                    translationSubject.send((transcriptText, validTranslation))
-                    print("⚠️ [確認] 異常：commit 文本較短，使用現有翻譯")
-                    print("   commit: \(transcriptText.prefix(50))...")
-                    print("   翻譯原文: \(pendingSourceText.prefix(50))...")
-                } else {
-                    // ⚠️ pendingSegments 不匹配（可能是上一句的翻譯），重新翻譯
-                    if !pendingSegments.isEmpty {
-                        print("⚠️ [確認] pendingSegments 不匹配，忽略舊翻譯")
-                        print("   期望: \(transcriptText.prefix(30))...")
-                        print("   實際: \(pendingSourceText.prefix(30))...")
+                }
+
+                // ⭐️ 處理 pending segment（最後一個未完成的分句）
+                if let pending = pendingIncompleteSegment {
+                    // 檢查是否已在 confirmedSegments 中
+                    let alreadySent = confirmedSegments.contains { $0.original == pending.original }
+                    if !alreadySent {
+                        var pendingTranscript = TranscriptMessage(
+                            text: pending.original,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0.9,
+                            language: detectedLanguage,
+                            converted: wasConverted,
+                            originalText: nil
+                        )
+                        pendingTranscript.translation = pending.translation
+                        transcriptSubject.send(pendingTranscript)
+                        print("   [+] 「\(pending.original.prefix(20))」→「\(pending.translation.prefix(25))」(pending)")
                     }
-                    // ⭐️ 修復：同步等待翻譯完成，確保翻譯不會丟失
-                    print("✅ [確認] \(transcriptText.prefix(40))... (同步翻譯中...)")
+                }
+
+                // ⭐️ 如果沒有任何分句（極少數情況），發送完整的 transcript
+                if confirmedSegments.isEmpty && pendingIncompleteSegment == nil {
+                    let transcript = TranscriptMessage(
+                        text: transcriptText,
+                        isFinal: true,
+                        confidence: response.confidence ?? 0.9,
+                        language: detectedLanguage,
+                        converted: wasConverted,
+                        originalText: wasConverted ? rawText : nil
+                    )
+                    transcriptSubject.send(transcript)
+                    print("⚠️ [VAD Commit] 無分句，發送完整 transcript")
+
+                    // 觸發翻譯
                     Task {
                         await self.translateAndSendFinal(transcriptText)
                     }
