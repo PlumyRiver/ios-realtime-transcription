@@ -110,6 +110,16 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
     private var recognitionStartTime: Date?
     private var totalAudioDuration: TimeInterval = 0
 
+    // MARK: - 防止無限重啟
+
+    /// 重建冷卻時間（防止快速循環重啟）
+    private var lastRebuildTime: Date?
+    private let rebuildCooldown: TimeInterval = 3.0  // 至少 3 秒才能重建
+
+    /// 連續錯誤計數（用於決定是否放棄）
+    private var consecutiveErrorCount = 0
+    private let maxConsecutiveErrors = 5
+
     // MARK: - Initialization
 
     override init() {
@@ -165,24 +175,92 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         lastEmittedText = ""
         lastEmittedLanguage = ""
 
+        // 重置計數器
+        audioSendCount = 0
+        sourceErrorCount = 0
+        targetErrorCount = 0
+        consecutiveErrorCount = 0
+        lastRebuildTime = nil
+
         connectionState = .disconnected
     }
 
-    func sendAudio(data: Data) {
-        guard connectionState == .connected else { return }
+    /// 音頻發送計數器
+    private var audioSendCount = 0
 
-        // 轉換 PCM Int16 → AVAudioPCMBuffer
-        guard let buffer = convertToAudioBuffer(data: data) else {
+    func sendAudio(data: Data) {
+        // ⭐️ 第一次調用時打印詳細狀態
+        if audioSendCount == 0 {
+            print("🔍 [Apple STT] sendAudio 首次調用:")
+            print("   connectionState: \(connectionState)")
+            print("   sourceRequest: \(sourceRequest != nil ? "存在" : "nil")")
+            print("   targetRequest: \(targetRequest != nil ? "存在" : "nil")")
+            print("   data.count: \(data.count) bytes")
+        }
+
+        guard connectionState == .connected else {
+            if audioSendCount % 50 == 0 {  // 減少 log 噪音
+                print("⚠️ [Apple STT] sendAudio: 未連接 (\(connectionState))，忽略")
+            }
+            audioSendCount += 1
             return
         }
 
+        audioSendCount += 1
+
+        // 每 20 次打印一次 debug info
+        if audioSendCount == 1 || audioSendCount % 20 == 0 {
+            print("📤 [Apple STT] 收到音頻 #\(audioSendCount): \(data.count) bytes")
+        }
+
+        // 轉換 PCM Int16 → AVAudioPCMBuffer
+        guard let buffer = convertToAudioBuffer(data: data) else {
+            print("❌ [Apple STT] 音頻轉換失敗 (data.count: \(data.count))")
+            return
+        }
+
+        // 檢查 request 是否存在
+        guard let srcReq = sourceRequest, let tgtReq = targetRequest else {
+            print("❌ [Apple STT] Request 為空，無法發送音頻")
+            print("   sourceRequest: \(sourceRequest != nil)")
+            print("   targetRequest: \(targetRequest != nil)")
+            return
+        }
+
+        // ⭐️ 計算音頻振幅（調試用）
+        var maxAmplitude: Float = 0
+        var avgAmplitude: Float = 0
+        if let floatData = buffer.floatChannelData?[0] {
+            let frameCount = Int(buffer.frameLength)
+            var sum: Float = 0
+            for i in 0..<frameCount {
+                let absVal = abs(floatData[i])
+                sum += absVal
+                if absVal > maxAmplitude {
+                    maxAmplitude = absVal
+                }
+            }
+            avgAmplitude = sum / Float(frameCount)
+        }
+
         // 發送給兩個識別器
-        sourceRequest?.append(buffer)
-        targetRequest?.append(buffer)
+        srcReq.append(buffer)
+        tgtReq.append(buffer)
 
         // 統計音頻時長
         let duration = Double(buffer.frameLength) / 16000.0
         totalAudioDuration += duration
+
+        // 每 20 次打印一次（包含振幅資訊）
+        if audioSendCount == 1 || audioSendCount % 20 == 0 {
+            print("   ✅ 已發送到識別器 (累計 \(String(format: "%.1f", totalAudioDuration))秒)")
+            print("   📊 振幅: max=\(String(format: "%.4f", maxAmplitude)), avg=\(String(format: "%.6f", avgAmplitude))")
+
+            // 振幅警告
+            if maxAmplitude < 0.01 {
+                print("   ⚠️ 音頻振幅過低！可能是靜音或麥克風問題")
+            }
+        }
     }
 
     func sendEndUtterance() {
@@ -362,6 +440,11 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
     // MARK: - Recognition Result Handling
 
+    /// 錯誤重試計數
+    private var sourceErrorCount = 0
+    private var targetErrorCount = 0
+    private let maxErrorRetries = 3
+
     private func handleRecognitionResult(
         result: SFSpeechRecognitionResult?,
         error: Error?,
@@ -372,14 +455,87 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
         // 處理錯誤
         if let error = error {
+            let nsError = error as NSError
+
             // 忽略取消錯誤
-            if (error as NSError).code == 1 || (error as NSError).code == 216 {
+            if nsError.code == 1 || nsError.code == 216 {
                 // 1: kAFAssistantErrorDomain - 用戶取消
                 // 216: 識別被中斷
                 return
             }
-            print("⚠️ [Apple STT/\(langName)] 錯誤: \(error.localizedDescription)")
+
+            // ⭐️ 處理 "No speech detected" 等可恢復錯誤
+            let errorMessage = error.localizedDescription
+            print("⚠️ [Apple STT/\(langName)] 錯誤: \(errorMessage) (code: \(nsError.code))")
+
+            // ⭐️ Error 1110 "No speech detected" 是正常的
+            // 表示識別器在運行，只是沒檢測到語音
+            // **不要** 因為這個錯誤而重啟任務！
+            if nsError.code == 1110 {
+                // 追蹤連續錯誤
+                consecutiveErrorCount += 1
+                if consecutiveErrorCount == 1 {
+                    print("ℹ️ [Apple STT] No speech detected - 等待語音輸入...")
+                } else if consecutiveErrorCount % 10 == 0 {
+                    print("ℹ️ [Apple STT] 持續等待語音... (已等待 \(consecutiveErrorCount) 次)")
+                }
+
+                // 如果連續太多次沒檢測到語音，可能需要重建任務
+                if consecutiveErrorCount >= maxConsecutiveErrors * 2 {
+                    // 但要檢查冷卻時間
+                    if let lastRebuild = lastRebuildTime,
+                       Date().timeIntervalSince(lastRebuild) < rebuildCooldown {
+                        // 還在冷卻中，不重建
+                        return
+                    }
+
+                    print("🔄 [Apple STT] 長時間無語音，嘗試重建任務...")
+                    consecutiveErrorCount = 0
+                    lastRebuildTime = Date()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self?.rebuildRecognitionTasks()
+                    }
+                }
+                return
+            }
+
+            // 追蹤其他錯誤次數
+            if isSource {
+                sourceErrorCount += 1
+            } else {
+                targetErrorCount += 1
+            }
+
+            // ⭐️ 只有非 1110 錯誤才考慮重啟
+            if sourceErrorCount > 0 && targetErrorCount > 0 {
+                // 檢查冷卻時間
+                if let lastRebuild = lastRebuildTime,
+                   Date().timeIntervalSince(lastRebuild) < rebuildCooldown {
+                    print("⏳ [Apple STT] 重建冷卻中，跳過...")
+                    return
+                }
+
+                if sourceErrorCount + targetErrorCount <= maxErrorRetries * 2 {
+                    print("🔄 [Apple STT] 識別器出錯，嘗試重啟任務...")
+                    lastRebuildTime = Date()
+                    sourceErrorCount = 0
+                    targetErrorCount = 0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.rebuildRecognitionTasks()
+                    }
+                } else {
+                    print("❌ [Apple STT] 錯誤次數過多，停止重試")
+                }
+            }
             return
+        }
+
+        // 收到有效結果，重置所有錯誤計數
+        consecutiveErrorCount = 0
+        if isSource {
+            sourceErrorCount = 0
+        } else {
+            targetErrorCount = 0
         }
 
         guard let result = result else { return }
@@ -491,11 +647,30 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         target: RecognitionResult?
     ) -> RecognitionResult? {
 
-        // 只有一個結果
+        // ⭐️ 同時顯示兩個識別結果（方便比較）
+        print("┌─────────────────────────────────────────────────────")
+        if let s = source {
+            print("│ 📗 [\(sourceLang.shortName)] \"\(s.text.prefix(30))\" (信心: \(String(format: "%.2f", s.confidence)))")
+        } else {
+            print("│ 📗 [\(sourceLang.shortName)] (無結果)")
+        }
+        if let t = target {
+            print("│ 📘 [\(targetLang.shortName)] \"\(t.text.prefix(30))\" (信心: \(String(format: "%.2f", t.confidence)))")
+        } else {
+            print("│ 📘 [\(targetLang.shortName)] (無結果)")
+        }
+
+        // 只有一個結果或都沒有
         guard let source = source else {
+            if target != nil {
+                print("└─→ 選擇 \(targetLang.shortName)（僅有此結果）")
+            } else {
+                print("└─→ 兩個識別器都無結果")
+            }
             return target
         }
         guard let target = target else {
+            print("└─→ 選擇 \(sourceLang.shortName)（僅有此結果）")
             return source
         }
 
@@ -509,24 +684,25 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         // 如果時間差太大，選擇較新的
         if timeDiff > timeThreshold {
             let winner = source.timestamp > target.timestamp ? source : target
-            print("⏱️ [Apple STT] 選擇較新結果: \(winner.language)")
+            let winnerLang = winner.language == sourceLang.rawValue ? sourceLang.shortName : targetLang.shortName
+            print("└─→ ⏱️ 時間差過大，選擇較新: \(winnerLang)")
             return winner
         }
 
         // 比較信心度
         if source.confidence > target.confidence + threshold {
-            print("🏆 [Apple STT] 選擇來源語言 (\(sourceLang.shortName)): 信心 \(String(format: "%.2f", source.confidence)) > \(String(format: "%.2f", target.confidence))")
+            print("└─→ 🏆 選擇 \(sourceLang.shortName)（信心 \(String(format: "%.2f", source.confidence)) > \(String(format: "%.2f", target.confidence))）")
             return source
         } else if target.confidence > source.confidence + threshold {
-            print("🏆 [Apple STT] 選擇目標語言 (\(targetLang.shortName)): 信心 \(String(format: "%.2f", target.confidence)) > \(String(format: "%.2f", source.confidence))")
+            print("└─→ 🏆 選擇 \(targetLang.shortName)（信心 \(String(format: "%.2f", target.confidence)) > \(String(format: "%.2f", source.confidence))）")
             return target
         } else {
             // 信心度相近，選擇文本更長的（通常更完整）
             if source.text.count >= target.text.count {
-                print("📏 [Apple STT] 信心度相近，選擇較長文本: \(sourceLang.shortName)")
+                print("└─→ 📏 信心度相近，選擇較長: \(sourceLang.shortName)（\(source.text.count) 字）")
                 return source
             } else {
-                print("📏 [Apple STT] 信心度相近，選擇較長文本: \(targetLang.shortName)")
+                print("└─→ 📏 信心度相近，選擇較長: \(targetLang.shortName)（\(target.text.count) 字）")
                 return target
             }
         }

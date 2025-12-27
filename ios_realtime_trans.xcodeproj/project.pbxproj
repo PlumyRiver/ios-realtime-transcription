@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		4C7782CD1D85A163A0B661F0 /* Pods_ios_realtime_trans.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4CE5EC2E9E3722F911DF2C62 /* Pods_ios_realtime_trans.framework */; };
+		527E806B2EFBB4B800DB7077 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 527E806A2EFBB4B800DB7077 /* StoreKit.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -15,6 +16,7 @@
 		3997CDEF82448B0A5FECFA1A /* Pods-ios_realtime_trans.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ios_realtime_trans.release.xcconfig"; path = "Target Support Files/Pods-ios_realtime_trans/Pods-ios_realtime_trans.release.xcconfig"; sourceTree = "<group>"; };
 		4CE5EC2E9E3722F911DF2C62 /* Pods_ios_realtime_trans.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_ios_realtime_trans.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		526BD19E2ED2D7FD004C76F6 /* ios_realtime_trans.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ios_realtime_trans.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		527E806A2EFBB4B800DB7077 /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = System/Library/Frameworks/StoreKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -44,6 +46,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4C7782CD1D85A163A0B661F0 /* Pods_ios_realtime_trans.framework in Frameworks */,
+				527E806B2EFBB4B800DB7077 /* StoreKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -53,6 +56,7 @@
 		3CDA69B1682E4EBF11FB30D5 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				527E806A2EFBB4B800DB7077 /* StoreKit.framework */,
 				4CE5EC2E9E3722F911DF2C62 /* Pods_ios_realtime_trans.framework */,
 			);
 			name = Frameworks;
@@ -338,6 +342,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ios_realtime_trans/ios_realtime_trans.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Q36H577RU5;
@@ -367,6 +372,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = ios_realtime_trans/ios_realtime_trans.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Q36H577RU5;

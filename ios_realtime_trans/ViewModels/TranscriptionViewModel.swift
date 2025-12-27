@@ -499,7 +499,12 @@ final class TranscriptionViewModel {
                 print("🎙️ [ViewModel] VAD 模式：自動開始持續監聽")
             }
 
-            BillingService.shared.startSTTTimer()
+            // ⭐️ Apple STT 是免費的，不需要計費
+            if sttProvider != .apple {
+                BillingService.shared.startSTTTimer()
+            } else {
+                print("💰 [ViewModel] Apple STT 免費，不計費")
+            }
 
             // ⭐️ 只有登入用戶才創建 Firebase Session 記錄
             if let uid = AuthService.shared.currentUser?.uid {

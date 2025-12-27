@@ -1,0 +1,150 @@
+{
+  "identifier" : "E8A2B3C4-D5E6-F7A8-B9C0-D1E2F3A4B5C6",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "30",
+      "familyShareable" : false,
+      "internalID" : "2001",
+      "localizations" : [
+        {
+          "description" : "新手限定 5萬額度（限購一次）",
+          "displayName" : "新手禮包",
+          "locale" : "zh_TW"
+        },
+        {
+          "description" : "Starter pack 50K credits (one-time only)",
+          "displayName" : "Starter Pack",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "starter_pack",
+      "referenceName" : "Starter Pack 50K",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "199",
+      "familyShareable" : false,
+      "internalID" : "2002",
+      "localizations" : [
+        {
+          "description" : "10萬+2萬贈送額度",
+          "displayName" : "超值包",
+          "locale" : "zh_TW"
+        },
+        {
+          "description" : "100K + 20K bonus credits",
+          "displayName" : "Value Pack",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "credits_12",
+      "referenceName" : "Credits 120K",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "499",
+      "familyShareable" : false,
+      "internalID" : "2003",
+      "localizations" : [
+        {
+          "description" : "25萬+10萬贈送額度",
+          "displayName" : "豪華包",
+          "locale" : "zh_TW"
+        },
+        {
+          "description" : "250K + 100K bonus credits",
+          "displayName" : "Premium Pack",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "credits_35",
+      "referenceName" : "Credits 350K",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "999",
+      "familyShareable" : false,
+      "internalID" : "2004",
+      "localizations" : [
+        {
+          "description" : "50萬+50萬贈送額度",
+          "displayName" : "尊爵包",
+          "locale" : "zh_TW"
+        },
+        {
+          "description" : "500K + 500K bonus credits",
+          "displayName" : "Ultimate Pack",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "credits_100",
+      "referenceName" : "Credits 1M",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "1234567890",
+    "_developerTeamID" : "YOUR_TEAM_ID",
+    "_failTransactionsEnabled" : false,
+    "_lastSynchronizedDate" : "2024-01-01T00:00:00Z",
+    "_locale" : "zh_TW",
+    "_storefront" : "TWN",
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Purchase"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Verification"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Store Sync"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Subscription Status"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Transaction"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Manage Subscriptions Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Refund Request Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Offer Code Redeem Sheet"
+      }
+    ]
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

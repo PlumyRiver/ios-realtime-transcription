@@ -5,6 +5,11 @@ target 'ios_realtime_trans' do
 
   # WebRTC with AEC3
   pod 'WebRTC-SDK', '~> 125.6422.04'
+
+  # Firebase Authentication & Firestore
+  pod 'FirebaseAuth'
+  pod 'FirebaseFirestore'
+  pod 'GoogleSignIn'
 end
 
 post_install do |installer|

@@ -276,6 +276,9 @@ class AzureTTSService {
             throw TTSError.emptyText
         }
 
+        // ⭐️ 記錄 TTS 用量（用於計費）
+        BillingService.shared.recordTTSUsage(text: text)
+
         // ⭐️ 使用語言專用語音（不再使用多語言語音）
         let voice = selectVoice(languageCode: languageCode, gender: gender)
 

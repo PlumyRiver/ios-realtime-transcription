@@ -198,6 +198,17 @@ final class WebRTCAudioManager: NSObject {
     private var sendCount = 0
     private let maxChunkSize = 25600
 
+    // MARK: - PTT 尾音緩衝（放開按鈕後繼續發送 0.5 秒）
+
+    /// ⭐️ PTT 尾音緩衝計時器
+    private var pttTrailingTimer: Timer?
+
+    /// ⭐️ PTT 尾音緩衝時間（秒）
+    private let pttTrailingDuration: TimeInterval = 0.5
+
+    /// ⭐️ 是否正在發送尾音緩衝
+    private(set) var isTrailingBuffer: Bool = false
+
     // MARK: - Combine Publishers
 
     private let audioDataSubject = PassthroughSubject<Data, Never>()
@@ -229,15 +240,28 @@ final class WebRTCAudioManager: NSObject {
 
     // MARK: - Initialization
 
+    /// ⭐️ 是否已初始化 WebRTC
+    private var isWebRTCInitialized = false
+    private let initLock = NSLock()
+
     private override init() {
         super.init()
-        setupWebRTC()
+        // ⭐️ 不在 init 中同步初始化，改為延遲初始化
+        // 在背景線程初始化，避免阻塞主線程
+        Task.detached(priority: .userInitiated) { [weak self] in
+            self?.setupWebRTC()
+        }
     }
 
     // MARK: - WebRTC Setup
 
-    /// 設置 WebRTC
+    /// 設置 WebRTC（可在背景線程執行）
     private func setupWebRTC() {
+        initLock.lock()
+        defer { initLock.unlock() }
+
+        guard !isWebRTCInitialized else { return }
+
         RTCInitializeSSL()
 
         let videoEncoderFactory = RTCDefaultVideoEncoderFactory()
@@ -264,10 +288,19 @@ final class WebRTCAudioManager: NSObject {
             interleaved: true
         )
 
-        print("✅ [WebRTC] Factory 初始化完成")
+        isWebRTCInitialized = true
+
+        print("✅ [WebRTC] Factory 初始化完成（背景線程）")
         print("   模式: AudioEngine")
         print("   Voice Processing: 啟用（AEC 回音消除）")
         print("   Delegate: 已設置")
+    }
+
+    /// ⭐️ 確保 WebRTC 已初始化（在需要時調用）
+    private func ensureInitialized() {
+        if !isWebRTCInitialized {
+            setupWebRTC()
+        }
     }
 
     /// 更新輸出路由
@@ -321,6 +354,9 @@ final class WebRTCAudioManager: NSObject {
 
     /// 開始錄音
     func startRecording() throws {
+        // ⭐️ 確保 WebRTC 已初始化
+        ensureInitialized()
+
         guard recordingState != .recording else { return }
 
         // 配置音頻會話
@@ -381,6 +417,11 @@ final class WebRTCAudioManager: NSObject {
     /// 停止錄音
     func stopRecording() {
         guard recordingState == .recording else { return }
+
+        // ⭐️ 停止尾音緩衝計時器
+        pttTrailingTimer?.invalidate()
+        pttTrailingTimer = nil
+        isTrailingBuffer = false
 
         stopBufferTimer()
         flushBuffer()
@@ -559,8 +600,16 @@ final class WebRTCAudioManager: NSObject {
     // MARK: - Push-to-Talk
 
     func startSending() {
+        // ⭐️ 取消尾音緩衝計時器（如果正在運行）
+        pttTrailingTimer?.invalidate()
+        pttTrailingTimer = nil
+        isTrailingBuffer = false
+
         isManualSendingPaused = false
         print("🎙️ [WebRTC] 開始發送音頻")
+
+        // ⭐️ 通知 BillingService 開始計費
+        BillingService.shared.startAudioSending()
 
         if !audioBufferCollector.isEmpty {
             print("📦 [WebRTC] 立即發送緩衝: \(audioBufferCollector.count) 個片段")
@@ -569,11 +618,30 @@ final class WebRTCAudioManager: NSObject {
     }
 
     func stopSending() {
+        // ⭐️ 開始尾音緩衝：繼續發送 0.5 秒的音頻
+        isTrailingBuffer = true
+        print("🔊 [WebRTC] 開始 \(pttTrailingDuration) 秒尾音緩衝")
+
+        pttTrailingTimer?.invalidate()
+        pttTrailingTimer = Timer.scheduledTimer(withTimeInterval: pttTrailingDuration, repeats: false) { [weak self] _ in
+            self?.finishStopSending()
+        }
+    }
+
+    /// ⭐️ 尾音緩衝結束後，真正停止發送
+    private func finishStopSending() {
+        isTrailingBuffer = false
+
+        // 發送剩餘音頻和靜音
         flushRemainingAudio()
         sendTrailingSilence()
         onEndUtterance?()
+
+        // ⭐️ 通知 BillingService 停止計費
+        BillingService.shared.stopAudioSending()
+
         isManualSendingPaused = true
-        print("⏸️ [WebRTC] 停止發送音頻")
+        print("⏸️ [WebRTC] 停止發送音頻（尾音緩衝結束）")
     }
 
     private func flushRemainingAudio() {
