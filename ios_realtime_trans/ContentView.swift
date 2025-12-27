@@ -1739,6 +1739,23 @@ struct SettingsView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                    // 🚀 音頻加速選項（僅非 Apple STT 顯示）
+                    if viewModel.shouldShowSpeedUpOption {
+                        Toggle(isOn: $viewModel.isAudioSpeedUpEnabled) {
+                            HStack {
+                                Image(systemName: viewModel.isAudioSpeedUpEnabled ? "hare.fill" : "hare")
+                                    .foregroundStyle(viewModel.isAudioSpeedUpEnabled ? .green : .secondary)
+                                VStack(alignment: .leading) {
+                                    Text("音頻加速")
+                                    Text("2x 加速，節省 50% 成本，+250ms 延遲")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.green)
+                    }
                 }
 
                 // ⭐️ 翻譯模型選擇

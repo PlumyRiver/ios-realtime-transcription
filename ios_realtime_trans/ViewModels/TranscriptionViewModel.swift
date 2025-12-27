@@ -191,6 +191,29 @@ final class TranscriptionViewModel {
         }
     }
 
+    // MARK: - 音頻加速設定
+
+    /// ⭐️ 音頻加速器（250ms 緩衝，2x 加速，節省 50% STT 成本）
+    private let audioTimeStretcher = AudioTimeStretcher()
+
+    /// ⭐️ 是否啟用音頻加速（2x 速度，250ms 額外延遲）
+    /// 注意：Apple STT 免費，不需要加速
+    var isAudioSpeedUpEnabled: Bool = false {
+        didSet {
+            audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
+            if isAudioSpeedUpEnabled {
+                print("🚀 [STT] 音頻加速已啟用（2x，節省 50% 成本，+250ms 延遲）")
+            } else {
+                print("⏸️ [STT] 音頻加速已禁用")
+            }
+        }
+    }
+
+    /// 是否顯示音頻加速選項（Apple STT 免費不需要）
+    var shouldShowSpeedUpOption: Bool {
+        sttProvider != .apple
+    }
+
     /// ⭐️ 麥克風增益（1.0 ~ 4.0）
     /// 放大送入 ElevenLabs 的音頻，讓細微聲音更容易被偵測
     var microphoneGain: Float {
@@ -543,6 +566,13 @@ final class TranscriptionViewModel {
         audioManager.stopRecording()
         audioManager.stopTTS()
 
+        // 🚀 Flush 音頻加速器剩餘的緩衝音頻
+        if isAudioSpeedUpEnabled, let remainingData = audioTimeStretcher.flush() {
+            currentSTTService.sendAudio(data: remainingData)
+            audioTimeStretcher.printStats()  // 打印統計信息
+        }
+        audioTimeStretcher.reset()
+
         // ⭐️ 斷開當前 STT 服務
         currentSTTService.disconnect()
 
@@ -646,11 +676,23 @@ final class TranscriptionViewModel {
     private func setupSubscriptions() {
         // ⭐️ 訂閱音頻數據（來自統一的 AudioManager）
         // 根據當前選擇的 STT 提供商發送到對應服務
+        // 🚀 如果啟用加速，先通過 AudioTimeStretcher 處理
         audioManager.audioDataPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] data in
                 guard let self else { return }
-                self.currentSTTService.sendAudio(data: data)
+
+                // 🚀 音頻加速處理
+                if self.isAudioSpeedUpEnabled && self.sttProvider != .apple {
+                    // 通過加速器處理（250ms 緩衝 → 125ms 輸出）
+                    if let processedData = self.audioTimeStretcher.process(data: data) {
+                        self.currentSTTService.sendAudio(data: processedData)
+                    }
+                    // 如果返回 nil，表示還在緩衝中，等待下一塊
+                } else {
+                    // 不加速，直接發送原始音頻
+                    self.currentSTTService.sendAudio(data: data)
+                }
             }
             .store(in: &cancellables)
 
