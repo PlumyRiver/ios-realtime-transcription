@@ -20,6 +20,9 @@ struct ContentView: View {
     @State private var viewModel = TranscriptionViewModel()
     @State private var showSettings = false
 
+    /// ⭐️ 獲取登入用戶資訊
+    @State private var authService = AuthService.shared
+
     /// ⭐️ 用戶是否正在查看舊訊息（手動往上滾動）
     @State private var isUserScrolledUp = false
 
@@ -42,7 +45,12 @@ struct ContentView: View {
                                     onPlayTTS: { text, langCode in
                                         // ⭐️ 使用統一的 AudioManager 播放（啟用 AEC）
                                         viewModel.enqueueTTS(text: text, languageCode: langCode)
-                                    }
+                                    },
+                                    onStopTTS: {
+                                        // ⭐️ 停止當前播放，繼續播放下一個
+                                        viewModel.skipCurrentTTS()
+                                    },
+                                    currentPlayingText: viewModel.currentPlayingTTSText
                                 )
                                 .id(transcript.id)
                             }
@@ -55,7 +63,11 @@ struct ContentView: View {
                                     targetLang: viewModel.targetLang,
                                     onPlayTTS: { text, langCode in
                                         viewModel.enqueueTTS(text: text, languageCode: langCode)
-                                    }
+                                    },
+                                    onStopTTS: {
+                                        viewModel.skipCurrentTTS()
+                                    },
+                                    currentPlayingText: viewModel.currentPlayingTTSText
                                 )
                                 .id("interim")
                             }
@@ -151,24 +163,18 @@ struct ContentView: View {
                 BottomControlBar(viewModel: viewModel)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("即時翻譯")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    CreditsToolbarView(showSettings: $showSettings, isRecording: viewModel.isRecording)
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
                     } label: {
                         Image(systemName: "gearshape")
                     }
-                }
-
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        viewModel.clearTranscripts()
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .disabled(viewModel.isRecording || viewModel.transcripts.isEmpty)
                 }
             }
             .sheet(isPresented: $showSettings) {
@@ -180,6 +186,8 @@ struct ContentView: View {
                     hasPreFetchedToken = true
                     viewModel.prefetchElevenLabsToken()
                 }
+                // Debug: 顯示當前用戶額度
+                print("💰 [ContentView] currentUser = \(authService.currentUser?.email ?? "nil"), slowCredits = \(authService.currentUser?.slowCredits ?? -1)")
             }
         }
     }
@@ -193,11 +201,24 @@ struct ConversationBubbleView: View {
     let targetLang: Language  // 用戶設定的目標語言
     /// ⭐️ 使用 ViewModel 的統一播放方法（通過 AudioManager，啟用 AEC）
     var onPlayTTS: ((String, String) -> Void)?
+    /// ⭐️ 停止當前 TTS 並播放下一個
+    var onStopTTS: (() -> Void)?
+    /// ⭐️ 當前正在播放的 TTS 文本（用於判斷是否顯示停止按鈕）
+    var currentPlayingText: String?
 
     /// 隱藏狀態
     @State private var isHidden: Bool = false
     /// 複製反饋狀態
     @State private var showCopiedFeedback: Bool = false
+
+    /// ⭐️ 判斷這句話是否正在播放
+    private var isThisPlaying: Bool {
+        guard let translation = transcript.translation,
+              let playingText = currentPlayingText else {
+            return false
+        }
+        return translation == playingText
+    }
 
     /// 判斷是否為來源語言（用戶說的話）
     /// 根據 Chirp3 返回的語言代碼與用戶設定的來源語言比較
@@ -205,6 +226,20 @@ struct ConversationBubbleView: View {
         guard let detectedLang = transcript.language else { return true }
         let detectedBase = detectedLang.split(separator: "-").first.map(String.init) ?? detectedLang
         return detectedBase == sourceLang.rawValue
+    }
+
+    /// ⭐️ 獲取翻譯結果應該使用的 TTS 語言代碼
+    /// 邏輯：翻譯的目標語言與原文語言相反
+    /// - 原文是來源語言 → 翻譯是目標語言 → TTS 用 targetLang
+    /// - 原文是目標語言 → 翻譯是來源語言 → TTS 用 sourceLang
+    private var ttsLanguageCode: String {
+        if isSourceLanguage {
+            // 原文是來源語言（如中文）→ 翻譯是目標語言（如日文）
+            return targetLang.azureLocale
+        } else {
+            // 原文是目標語言（如日文）→ 翻譯是來源語言（如中文）
+            return sourceLang.azureLocale
+        }
     }
 
     /// 氣泡背景顏色
@@ -329,14 +364,20 @@ struct ConversationBubbleView: View {
                     .foregroundStyle(showCopiedFeedback ? .green : .gray)
             }
 
-            // 播放按鈕
+            // ⭐️ 播放/停止按鈕（根據播放狀態切換）
             Button {
-                // ⭐️ 直接使用 Language enum 的 azureLocale 屬性
-                onPlayTTS?(transcript.translation!, targetLang.azureLocale)
+                if isThisPlaying {
+                    // 正在播放這句 → 停止並播放下一個
+                    onStopTTS?()
+                } else {
+                    // 沒在播放 → 開始播放
+                    // ⭐️ 使用 ttsLanguageCode 根據原文語言動態決定 TTS 語言
+                    onPlayTTS?(transcript.translation!, ttsLanguageCode)
+                }
             } label: {
-                Image(systemName: "play.circle.fill")
+                Image(systemName: isThisPlaying ? "stop.circle.fill" : "play.circle.fill")
                     .font(.title2)
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(isThisPlaying ? .red : .blue)
             }
 
             // 隱藏/顯示按鈕
@@ -444,7 +485,7 @@ struct TypingIndicator: View {
     }
 }
 
-// MARK: - Bottom Control Bar (底部控制區 - 仿開講AI設計)
+// MARK: - Bottom Control Bar (底部控制區 - 兩排架構)
 
 struct BottomControlBar: View {
     @Bindable var viewModel: TranscriptionViewModel
@@ -457,17 +498,325 @@ struct BottomControlBar: View {
                 // === 第一行：語言選擇器 + 模式切換 ===
                 LanguageSelectorRow(viewModel: viewModel)
 
-                // === 第二行：喇叭 + 麥克風 並排居中（僅錄音時顯示）===
+                // === 第二行：根據通話狀態顯示不同內容 ===
                 if viewModel.isRecording {
-                    DualIconControlRow(viewModel: viewModel)
+                    // 通話中：TTS + 錄音 + 結束通話
+                    InCallControlRow(viewModel: viewModel)
+                } else {
+                    // 未通話：滑動開始通話
+                    CenteredCallButton(viewModel: viewModel)
                 }
-
-                // === 第三行：通話按鈕置中 ===
-                CenteredCallButton(viewModel: viewModel)
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .padding(.top, 12)
+            // ⭐️ 底部不加 padding，讓按鈕標籤貼近螢幕最下方
             .background(Color(.systemBackground))
+        }
+    }
+}
+
+// MARK: - 通話中控制行（TTS + 錄音 居中，結束通話在右側）
+
+struct InCallControlRow: View {
+    @Bindable var viewModel: TranscriptionViewModel
+
+    // 結束通話滑動狀態
+    @State private var isEndCallPressed = false
+    @State private var dragOffset: CGFloat = 0
+    @State private var isDragging = false
+
+    // Haptic
+    private let hapticGenerator = UIImpactFeedbackGenerator(style: .medium)
+
+    // 按鈕尺寸（與原本 DualIconControlRow 一致）
+    private let buttonSize: CGFloat = 70
+    private let iconSize: CGFloat = 28
+    private let endCallButtonSize: CGFloat = 60  // ⭐️ 與開始通話滑塊一樣大
+
+    // 滑軌尺寸
+    private let sliderHeight: CGFloat = 70
+    private let thumbSize: CGFloat = 60
+    private let threshold: CGFloat = 0.6
+
+    var body: some View {
+        GeometryReader { geometry in
+            let sliderWidth = geometry.size.width
+
+            ZStack {
+                // 正常狀態：TTS + 錄音 真正居中，結束通話用 overlay 放右側
+                if !isEndCallPressed {
+                    // TTS + 錄音 並排置中（使用 ZStack 確保真正居中）
+                    HStack(spacing: 40) {
+                        ttsButton
+                        microphoneButton
+                    }
+                    .frame(maxWidth: .infinity)  // 填滿寬度以居中
+                    .overlay(alignment: .trailing) {
+                        // 結束通話按鈕（右側 overlay，不影響居中）
+                        endCallButton
+                            .padding(.trailing, 4)
+                    }
+                    .transition(.opacity)
+                } else {
+                    // 滑動軌道（填滿整個寬度）
+                    endCallSlider(width: sliderWidth)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: isEndCallPressed)
+        }
+        .frame(height: 100)  // ⭐️ 給標籤留空間
+        .onAppear {
+            hapticGenerator.prepare()
+        }
+    }
+
+    // MARK: - TTS 按鈕
+
+    private var ttsButtonColor: Color {
+        switch viewModel.ttsPlaybackMode {
+        case .all: return .green
+        case .sourceOnly: return .blue
+        case .targetOnly: return .orange
+        case .muted: return Color(.systemGray4)
+        }
+    }
+
+    private var isTTSActive: Bool {
+        viewModel.ttsPlaybackMode != .muted
+    }
+
+    private var ttsButton: some View {
+        Button {
+            viewModel.ttsPlaybackMode = viewModel.ttsPlaybackMode.next()
+            hapticGenerator.impactOccurred()
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(isTTSActive ? ttsButtonColor.opacity(0.15) : Color(.systemGray6))
+                    .frame(width: buttonSize, height: buttonSize)
+
+                Circle()
+                    .fill(ttsButtonColor)
+                    .frame(width: buttonSize - 10, height: buttonSize - 10)
+                    .shadow(color: isTTSActive ? ttsButtonColor.opacity(0.3) : .clear, radius: 8)
+
+                Image(systemName: viewModel.ttsPlaybackMode.iconName)
+                    .font(.system(size: iconSize, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Text(viewModel.ttsPlaybackMode.displayText(
+                sourceLang: viewModel.sourceLang,
+                targetLang: viewModel.targetLang
+            ))
+            .font(.caption2)
+            .fontWeight(.medium)
+            .foregroundStyle(isTTSActive ? ttsButtonColor : .secondary)
+            .offset(y: 28)
+        }
+    }
+
+    // MARK: - 錄音按鈕
+
+    @State private var pulseAnimation = false
+    @State private var isPressed = false
+
+    private var isVADMode: Bool {
+        viewModel.inputMode == .vad
+    }
+
+    private var microphoneButton: some View {
+        ZStack {
+            if isVADMode {
+                // VAD 模式：脈動動畫
+                ZStack {
+                    Circle()
+                        .fill(Color.green.opacity(0.15))
+                        .frame(width: buttonSize, height: buttonSize)
+                        .scaleEffect(pulseAnimation ? 1.2 : 1.0)
+                        .opacity(pulseAnimation ? 0.0 : 0.5)
+                        .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false), value: pulseAnimation)
+
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: buttonSize - 10, height: buttonSize - 10)
+                        .shadow(color: Color.green.opacity(0.4), radius: 8)
+
+                    Image(systemName: "waveform")
+                        .font(.system(size: iconSize, weight: .medium))
+                        .foregroundStyle(.white)
+                        .scaleEffect(pulseAnimation ? 1.1 : 0.95)
+                        .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: pulseAnimation)
+                }
+                .onAppear { pulseAnimation = true }
+            } else {
+                // PTT 模式：按住說話
+                ZStack {
+                    Circle()
+                        .fill(isPressed ? Color.red.opacity(0.2) : Color(.systemGray6))
+                        .frame(width: buttonSize, height: buttonSize)
+                        .scaleEffect(isPressed ? 1.15 : 1.0)
+
+                    Circle()
+                        .fill(isPressed ? Color.red : Color.orange)
+                        .frame(width: buttonSize - 10, height: buttonSize - 10)
+                        .shadow(color: isPressed ? Color.red.opacity(0.5) : Color.orange.opacity(0.3), radius: 8)
+
+                    Image(systemName: isPressed ? "mic.fill" : "mic")
+                        .font(.system(size: iconSize, weight: .medium))
+                        .foregroundStyle(.white)
+                }
+                .scaleEffect(isPressed ? 1.05 : 1.0)
+                .animation(.spring(response: 0.3), value: isPressed)
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            if !isPressed {
+                                isPressed = true
+                                viewModel.startTalking()
+                                hapticGenerator.impactOccurred()
+                            }
+                        }
+                        .onEnded { _ in
+                            isPressed = false
+                            viewModel.stopTalking()
+                        }
+                )
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Text(isVADMode ? "監聽中" : "按住說話")
+                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundStyle(isVADMode ? .green : (isPressed ? .red : .secondary))
+                .offset(y: 28)
+        }
+    }
+
+    // MARK: - 結束通話按鈕（右側）
+
+    private var endCallButton: some View {
+        ZStack {
+            Circle()
+                .fill(Color.red.opacity(0.15))
+                .frame(width: endCallButtonSize, height: endCallButtonSize)
+
+            Circle()
+                .fill(Color.red)
+                .frame(width: endCallButtonSize - 8, height: endCallButtonSize - 8)
+                .shadow(color: Color.red.opacity(0.3), radius: 6)
+
+            Image(systemName: "phone.down.fill")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(.white)
+        }
+        .overlay(alignment: .bottom) {
+            Text("結束")
+                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundStyle(.red)
+                .offset(y: 28)
+        }
+        // ⭐️ 一碰到就觸發滑動條（不用等點擊完成）
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    if !isEndCallPressed {
+                        isEndCallPressed = true
+                        hapticGenerator.impactOccurred()
+                    }
+                }
+        )
+    }
+
+    // MARK: - 結束通話滑動軌道（填滿整個寬度）
+
+    private func endCallSlider(width: CGFloat) -> some View {
+        let maxOffset = width - thumbSize - 20
+
+        return ZStack {
+            // 背景軌道
+            RoundedRectangle(cornerRadius: sliderHeight / 2)
+                .fill(Color.red.opacity(0.15))
+                .frame(width: width, height: sliderHeight)
+                .overlay(
+                    RoundedRectangle(cornerRadius: sliderHeight / 2)
+                        .stroke(Color.red.opacity(0.3), lineWidth: 1)
+                )
+
+            // 左邊圖標（結束目標）
+            HStack {
+                Image(systemName: "phone.down.fill")
+                    .font(.title2)
+                    .foregroundStyle(.red.opacity(0.8))
+                    .padding(.leading, 20)
+                Spacer()
+            }
+
+            // 提示文字
+            Text("← 滑動結束通話")
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundStyle(.secondary)
+
+            // 可滑動按鈕（從右側開始）
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Color.pink, Color.red],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .frame(width: thumbSize, height: thumbSize)
+                .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
+                .overlay(
+                    Image(systemName: "xmark")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                        .foregroundStyle(.white)
+                )
+                .scaleEffect(isDragging ? 1.1 : 1.0)
+                .animation(.spring(response: 0.3), value: isDragging)
+                .offset(x: (width - thumbSize) / 2 - 10 + dragOffset)
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            isDragging = true
+                            // 只能往左滑
+                            dragOffset = min(0, max(-maxOffset, value.translation.width))
+                        }
+                        .onEnded { _ in
+                            isDragging = false
+                            let progress = abs(dragOffset) / maxOffset
+
+                            if progress > threshold {
+                                // 觸發結束通話
+                                hapticGenerator.impactOccurred()
+
+                                // ⭐️ 同步更新 UI（立即切換畫面）
+                                viewModel.endCall()
+
+                                // 重置狀態
+                                dragOffset = 0
+                                isEndCallPressed = false
+                            } else {
+                                // 未達閾值，彈回原位
+                                withAnimation(.spring(response: 0.3)) {
+                                    dragOffset = 0
+                                    isEndCallPressed = false
+                                }
+                            }
+                        }
+                )
+        }
+        .onTapGesture {
+            // 點擊空白處取消
+            withAnimation {
+                isEndCallPressed = false
+            }
         }
     }
 }
@@ -852,7 +1201,7 @@ struct DualIconControlRow: View {
     }
 }
 
-// MARK: - 通話按鈕置中
+// MARK: - 通話按鈕（填滿整個寬度）
 
 struct CenteredCallButton: View {
     @Bindable var viewModel: TranscriptionViewModel
@@ -862,135 +1211,106 @@ struct CenteredCallButton: View {
     @State private var isDragging = false
 
     // 尺寸常數
-    private let trackWidth: CGFloat = 280
+    private let containerHeight: CGFloat = 100  // ⭐️ 與通話中控制欄高度一致
     private let trackHeight: CGFloat = 70
     private let thumbSize: CGFloat = 60
     private let threshold: CGFloat = 0.6  // 滑動超過 60% 觸發
 
-    // 計算滑動範圍
-    private var maxOffset: CGFloat {
-        trackWidth - thumbSize - 10
-    }
-
-    // 背景顏色
-    private var trackColor: Color {
-        viewModel.isRecording ? Color.red.opacity(0.15) : Color.green.opacity(0.15)
-    }
-
     // 按鈕顏色
     private var thumbGradient: LinearGradient {
-        if viewModel.isRecording {
-            return LinearGradient(
-                colors: [Color.pink, Color.red],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        } else {
-            return LinearGradient(
-                colors: [Color.green, Color.mint],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        }
+        LinearGradient(
+            colors: [Color.green, Color.mint],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
     }
 
     var body: some View {
-        HStack {
-            Spacer()
+        GeometryReader { geometry in
+            let trackWidth = geometry.size.width
+            let maxOffset = trackWidth - thumbSize - 20
 
             ZStack {
                 // 背景軌道
                 RoundedRectangle(cornerRadius: trackHeight / 2)
-                    .fill(trackColor)
-                    .frame(width: trackWidth, height: trackHeight)
+                    .fill(Color.green.opacity(0.15))
+                    .frame(height: trackHeight)
                     .overlay(
                         RoundedRectangle(cornerRadius: trackHeight / 2)
-                            .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+                            .stroke(Color.green.opacity(0.3), lineWidth: 1)
                     )
 
-                // 左邊圖標（結束通話）
+                // 左邊圖標（麥克風）
                 HStack {
-                    Image(systemName: "phone.down.fill")
-                        .font(.title3)
-                        .foregroundStyle(.red.opacity(viewModel.isRecording ? 0.8 : 0.3))
-                        .padding(.leading, 18)
+                    Image(systemName: "mic.fill")
+                        .font(.title2)
+                        .foregroundStyle(.green.opacity(0.5))
+                        .padding(.leading, 20)
                     Spacer()
                 }
-                .frame(width: trackWidth)
 
                 // 右邊圖標（開始通話）
                 HStack {
                     Spacer()
                     Image(systemName: "phone.fill")
-                        .font(.title3)
-                        .foregroundStyle(.green.opacity(viewModel.isRecording ? 0.3 : 0.8))
-                        .padding(.trailing, 18)
+                        .font(.title2)
+                        .foregroundStyle(.green.opacity(0.8))
+                        .padding(.trailing, 20)
                 }
-                .frame(width: trackWidth)
 
                 // 中間提示文字
-                Text(viewModel.isRecording ? "← 滑動結束" : "滑動開始 →")
-                    .font(.caption)
+                Text("滑動開始通話 →")
+                    .font(.subheadline)
                     .fontWeight(.medium)
                     .foregroundStyle(.secondary)
 
-                // 可滑動的按鈕
+                // 可滑動的按鈕（從左側開始）
                 Circle()
                     .fill(thumbGradient)
                     .frame(width: thumbSize, height: thumbSize)
-                    .shadow(color: viewModel.isRecording ? .red.opacity(0.4) : .green.opacity(0.4), radius: 8, x: 0, y: 4)
+                    .shadow(color: .green.opacity(0.4), radius: 8, y: 4)
                     .overlay(
-                        Image(systemName: viewModel.isRecording ? "waveform" : "mic.fill")
+                        Image(systemName: "mic.fill")
                             .font(.title2)
                             .foregroundStyle(.white)
                     )
                     .scaleEffect(isDragging ? 1.1 : 1.0)
                     .animation(.spring(response: 0.3), value: isDragging)
-                    .offset(x: thumbPosition + dragOffset)
+                    .offset(x: -(trackWidth - thumbSize) / 2 + 10 + dragOffset)
                     .gesture(
                         DragGesture()
                             .onChanged { value in
                                 isDragging = true
-                                if viewModel.isRecording {
-                                    // 通話中：只能往左滑
-                                    dragOffset = min(0, max(-maxOffset, value.translation.width))
-                                } else {
-                                    // 未通話：只能往右滑
-                                    dragOffset = max(0, min(maxOffset, value.translation.width))
-                                }
+                                // 只能往右滑
+                                dragOffset = max(0, min(maxOffset, value.translation.width))
                             }
                             .onEnded { _ in
                                 isDragging = false
-                                let progress = abs(dragOffset) / maxOffset
+                                let progress = dragOffset / maxOffset
 
                                 if progress > threshold {
                                     // 觸覺反饋
                                     let generator = UIImpactFeedbackGenerator(style: .medium)
                                     generator.impactOccurred()
 
-                                    // 執行操作
-                                    Task {
-                                        await viewModel.toggleRecording()
-                                    }
-                                }
+                                    // ⭐️ 同步更新 UI（立即切換畫面）
+                                    viewModel.beginCall()
 
-                                // 彈回原位
-                                withAnimation(.spring(response: 0.3)) {
-                                    dragOffset = 0
+                                    // ⭐️ 背景執行連接（不阻塞 UI）
+                                    Task.detached {
+                                        await viewModel.performStartRecording()
+                                    }
+                                } else {
+                                    // 未達閾值，彈回原位
+                                    withAnimation(.spring(response: 0.3)) {
+                                        dragOffset = 0
+                                    }
                                 }
                             }
                     )
             }
-            .frame(width: trackWidth, height: trackHeight)
-
-            Spacer()
         }
-    }
-
-    // 計算按鈕初始位置
-    private var thumbPosition: CGFloat {
-        let halfTrack = (trackWidth - thumbSize) / 2 - 5
-        return viewModel.isRecording ? halfTrack : -halfTrack
+        .frame(height: containerHeight)  // ⭐️ 與通話中控制欄高度一致
     }
 }
 
@@ -1184,10 +1504,91 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var viewModel: TranscriptionViewModel
     @State private var volumeValue: Float = 0.5
+    @State private var showPurchaseSheet = false
+    @State private var authService = AuthService.shared
 
     var body: some View {
         NavigationStack {
             Form {
+                // ⭐️ TTS 服務商選擇
+                Section {
+                    Picker(selection: $viewModel.ttsProvider) {
+                        ForEach(TTSProvider.allCases) { provider in
+                            HStack {
+                                Image(systemName: provider.iconName)
+                                VStack(alignment: .leading) {
+                                    Text(provider.displayName)
+                                    Text(provider.description)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tag(provider)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: viewModel.ttsProvider.iconName)
+                                .foregroundStyle(viewModel.ttsProvider.isFree ? .green : .blue)
+                            Text("語音合成")
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    // 服務商資訊
+                    HStack(spacing: 16) {
+                        Label {
+                            Text(viewModel.ttsProvider.latencyDescription)
+                        } icon: {
+                            Image(systemName: "timer")
+                                .foregroundStyle(.orange)
+                        }
+
+                        if viewModel.ttsProvider.isFree {
+                            Label {
+                                Text("免費")
+                            } icon: {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundStyle(.green)
+                            }
+                        }
+
+                        if !viewModel.ttsProvider.requiresNetwork {
+                            Label {
+                                Text("離線")
+                            } icon: {
+                                Image(systemName: "wifi.slash")
+                                    .foregroundStyle(.purple)
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } header: {
+                    Text("TTS 服務商")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if viewModel.ttsProvider == .apple {
+                            Text("Apple 內建語音免費且離線可用，但品質不如 Azure 神經語音。")
+
+                            // ⭐️ 檢查當前語言是否支援
+                            let sourceLangSupported = AppleTTSService.isLanguageSupported(viewModel.sourceLang.azureLocale)
+                            let targetLangSupported = AppleTTSService.isLanguageSupported(viewModel.targetLang.azureLocale)
+
+                            if !sourceLangSupported || !targetLangSupported {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(.orange)
+                                    Text("部分語言不支援，將自動使用 Azure")
+                                        .foregroundStyle(.orange)
+                                }
+                                .padding(.top, 4)
+                            }
+                        } else {
+                            Text("Azure 神經語音品質高，但需要網路且會消耗額度。")
+                        }
+                    }
+                }
+
                 // ⭐️ 音量設定區塊
                 Section("TTS 音量") {
                     VStack(alignment: .leading, spacing: 12) {
@@ -1317,6 +1718,91 @@ struct SettingsView: View {
                                 Image(systemName: "globe")
                                     .foregroundStyle(.purple)
                                 Text("支援 92 語言，需外部翻譯")
+                            }
+                        case .apple:
+                            HStack {
+                                Image(systemName: "apple.logo")
+                                    .foregroundStyle(.gray)
+                                Text("Apple 內建：免費離線，雙語並行識別")
+                            }
+                            HStack {
+                                Image(systemName: "bolt.fill")
+                                    .foregroundStyle(.green)
+                                Text("延遲約 100ms，設備端處理")
+                            }
+                            HStack {
+                                Image(systemName: "chart.bar.fill")
+                                    .foregroundStyle(.orange)
+                                Text("根據信心度自動選擇最佳結果")
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                // ⭐️ 翻譯模型選擇
+                Section("翻譯模型") {
+                    Picker(selection: $viewModel.translationProvider) {
+                        ForEach(TranslationProvider.allCases) { provider in
+                            HStack {
+                                Image(systemName: provider.iconName)
+                                VStack(alignment: .leading) {
+                                    Text(provider.displayName)
+                                    HStack(spacing: 8) {
+                                        Text(provider.latencyDescription)
+                                        Text("•")
+                                        Text(provider.priceLevel)
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tag(provider)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: viewModel.translationProvider.iconName)
+                                .foregroundStyle(translationProviderColor(viewModel.translationProvider))
+                            Text("翻譯引擎")
+                        }
+                    }
+
+                    // 模型說明
+                    VStack(alignment: .leading, spacing: 4) {
+                        switch viewModel.translationProvider {
+                        case .gemini:
+                            HStack {
+                                Image(systemName: "sparkles")
+                                    .foregroundStyle(.purple)
+                                Text("Gemini 3 Flash：平衡型，預設推薦")
+                            }
+                            HStack {
+                                Image(systemName: "dollarsign.circle")
+                                    .foregroundStyle(.orange)
+                                Text("$0.50/M 輸入 • $3.00/M 輸出")
+                            }
+                        case .grok:
+                            HStack {
+                                Image(systemName: "star.fill")
+                                    .foregroundStyle(.yellow)
+                                Text("Grok 4.1 Fast：高品質翻譯")
+                            }
+                            HStack {
+                                Image(systemName: "dollarsign.circle")
+                                    .foregroundStyle(.green)
+                                Text("$0.20/M 輸入 • $0.50/M 輸出")
+                            }
+                        case .cerebras:
+                            HStack {
+                                Image(systemName: "bolt.fill")
+                                    .foregroundStyle(.blue)
+                                Text("Cerebras：極速回應 ~380ms")
+                            }
+                            HStack {
+                                Image(systemName: "dollarsign.circle")
+                                    .foregroundStyle(.green)
+                                Text("$0.10/M 輸入 • $0.10/M 輸出")
                             }
                         }
                     }
@@ -1479,6 +1965,75 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                // ⭐️ 帳號資訊區塊
+                Section("帳號") {
+                    if let user = AuthService.shared.currentUser {
+                        // 用戶資訊
+                        HStack(spacing: 12) {
+                            // 頭像
+                            if let photoURL = user.photoURL,
+                               let url = URL(string: photoURL) {
+                                AsyncImage(url: url) { image in
+                                    image
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                } placeholder: {
+                                    Image(systemName: "person.circle.fill")
+                                        .font(.system(size: 40))
+                                        .foregroundStyle(.gray)
+                                }
+                                .frame(width: 40, height: 40)
+                                .clipShape(Circle())
+                            } else {
+                                Image(systemName: "person.circle.fill")
+                                    .font(.system(size: 40))
+                                    .foregroundStyle(.gray)
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(user.displayName ?? "用戶")
+                                    .font(.headline)
+                                Text(user.email)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+
+                        // 額度顯示（含購買按鈕）
+                        HStack {
+                            Text("超值額度")
+                            Spacer()
+                            Text("\(formatCredits(user.slowCredits))")
+                                .foregroundStyle(.green)
+                                .fontWeight(.semibold)
+
+                            // 購買按鈕
+                            Button {
+                                showPurchaseSheet = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "plus.circle.fill")
+                                    Image(systemName: "wallet.bifold.fill")
+                                }
+                                .font(.title3)
+                                .foregroundStyle(.blue)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // 登出按鈕
+                    Button(role: .destructive) {
+                        try? AuthService.shared.signOut()
+                    } label: {
+                        HStack {
+                            Image(systemName: "rectangle.portrait.and.arrow.right")
+                            Text("登出")
+                        }
+                    }
+                }
             }
             .navigationTitle("設定")
             .navigationBarTitleDisplayMode(.inline)
@@ -1488,6 +2043,9 @@ struct SettingsView: View {
                         dismiss()
                     }
                 }
+            }
+            .sheet(isPresented: $showPurchaseSheet) {
+                PurchaseView()
             }
             .onAppear {
                 volumeValue = viewModel.ttsVolume
@@ -1509,6 +2067,13 @@ struct SettingsView: View {
         } else {
             return .red
         }
+    }
+
+    /// 格式化額度數字（添加千位分隔符）
+    private func formatCredits(_ credits: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: credits)) ?? "\(credits)"
     }
 
     /// VAD 靈敏度標籤
@@ -1562,6 +2127,20 @@ struct SettingsView: View {
             return .green
         case .elevenLabs:
             return .blue
+        case .apple:
+            return .gray
+        }
+    }
+
+    /// 根據翻譯模型返回對應顏色
+    private func translationProviderColor(_ provider: TranslationProvider) -> Color {
+        switch provider {
+        case .gemini:
+            return .purple
+        case .grok:
+            return .yellow
+        case .cerebras:
+            return .blue
         }
     }
 
@@ -1576,6 +2155,320 @@ struct SettingsView: View {
         } else {
             return .red
         }
+    }
+}
+
+// MARK: - Credits Toolbar View
+
+/// 額度顯示工具欄視圖（含消耗明細彈窗）
+struct CreditsToolbarView: View {
+    @Binding var showSettings: Bool
+    var isRecording: Bool = false  // ⭐️ 通話中隱藏購買按鈕
+    @State private var showUsageDetail = false
+    @State private var showPurchaseSheet = false
+
+    private var authService: AuthService { AuthService.shared }
+    private var billingService: BillingService { BillingService.shared }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // 剩餘額度
+            HStack(spacing: 4) {
+                Image(systemName: "dollarsign.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.system(size: 14))
+                Text("\(authService.currentUser?.slowCredits ?? 0)")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+
+            // 購買額度按鈕（通話中隱藏）
+            if !isRecording {
+                Button {
+                    showPurchaseSheet = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "bag.circle.fill")
+                            .font(.system(size: 14))
+                        Text("購買額度")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        LinearGradient(
+                            colors: [.orange, .red.opacity(0.8)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .sheet(isPresented: $showPurchaseSheet) {
+                    PurchaseView()
+                }
+            }
+
+            // ⭐️ 本次消耗額度（可點擊查看明細）
+            if billingService.sessionTotalCreditsUsed > 0 {
+                Button {
+                    showUsageDetail = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "flame.fill")
+                            .foregroundStyle(.orange)
+                            .font(.system(size: 12))
+                        Text("-\(billingService.sessionTotalCreditsUsed)")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.orange)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule()
+                            .fill(Color.orange.opacity(0.15))
+                    )
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showUsageDetail, arrowEdge: .top) {
+                    UsageDetailPopover(billingService: billingService)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Usage Detail Popover
+
+/// 額度消耗明細彈窗
+struct UsageDetailPopover: View {
+    let billingService: BillingService
+
+    private var totalCredits: Int { billingService.sessionTotalCreditsUsed }
+    private var sttCredits: Int { billingService.sessionSTTCreditsUsed }
+    private var llmCredits: Int { billingService.sessionLLMCreditsUsed }
+    private var ttsCredits: Int { billingService.sessionTTSCreditsUsed }
+
+    /// 計算百分比
+    private func percentage(of value: Int) -> Double {
+        guard totalCredits > 0 else { return 0 }
+        return Double(value) / Double(totalCredits) * 100
+    }
+
+    /// 格式化秒數為 mm:ss
+    private func formatDuration(_ seconds: Double) -> String {
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        if mins > 0 {
+            return String(format: "%d:%02d", mins, secs)
+        } else {
+            return String(format: "%.1f 秒", seconds)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // 標題
+            HStack {
+                Image(systemName: "flame.fill")
+                    .foregroundStyle(.orange)
+                Text("本次消耗明細")
+                    .font(.headline)
+                Spacer()
+                Text("-\(totalCredits)")
+                    .font(.title2.bold())
+                    .foregroundStyle(.orange)
+            }
+
+            Divider()
+
+            // 消耗組成圖表
+            VStack(spacing: 16) {
+                // STT 語音識別
+                UsageItemView(
+                    icon: "waveform",
+                    iconColor: .blue,
+                    title: "語音識別 (STT)",
+                    credits: sttCredits,
+                    percentage: percentage(of: sttCredits),
+                    details: [
+                        ("時長", formatDuration(billingService.sessionSTTSeconds))
+                    ]
+                )
+
+                // LLM 翻譯
+                UsageItemView(
+                    icon: "brain",
+                    iconColor: .purple,
+                    title: "AI 翻譯 (LLM)",
+                    credits: llmCredits,
+                    percentage: percentage(of: llmCredits),
+                    details: [
+                        ("調用", "\(billingService.sessionLLMCallCount) 次"),
+                        ("Input", "\(billingService.sessionLLMInputTokens)"),
+                        ("Output", "\(billingService.sessionLLMOutputTokens)")
+                    ]
+                )
+
+                // TTS 語音合成
+                UsageItemView(
+                    icon: "speaker.wave.2.fill",
+                    iconColor: .green,
+                    title: "語音合成 (TTS)",
+                    credits: ttsCredits,
+                    percentage: percentage(of: ttsCredits),
+                    details: [
+                        ("字數", "\(billingService.sessionTTSChars) 字")
+                    ]
+                )
+            }
+
+            Divider()
+
+            // 底部說明
+            HStack {
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+                Text("從 App 啟動起累計")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(20)
+        .frame(width: 320)
+    }
+}
+
+// MARK: - Usage Item View (Enhanced)
+
+/// 單個消耗項目視圖（增強版，支援多行詳細資訊）
+struct UsageItemView: View {
+    let icon: String
+    let iconColor: Color
+    let title: String
+    let credits: Int
+    let percentage: Double
+    let details: [(String, String)]  // (標籤, 值)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // 標題行
+            HStack {
+                Image(systemName: icon)
+                    .foregroundStyle(iconColor)
+                    .frame(width: 20)
+
+                Text(title)
+                    .font(.subheadline.bold())
+
+                Spacer()
+
+                Text("-\(credits)")
+                    .font(.subheadline.bold())
+                    .foregroundStyle(credits > 0 ? iconColor : .secondary)
+            }
+
+            // 進度條
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    // 背景
+                    Capsule()
+                        .fill(Color.gray.opacity(0.2))
+                        .frame(height: 6)
+
+                    // 進度
+                    Capsule()
+                        .fill(iconColor.opacity(0.8))
+                        .frame(width: geometry.size.width * CGFloat(percentage / 100), height: 6)
+                }
+            }
+            .frame(height: 6)
+
+            // 詳細資訊（多欄顯示）
+            HStack(spacing: 16) {
+                ForEach(details, id: \.0) { detail in
+                    HStack(spacing: 4) {
+                        Text(detail.0)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(detail.1)
+                            .font(.caption.bold())
+                            .foregroundStyle(.primary)
+                    }
+                }
+
+                Spacer()
+
+                Text(String(format: "%.1f%%", percentage))
+                    .font(.caption.bold())
+                    .foregroundStyle(iconColor)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+// MARK: - Usage Item Row
+
+/// 單個消耗項目行
+struct UsageItemRow: View {
+    let icon: String
+    let iconColor: Color
+    let title: String
+    let credits: Int
+    let percentage: Double
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // 標題行
+            HStack {
+                Image(systemName: icon)
+                    .foregroundStyle(iconColor)
+                    .frame(width: 20)
+
+                Text(title)
+                    .font(.subheadline)
+
+                Spacer()
+
+                Text("-\(credits)")
+                    .font(.subheadline.bold())
+                    .foregroundStyle(credits > 0 ? .primary : .secondary)
+            }
+
+            // 進度條
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    // 背景
+                    Capsule()
+                        .fill(Color.gray.opacity(0.2))
+                        .frame(height: 8)
+
+                    // 進度
+                    Capsule()
+                        .fill(iconColor)
+                        .frame(width: geometry.size.width * CGFloat(percentage / 100), height: 8)
+                }
+            }
+            .frame(height: 8)
+
+            // 詳細資訊
+            HStack {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Text(String(format: "%.1f%%", percentage))
+                    .font(.caption.bold())
+                    .foregroundStyle(iconColor)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }
 

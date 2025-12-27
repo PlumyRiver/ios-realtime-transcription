@@ -87,6 +87,9 @@ final class TranscriptionViewModel {
     /// TTS 播放模式（四段切換）
     var ttsPlaybackMode: TTSPlaybackMode = .all
 
+    /// ⭐️ TTS 服務商（Azure 或 Apple）
+    var ttsProvider: TTSProvider = .azure
+
     /// 自動播放翻譯（TTS）- 計算屬性，向後兼容
     var autoPlayTTS: Bool {
         get { ttsPlaybackMode != .muted }
@@ -101,12 +104,22 @@ final class TranscriptionViewModel {
 
     /// TTS 播放中
     var isPlayingTTS: Bool {
-        audioManager.isPlayingTTS
+        switch ttsProvider {
+        case .azure:
+            return audioManager.isPlayingTTS
+        case .apple:
+            return appleTTSService.isPlaying
+        }
     }
 
     /// ⭐️ 當前正在播放的 TTS 文本
     var currentPlayingTTSText: String? {
-        audioManager.currentTTSText
+        switch ttsProvider {
+        case .azure:
+            return audioManager.currentTTSText
+        case .apple:
+            return appleTTSService.currentText
+        }
     }
 
     /// ⭐️ Push-to-Talk：是否正在按住說話
@@ -160,8 +173,9 @@ final class TranscriptionViewModel {
         didSet {
             if oldValue != translationProvider {
                 print("🔄 [翻譯] 切換模型: \(oldValue.displayName) → \(translationProvider.displayName)")
-                // 更新 ElevenLabs 服務的翻譯模型
+                // 更新各 STT 服務的翻譯模型
                 elevenLabsService.translationProvider = translationProvider
+                appleSTTService.translationProvider = translationProvider
             }
         }
     }
@@ -201,15 +215,17 @@ final class TranscriptionViewModel {
 
     // MARK: - Private Properties
 
-    /// ⭐️ 雙 STT 服務
+    /// ⭐️ 三種 STT 服務
     private let chirp3Service = WebSocketService()
     private let elevenLabsService = ElevenLabsSTTService()
+    private let appleSTTService = AppleSTTService()
 
     /// 當前使用的 STT 服務
     private var currentSTTService: WebSocketServiceProtocol {
         switch sttProvider {
         case .chirp3: return chirp3Service
         case .elevenLabs: return elevenLabsService
+        case .apple: return appleSTTService
         }
     }
 
@@ -219,8 +235,11 @@ final class TranscriptionViewModel {
     /// ⭐️ Session 服務（對話記錄儲存到 Firestore）
     private let sessionService = SessionService.shared
 
-    /// TTS 服務
+    /// TTS 服務（Azure）
     private let ttsService = AzureTTSService()
+
+    /// ⭐️ TTS 服務（Apple 內建）
+    private let appleTTSService = AppleTTSService()
 
     /// TTS 播放隊列
     private var ttsQueue: [(text: String, lang: String)] = []
@@ -698,8 +717,46 @@ final class TranscriptionViewModel {
             }
             .store(in: &cancellables)
 
+        // ⭐️ 訂閱 Apple STT 服務的結果
+        appleSTTService.transcriptPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transcript in
+                guard self?.sttProvider == .apple else { return }
+                self?.handleTranscript(transcript)
+            }
+            .store(in: &cancellables)
+
+        appleSTTService.translationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] (sourceText, translatedText) in
+                guard self?.sttProvider == .apple else { return }
+                self?.handleTranslation(sourceText: sourceText, translatedText: translatedText)
+            }
+            .store(in: &cancellables)
+
+        appleSTTService.segmentedTranslationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] (sourceText, segments) in
+                guard self?.sttProvider == .apple else { return }
+                self?.handleSegmentedTranslation(sourceText: sourceText, segments: segments)
+            }
+            .store(in: &cancellables)
+
+        appleSTTService.errorPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] errorMessage in
+                guard self?.sttProvider == .apple else { return }
+                self?.status = .error(errorMessage)
+            }
+            .store(in: &cancellables)
+
         // ⭐️ TTS 播放完成回調（播放隊列中的下一個）
         audioManager.onTTSPlaybackFinished = { [weak self] in
+            self?.processNextTTS()
+        }
+
+        // ⭐️ Apple TTS 播放完成回調
+        appleTTSService.onPlaybackFinished = { [weak self] in
             self?.processNextTTS()
         }
 
@@ -722,9 +779,16 @@ final class TranscriptionViewModel {
             .store(in: &cancellables)
     }
 
-    /// 切換 STT 提供商
+    /// 切換 STT 提供商（三選一循環）
     func toggleSTTProvider() {
-        sttProvider = (sttProvider == .chirp3) ? .elevenLabs : .chirp3
+        switch sttProvider {
+        case .chirp3:
+            sttProvider = .elevenLabs
+        case .elevenLabs:
+            sttProvider = .apple
+        case .apple:
+            sttProvider = .chirp3
+        }
     }
 
     /// 處理轉錄結果
@@ -1417,29 +1481,71 @@ final class TranscriptionViewModel {
         // ⭐️ 記錄當前正在合成的文本（用於去重）
         currentSynthesizingText = item.text
 
-        Task {
-            do {
-                print("🎙️ [TTS] 合成中: \"\(item.text.prefix(30))...\"")
+        // ⭐️ 根據 TTS 服務商選擇不同的播放方式
+        switch ttsProvider {
+        case .azure:
+            // Azure TTS：網路合成 → WebRTC 播放
+            Task {
+                do {
+                    print("🎙️ [Azure TTS] 合成中: \"\(item.text.prefix(30))...\"")
 
-                // 獲取音頻數據
-                let audioData = try await ttsService.synthesize(
-                    text: item.text,
-                    languageCode: item.lang
-                )
+                    // 獲取音頻數據
+                    let audioData = try await ttsService.synthesize(
+                        text: item.text,
+                        languageCode: item.lang
+                    )
 
-                // ⭐️ 使用 AudioManager 播放（同一 Engine，AEC 啟用）
-                try audioManager.playTTS(audioData: audioData, text: item.text)
+                    // ⭐️ 使用 AudioManager 播放（同一 Engine，AEC 啟用）
+                    try audioManager.playTTS(audioData: audioData, text: item.text)
 
-                // 播放開始後清除合成文本（currentTTSText 已接管）
+                    // 播放開始後清除合成文本（currentTTSText 已接管）
+                    currentSynthesizingText = nil
+
+                    print("▶️ [Azure TTS] 播放中（錄音繼續，回音消除啟用）")
+
+                } catch {
+                    print("❌ [Azure TTS] 錯誤: \(error.localizedDescription)")
+                    currentSynthesizingText = nil  // 清除
+                    // 繼續處理下一個
+                    processNextTTS()
+                }
+            }
+
+        case .apple:
+            // ⭐️ 檢查 Apple TTS 是否支援此語言
+            if AppleTTSService.isLanguageSupported(item.lang) {
+                // Apple TTS：本地合成 + 直接播放（免費、離線）
+                print("🎙️ [Apple TTS] 播放中: \"\(item.text.prefix(30))...\"")
+
+                // ⭐️ Apple TTS 不計費
+                // 注意：Apple TTS 直接播放，不經過 WebRTC
+                // AEC 仍然有效（因為共享同一個 AudioSession）
+                appleTTSService.speak(text: item.text, languageCode: item.lang)
                 currentSynthesizingText = nil
+            } else {
+                // ⭐️ 自動降級到 Azure TTS
+                print("⚠️ [Apple TTS] 不支援 \(item.lang)，自動降級到 Azure TTS")
 
-                print("▶️ [TTS] 播放中（錄音繼續，回音消除啟用）")
+                Task {
+                    do {
+                        print("🎙️ [Azure TTS 降級] 合成中: \"\(item.text.prefix(30))...\"")
 
-            } catch {
-                print("❌ [TTS] 錯誤: \(error.localizedDescription)")
-                currentSynthesizingText = nil  // 清除
-                // 繼續處理下一個
-                processNextTTS()
+                        let audioData = try await ttsService.synthesize(
+                            text: item.text,
+                            languageCode: item.lang
+                        )
+
+                        try audioManager.playTTS(audioData: audioData, text: item.text)
+                        currentSynthesizingText = nil
+
+                        print("▶️ [Azure TTS 降級] 播放中")
+
+                    } catch {
+                        print("❌ [Azure TTS 降級] 錯誤: \(error.localizedDescription)")
+                        currentSynthesizingText = nil
+                        processNextTTS()
+                    }
+                }
             }
         }
     }
@@ -1447,7 +1553,13 @@ final class TranscriptionViewModel {
     /// 停止當前 TTS 播放
     /// 停止所有 TTS（清空隊列）
     func stopCurrentTTS() {
-        audioManager.stopTTS()
+        // ⭐️ 根據當前服務商停止對應的服務
+        switch ttsProvider {
+        case .azure:
+            audioManager.stopTTS()
+        case .apple:
+            appleTTSService.stop()
+        }
         ttsQueue.removeAll()
         isProcessingTTS = false
     }
@@ -1455,7 +1567,13 @@ final class TranscriptionViewModel {
     /// ⭐️ 停止當前 TTS 並播放下一個（不清空隊列）
     func skipCurrentTTS() {
         print("⏭️ [TTS] 跳過當前播放，播放下一個")
-        audioManager.stopTTS()
+        // ⭐️ 根據當前服務商停止對應的服務
+        switch ttsProvider {
+        case .azure:
+            audioManager.stopTTS()
+        case .apple:
+            appleTTSService.stop()
+        }
         // 不清空隊列，繼續播放下一個
         processNextTTS()
     }

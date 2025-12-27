@@ -12,6 +12,7 @@ import Foundation
 enum STTProvider: String, CaseIterable, Identifiable {
     case chirp3 = "chirp3"           // Google Cloud Chirp 3
     case elevenLabs = "elevenlabs"   // ElevenLabs Scribe v2 Realtime
+    case apple = "apple"             // Apple 內建（設備端雙語言並行）
 
     var id: String { rawValue }
 
@@ -19,6 +20,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "Google Chirp 3"
         case .elevenLabs: return "ElevenLabs Scribe"
+        case .apple: return "Apple 內建"
         }
     }
 
@@ -26,6 +28,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "Chirp3"
         case .elevenLabs: return "ElevenLabs"
+        case .apple: return "Apple"
         }
     }
 
@@ -33,6 +36,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "waveform"
         case .elevenLabs: return "waveform.circle.fill"
+        case .apple: return "apple.logo"
         }
     }
 
@@ -41,6 +45,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "~300-500ms"
         case .elevenLabs: return "~150ms"
+        case .apple: return "~100ms (本地)"
         }
     }
 
@@ -49,6 +54,185 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return 100
         case .elevenLabs: return 92
+        case .apple: return 60  // 設備端支援約 60 種語言
+        }
+    }
+
+    /// 是否免費
+    var isFree: Bool {
+        self == .apple
+    }
+
+    /// 是否需要網路（識別部分）
+    var requiresNetwork: Bool {
+        self != .apple  // Apple STT 可離線（設備端）
+    }
+
+    /// 特色說明
+    var description: String {
+        switch self {
+        case .chirp3: return "高準確度，100+ 語言"
+        case .elevenLabs: return "低延遲，自動 VAD"
+        case .apple: return "免費離線，雙語並行"
+        }
+    }
+
+    /// 識別模式說明
+    var modeDescription: String {
+        switch self {
+        case .chirp3: return "串流識別，雲端處理"
+        case .elevenLabs: return "串流識別 + VAD"
+        case .apple: return "雙語並行，信心度選擇"
+        }
+    }
+}
+
+/// ⭐️ 翻譯模型提供商
+enum TranslationProvider: String, CaseIterable, Identifiable {
+    case gemini = "gemini"       // Gemini 3 Flash（預設）
+    case grok = "grok"           // Grok 4.1 Fast（高品質）
+    case cerebras = "cerebras"   // Cerebras Llama（快速）
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .gemini: return "Gemini 3 Flash"
+        case .grok: return "Grok 4.1 Fast"
+        case .cerebras: return "Cerebras"
+        }
+    }
+
+    var shortName: String {
+        switch self {
+        case .gemini: return "Gemini"
+        case .grok: return "Grok"
+        case .cerebras: return "Cerebras"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .gemini: return "sparkles"
+        case .grok: return "star.fill"
+        case .cerebras: return "bolt.fill"
+        }
+    }
+
+    /// 特色說明
+    var description: String {
+        switch self {
+        case .gemini: return "預設，平衡"
+        case .grok: return "高品質翻譯"
+        case .cerebras: return "極速回應"
+        }
+    }
+
+    /// 平均延遲
+    var latencyDescription: String {
+        switch self {
+        case .gemini: return "~960ms"
+        case .grok: return "~800ms"
+        case .cerebras: return "~380ms"
+        }
+    }
+
+    /// 計費：輸入價格（每百萬 tokens，USD）
+    var inputPricePerMillion: Double {
+        switch self {
+        case .gemini: return 0.50
+        case .grok: return 0.20
+        case .cerebras: return 0.85
+        }
+    }
+
+    /// 計費：輸出價格（每百萬 tokens，USD）
+    var outputPricePerMillion: Double {
+        switch self {
+        case .gemini: return 3.00
+        case .grok: return 0.50
+        case .cerebras: return 1.20
+        }
+    }
+
+    /// 價格等級說明
+    var priceLevel: String {
+        switch self {
+        case .gemini: return "$$"
+        case .grok: return "$"
+        case .cerebras: return "$$"
+        }
+    }
+
+    /// 品質等級（1-5）
+    var qualityRating: Int {
+        switch self {
+        case .gemini: return 4
+        case .grok: return 5
+        case .cerebras: return 3
+        }
+    }
+}
+
+/// ⭐️ TTS 服務商
+enum TTSProvider: String, CaseIterable, Identifiable {
+    case azure = "azure"     // Azure 神經語音（高品質，付費）
+    case apple = "apple"     // Apple 內建語音（免費，離線）
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .azure: return "Azure 神經語音"
+        case .apple: return "Apple 內建語音"
+        }
+    }
+
+    var shortName: String {
+        switch self {
+        case .azure: return "Azure"
+        case .apple: return "Apple"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .azure: return "cloud.fill"
+        case .apple: return "apple.logo"
+        }
+    }
+
+    /// 特色說明
+    var description: String {
+        switch self {
+        case .azure: return "高品質神經網路語音，需付費"
+        case .apple: return "免費離線語音，品質一般"
+        }
+    }
+
+    /// 是否免費
+    var isFree: Bool {
+        self == .apple
+    }
+
+    /// 是否需要網路
+    var requiresNetwork: Bool {
+        self == .azure
+    }
+
+    /// 延遲描述
+    var latencyDescription: String {
+        switch self {
+        case .azure: return "~500ms (網路)"
+        case .apple: return "~50ms (本地)"
+        }
+    }
+
+    /// 品質等級（1-5）
+    var qualityRating: Int {
+        switch self {
+        case .azure: return 5
+        case .apple: return 3
         }
     }
 }

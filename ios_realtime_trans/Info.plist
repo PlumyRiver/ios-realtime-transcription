@@ -16,6 +16,19 @@
 	<string>APPL</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>需要使用麥克風來進行即時語音轉錄和翻譯功能</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>使用 Apple 內建語音識別進行即時轉錄，所有處理均在設備本地完成，不會上傳至雲端</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com.googleusercontent.apps.1027448899164-dlmqlb0mme1peep2dmgphjii66v40sva</string>
+			</array>
+		</dict>
+	</array>
+	<key>GIDClientID</key>
+	<string>1027448899164-dlmqlb0mme1peep2dmgphjii66v40sva.apps.googleusercontent.com</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSExceptionDomains</key>
