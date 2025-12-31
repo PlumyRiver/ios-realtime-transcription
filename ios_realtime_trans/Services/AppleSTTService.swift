@@ -38,7 +38,7 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
     private(set) var connectionState: WebSocketConnectionState = .disconnected
 
     /// 翻譯模型選擇
-    var translationProvider: TranslationProvider = .gemini
+    var translationProvider: TranslationProvider = .grok
 
     /// 伺服器 URL（用於翻譯 API）
     private var serverURL: String = ""

@@ -88,7 +88,7 @@ final class TranscriptionViewModel {
     var ttsPlaybackMode: TTSPlaybackMode = .all
 
     /// ⭐️ TTS 服務商（Azure 或 Apple）
-    var ttsProvider: TTSProvider = .azure
+    var ttsProvider: TTSProvider = .apple
 
     /// 自動播放翻譯（TTS）- 計算屬性，向後兼容
     var autoPlayTTS: Bool {
@@ -102,13 +102,19 @@ final class TranscriptionViewModel {
         set { audioManager.volumePercent = newValue }
     }
 
+    /// ⭐️ Apple TTS 播放狀態（手動追蹤，因為 AppleTTSService 不是 @Observable）
+    private(set) var isAppleTTSPlaying: Bool = false
+
+    /// ⭐️ Apple TTS 當前播放文本（手動追蹤，用於 UI 更新）
+    private(set) var appleTTSCurrentText: String? = nil
+
     /// TTS 播放中
     var isPlayingTTS: Bool {
         switch ttsProvider {
         case .azure:
             return audioManager.isPlayingTTS
         case .apple:
-            return appleTTSService.isPlaying
+            return isAppleTTSPlaying  // ⭐️ 使用手動追蹤的狀態
         }
     }
 
@@ -118,7 +124,7 @@ final class TranscriptionViewModel {
         case .azure:
             return audioManager.currentTTSText
         case .apple:
-            return appleTTSService.currentText
+            return appleTTSCurrentText  // ⭐️ 使用手動追蹤的文本
         }
     }
 
@@ -168,8 +174,8 @@ final class TranscriptionViewModel {
         }
     }
 
-    /// ⭐️ 翻譯模型選擇（預設 Gemini 3 Flash）
-    var translationProvider: TranslationProvider = .gemini {
+    /// ⭐️ 翻譯模型選擇（預設 Grok）
+    var translationProvider: TranslationProvider = .grok {
         didSet {
             if oldValue != translationProvider {
                 print("🔄 [翻譯] 切換模型: \(oldValue.displayName) → \(translationProvider.displayName)")
@@ -193,16 +199,21 @@ final class TranscriptionViewModel {
 
     // MARK: - 音頻加速設定
 
-    /// ⭐️ 音頻加速器（250ms 緩衝，2x 加速，節省 50% STT 成本）
+    /// ⭐️ 音頻加速器（300ms 緩衝，1.5x 加速，節省 33% STT 成本）
+    /// 經測試 1.5x 對所有語言都有效，2.0x 對日語等語言無效
     private let audioTimeStretcher = AudioTimeStretcher()
 
-    /// ⭐️ 是否啟用音頻加速（2x 速度，250ms 額外延遲）
+    /// ⭐️ 是否啟用音頻加速（1.5x 速度，300ms 額外延遲）
     /// 注意：Apple STT 免費，不需要加速
     var isAudioSpeedUpEnabled: Bool = false {
         didSet {
             audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
+
+            // ⭐️ 更新計費服務的加速比（1.5x 加速 → 計費降為 66.7%）
+            BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
+
             if isAudioSpeedUpEnabled {
-                print("🚀 [STT] 音頻加速已啟用（2x，節省 50% 成本，+250ms 延遲）")
+                print("🚀 [STT] 音頻加速已啟用（1.5x，節省 33% 成本，+300ms 延遲）")
             } else {
                 print("⏸️ [STT] 音頻加速已禁用")
             }
@@ -372,6 +383,16 @@ final class TranscriptionViewModel {
         setupSubscriptions()
         // ⭐️ 不在 init 中預取 token，避免 ViewModel 多次初始化導致重複預取
         // 改為在 ContentView 的 onAppear 中手動調用
+
+        // ⭐️ 同步初始化預設設定（didSet 不會在初始化時觸發）
+        // 1. 音頻加速 1.5x
+        if isAudioSpeedUpEnabled {
+            audioTimeStretcher.setEnabled(true)
+            BillingService.shared.setSTTSpeedRatio(1.5)
+        }
+        // 2. 翻譯模型同步到各 STT 服務
+        elevenLabsService.translationProvider = translationProvider
+        appleSTTService.translationProvider = translationProvider
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
@@ -680,11 +701,12 @@ final class TranscriptionViewModel {
         audioManager.audioDataPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] data in
-                guard let self else { return }
+                // ⭐️ 檢查是否正在錄音，避免停止後的殘留音頻被處理
+                guard let self, self.isRecording else { return }
 
-                // 🚀 音頻加速處理
+                // 🚀 音頻加速處理（1.5x，節省 33% 成本）
                 if self.isAudioSpeedUpEnabled && self.sttProvider != .apple {
-                    // 通過加速器處理（250ms 緩衝 → 125ms 輸出）
+                    // 通過加速器處理（300ms 緩衝 → 200ms 輸出）
                     if let processedData = self.audioTimeStretcher.process(data: data) {
                         self.currentSTTService.sendAudio(data: processedData)
                     }
@@ -716,8 +738,14 @@ final class TranscriptionViewModel {
         chirp3Service.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] errorMessage in
-                guard self?.sttProvider == .chirp3 else { return }
-                self?.status = .error(errorMessage)
+                guard let self, self.sttProvider == .chirp3 else { return }
+                print("❌ [Chirp3] 錯誤: \(errorMessage)")
+                self.status = .error(errorMessage)
+                // ⭐️ 連接斷開時自動停止錄音
+                if self.isRecording {
+                    print("⚠️ [Chirp3] 連接斷開，自動停止錄音")
+                    self.stopRecording()
+                }
             }
             .store(in: &cancellables)
 
@@ -759,8 +787,14 @@ final class TranscriptionViewModel {
         elevenLabsService.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] errorMessage in
-                guard self?.sttProvider == .elevenLabs else { return }
-                self?.status = .error(errorMessage)
+                guard let self, self.sttProvider == .elevenLabs else { return }
+                print("❌ [ElevenLabs] 錯誤: \(errorMessage)")
+                self.status = .error(errorMessage)
+                // ⭐️ 連接斷開時自動停止錄音，避免浪費資源
+                if self.isRecording {
+                    print("⚠️ [ElevenLabs] 連接斷開，自動停止錄音")
+                    self.stopRecording()
+                }
             }
             .store(in: &cancellables)
 
@@ -792,8 +826,14 @@ final class TranscriptionViewModel {
         appleSTTService.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] errorMessage in
-                guard self?.sttProvider == .apple else { return }
-                self?.status = .error(errorMessage)
+                guard let self, self.sttProvider == .apple else { return }
+                print("❌ [Apple STT] 錯誤: \(errorMessage)")
+                self.status = .error(errorMessage)
+                // ⭐️ 連接斷開時自動停止錄音
+                if self.isRecording {
+                    print("⚠️ [Apple STT] 錯誤，自動停止錄音")
+                    self.stopRecording()
+                }
             }
             .store(in: &cancellables)
 
@@ -804,6 +844,8 @@ final class TranscriptionViewModel {
 
         // ⭐️ Apple TTS 播放完成回調
         appleTTSService.onPlaybackFinished = { [weak self] in
+            self?.isAppleTTSPlaying = false  // ⭐️ 更新狀態（觸發 UI 更新）
+            self?.appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
             self?.processNextTTS()
         }
 
@@ -1567,6 +1609,8 @@ final class TranscriptionViewModel {
                 // ⭐️ Apple TTS 不計費
                 // 注意：Apple TTS 直接播放，不經過 WebRTC
                 // AEC 仍然有效（因為共享同一個 AudioSession）
+                isAppleTTSPlaying = true  // ⭐️ 更新狀態（觸發 UI 更新）
+                appleTTSCurrentText = item.text  // ⭐️ 記錄當前播放文本
                 appleTTSService.speak(text: item.text, languageCode: item.lang)
                 currentSynthesizingText = nil
             } else {
@@ -1606,6 +1650,8 @@ final class TranscriptionViewModel {
             audioManager.stopTTS()
         case .apple:
             appleTTSService.stop()
+            isAppleTTSPlaying = false  // ⭐️ 更新狀態
+            appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
         }
         ttsQueue.removeAll()
         isProcessingTTS = false
@@ -1620,6 +1666,8 @@ final class TranscriptionViewModel {
             audioManager.stopTTS()
         case .apple:
             appleTTSService.stop()
+            isAppleTTSPlaying = false  // ⭐️ 更新狀態
+            appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
         }
         // 不清空隊列，繼續播放下一個
         processNextTTS()

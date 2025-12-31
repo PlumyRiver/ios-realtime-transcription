@@ -133,6 +133,10 @@ final class BillingService {
     private(set) var sessionLLMCallCount: Int = 0  // LLM 調用次數
     private(set) var sessionTTSChars: Int = 0
 
+    /// ⭐️ 音頻加速比（1.0 = 無加速，1.5 = 1.5x 加速）
+    /// 開啟加速時，STT 計費會除以此比率（節省 33%）
+    private(set) var sttSpeedRatio: Double = 1.0
+
     // MARK: - Initialization
 
     private init() {
@@ -166,6 +170,20 @@ final class BillingService {
     func resetUsage() {
         currentUsage = SessionUsage()
         sttStartTime = nil
+    }
+
+    // MARK: - 音頻加速設定
+
+    /// ⭐️ 設置音頻加速比（影響 STT 計費）
+    /// - Parameter ratio: 加速比（1.0 = 無加速，1.5 = 1.5x 加速）
+    /// 開啟 1.5x 加速時，STT 計費 = 實際秒數 / 1.5，節省 33%
+    func setSTTSpeedRatio(_ ratio: Double) {
+        sttSpeedRatio = max(1.0, ratio)  // 最小為 1.0
+        if ratio > 1.0 {
+            print("💰 [Billing] STT 加速模式: \(ratio)x (計費降為 \(String(format: "%.0f", 100.0 / ratio))%)")
+        } else {
+            print("💰 [Billing] STT 正常模式: 計費 100%")
+        }
     }
 
     // MARK: - STT 計費（即時扣款 + PTT 模式支援）
@@ -209,11 +227,14 @@ final class BillingService {
                 currentUsage.sttDurationSeconds += duration
                 sessionSTTSeconds += duration
 
-                let costUSD = duration * BillingPricing.sttPricePerSecond
+                // ⭐️ 加速模式下降低計費
+                let billingDuration = duration / sttSpeedRatio
+                let costUSD = billingDuration * BillingPricing.sttPricePerSecond
                 let credits = Int(ceil(costUSD * BillingPricing.creditsPerUSD))
                 if credits > 0 {
                     sessionSTTCreditsUsed += credits
-                    deductCreditsImmediately(credits: credits, reason: "STT(PTT結束)")
+                    let speedInfo = sttSpeedRatio > 1.0 ? " (\(sttSpeedRatio)x加速)" : ""
+                    deductCreditsImmediately(credits: credits, reason: "STT(PTT結束)\(speedInfo)")
                 }
             }
         }
@@ -225,6 +246,7 @@ final class BillingService {
 
     /// ⭐️ 處理 STT 即時扣款（每秒調用）
     /// PTT 模式：只有在發送音訊時才計費
+    /// 加速模式：計費時長 = 實際時長 / 加速比
     private func processSTTBilling() {
         // ⭐️ 只有正在發送音訊時才計費
         guard isBilling, isAudioSending, let lastTime = lastSTTBillingTime else { return }
@@ -233,17 +255,22 @@ final class BillingService {
         let duration = now.timeIntervalSince(lastTime)
         lastSTTBillingTime = now
 
-        // 累加用量
+        // 累加用量（記錄實際音訊時長）
         currentUsage.sttDurationSeconds += duration
         sessionSTTSeconds += duration  // ⭐️ 累計 App 級別的 STT 秒數
 
+        // ⭐️ 計算計費時長（加速模式下降低計費）
+        // 1.5x 加速 → 計費時長 = 實際時長 / 1.5 = 實際時長 * 0.667
+        let billingDuration = duration / sttSpeedRatio
+
         // 計算這段時間的費用並即時扣款
-        let costUSD = duration * BillingPricing.sttPricePerSecond
+        let costUSD = billingDuration * BillingPricing.sttPricePerSecond
         let credits = Int(ceil(costUSD * BillingPricing.creditsPerUSD))
 
         if credits > 0 {
             sessionSTTCreditsUsed += credits  // ⭐️ 累計 STT 消耗額度
-            deductCreditsImmediately(credits: credits, reason: "STT")
+            let speedInfo = sttSpeedRatio > 1.0 ? " (\(sttSpeedRatio)x加速)" : ""
+            deductCreditsImmediately(credits: credits, reason: "STT\(speedInfo)")
         }
     }
 
@@ -259,19 +286,22 @@ final class BillingService {
             currentUsage.sttDurationSeconds += duration
             sessionSTTSeconds += duration  // ⭐️ 累計
 
-            // 最後一段的扣款
-            let costUSD = duration * BillingPricing.sttPricePerSecond
+            // ⭐️ 加速模式下降低計費
+            let billingDuration = duration / sttSpeedRatio
+            let costUSD = billingDuration * BillingPricing.sttPricePerSecond
             let credits = Int(ceil(costUSD * BillingPricing.creditsPerUSD))
             if credits > 0 {
                 sessionSTTCreditsUsed += credits  // ⭐️ 累計
-                deductCreditsImmediately(credits: credits, reason: "STT(final)")
+                let speedInfo = sttSpeedRatio > 1.0 ? " (\(sttSpeedRatio)x加速)" : ""
+                deductCreditsImmediately(credits: credits, reason: "STT(final)\(speedInfo)")
             }
         }
 
         sttStartTime = nil
         lastSTTBillingTime = nil
         isAudioSending = false
-        print("💰 [Billing] STT 計時停止，累計: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒")
+        let speedInfo = sttSpeedRatio > 1.0 ? "（\(sttSpeedRatio)x加速，節省\(String(format: "%.0f", (1 - 1/sttSpeedRatio) * 100))%）" : ""
+        print("💰 [Billing] STT 計時停止，累計: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒\(speedInfo)")
     }
 
     /// 直接添加 STT 時長（秒）- 已改為即時扣款
@@ -280,12 +310,14 @@ final class BillingService {
         currentUsage.sttDurationSeconds += seconds
         sessionSTTSeconds += seconds  // ⭐️ 累計
 
-        // 即時扣款
-        let costUSD = seconds * BillingPricing.sttPricePerSecond
+        // ⭐️ 加速模式下降低計費
+        let billingSeconds = seconds / sttSpeedRatio
+        let costUSD = billingSeconds * BillingPricing.sttPricePerSecond
         let credits = Int(ceil(costUSD * BillingPricing.creditsPerUSD))
         if credits > 0 {
             sessionSTTCreditsUsed += credits  // ⭐️ 累計
-            deductCreditsImmediately(credits: credits, reason: "STT(add)")
+            let speedInfo = sttSpeedRatio > 1.0 ? " (\(sttSpeedRatio)x加速)" : ""
+            deductCreditsImmediately(credits: credits, reason: "STT(add)\(speedInfo)")
         }
     }
 

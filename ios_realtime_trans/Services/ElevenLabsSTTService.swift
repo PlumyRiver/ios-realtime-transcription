@@ -84,7 +84,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var currentTargetLang: Language = .en
 
     /// ⭐️ 翻譯模型提供商（可由用戶選擇）
-    var translationProvider: TranslationProvider = .gemini
+    var translationProvider: TranslationProvider = .grok
 
     // Combine Publishers
     private let transcriptSubject = PassthroughSubject<TranscriptMessage, Never>()
@@ -282,10 +282,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         stopPingTimer()
         stopTranslationTimer()  // ⭐️ 停止定時翻譯
 
-        if sendCount > 0 {
-            print("📊 [ElevenLabs] 總計發送: \(sendCount) 次音頻")
+        if sendCount > 0 || sendFailCount > 0 {
+            print("📊 [ElevenLabs] 總計發送: \(sendCount) 次，丟棄: \(sendFailCount) 次")
         }
         sendCount = 0
+        sendFailCount = 0
 
         // 重置翻譯狀態
         resetInterimState()
@@ -315,24 +316,37 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var sendErrorCount = 0
     private let maxSendErrorLogs = 3
 
+    /// ⭐️ 發送失敗計數（用於日誌節流）
+    private var sendFailCount = 0
+    private let maxSendFailLogs = 5
+
     /// 發送音頻數據
     func sendAudio(data: Data) {
         guard connectionState == .connected else {
-            if sendCount == 0 {
-                print("⚠️ [ElevenLabs] 未連接，無法發送音頻")
+            sendFailCount += 1
+            // ⭐️ 只打印前幾次和每 100 次的警告，避免刷屏
+            if sendFailCount <= maxSendFailLogs || sendFailCount % 100 == 0 {
+                print("⚠️ [ElevenLabs] 未連接 (state=\(connectionState))，丟棄音頻 #\(sendFailCount)")
             }
             return
         }
 
         // 檢查 WebSocket 是否有效
         guard let task = webSocketTask, task.state == .running else {
-            if sendErrorCount < maxSendErrorLogs {
-                print("⚠️ [ElevenLabs] WebSocket 已關閉，停止發送")
-                sendErrorCount += 1
+            sendFailCount += 1
+            if sendFailCount <= maxSendFailLogs || sendFailCount % 100 == 0 {
+                let taskState = webSocketTask?.state.rawValue ?? -1
+                print("⚠️ [ElevenLabs] WebSocket 無效 (taskState=\(taskState))，丟棄音頻 #\(sendFailCount)")
             }
             // 更新連接狀態
             connectionState = .disconnected
             return
+        }
+
+        // ⭐️ 重置失敗計數（連接恢復）
+        if sendFailCount > 0 {
+            print("✅ [ElevenLabs] 連接恢復，之前丟棄了 \(sendFailCount) 個音頻")
+            sendFailCount = 0
         }
 
         let base64String = data.base64EncodedString()
@@ -346,6 +360,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         ]
 
         sendCount += 1
+
+        // 🔍 調試：顯示發送的數據量
+        if sendCount == 1 || sendCount % 20 == 0 {
+            print("📤 [ElevenLabs] 發送音頻 #\(sendCount): \(data.count) bytes (\(data.count / 2) samples)")
+        }
 
         do {
             let jsonData = try JSONSerialization.data(withJSONObject: audioMessage)
@@ -1447,6 +1466,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         do {
             let response = try JSONDecoder().decode(ElevenLabsResponse.self, from: data)
 
+            // 🔍 調試：顯示所有收到的消息類型
+            if response.messageType != "pong" {
+                print("📨 [ElevenLabs] 收到消息: \(response.messageType), text: \(response.text?.prefix(30) ?? "nil")")
+            }
+
             switch response.messageType {
             case "session_started":
                 print("✅ [ElevenLabs] Session 開始: \(response.sessionId ?? "N/A")")
@@ -1839,6 +1863,11 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
             // ⭐️ 清除 token 快取（single-use token 只能用一次）
             self.cachedToken = nil
             self.tokenExpireTime = nil
+
+            // ⭐️ 通知 ViewModel 連接已斷開（讓它可以停止錄音）
+            if closeCode != .normalClosure {
+                self.errorSubject.send("連接已斷開 (code: \(closeCode.rawValue))")
+            }
         }
     }
 
