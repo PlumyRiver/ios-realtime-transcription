@@ -1748,7 +1748,7 @@ struct SettingsView: View {
                                     .foregroundStyle(viewModel.isAudioSpeedUpEnabled ? .green : .secondary)
                                 VStack(alignment: .leading) {
                                     Text("音頻加速")
-                                    Text("2x 加速，節省 50% 成本，+250ms 延遲")
+                                    Text("1.5x 加速，節省 33% 成本，+300ms 延遲")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }

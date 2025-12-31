@@ -281,6 +281,16 @@ final class TranscriptionViewModel {
     /// ⭐️ 當前正在合成的文本（用於去重）
     private var currentSynthesizingText: String?
 
+    // MARK: - TTS 防抖系統
+    // ⭐️ 延遲播放 TTS，避免 VAD 過早觸發導致一句話被拆成多句播放
+
+    /// TTS 防抖計時器
+    private var ttsDebounceTimer: Timer?
+    /// 待播放的 TTS（防抖期間暫存）
+    private var pendingTTS: (text: String, lang: String)?
+    /// TTS 防抖延遲時間（秒）- Final 後等待這麼久才播放
+    private let ttsDebounceDelay: TimeInterval = 1.5
+
     // MARK: - Streaming TTS 系統
     // ⭐️ 支援 interim 翻譯時就開始播放，避免等待 final
 
@@ -597,10 +607,14 @@ final class TranscriptionViewModel {
         // ⭐️ 斷開當前 STT 服務
         currentSTTService.disconnect()
 
-        // 清除 interim 和 TTS 隊列
+        // 清除 interim
         interimTranscript = nil
-        ttsQueue.removeAll()
-        isProcessingTTS = false
+
+        // ⭐️ 停止錄音時，立即播放待播放的 TTS（不要丟棄）
+        if pendingTTS != nil {
+            print("🎵 [TTS] 停止錄音，立即播放待播放內容")
+            flushPendingTTS()
+        }
 
         // ⭐️ 重置 Streaming TTS 狀態
         resetStreamingTTSState()
@@ -886,27 +900,37 @@ final class TranscriptionViewModel {
             // 最終結果：添加到列表末尾（最新的在下面）
             var finalTranscript = transcript
 
-            // ⭐️ 檢查新句子是否「包含」上一句（ElevenLabs 延續問題）
-            // 例如：上一句 "我都沒懂解說"，新句子 "我都沒懂解說，你們就算吧"
-            // 這種情況下應該刪除上一句，只保留新的完整句子
+            // ⭐️ 檢查新句子是否是上一句的「延續」（ElevenLabs 分段問題）
+            // 例如：
+            // - "yeah actually" → "Yeah, actually I'm a student"
+            // - "我早餐吃了兩" → "我早餐吃了兩個蛋糕"
+            // 這種情況下應該「替換」上一句，保持同一個對話框
             if let lastTranscript = transcripts.last {
                 let newText = transcript.text
                 let lastText = lastTranscript.text
 
-                // 檢查新句子是否以上一句為前綴
-                if newText.hasPrefix(lastText) && newText.count > lastText.count {
-                    // 新句子包含上一句，刪除上一句
-                    print("🔄 [合併] 新句子包含上一句，刪除舊句子")
-                    print("   舊: \"\(lastText.prefix(30))...\"")
-                    print("   新: \"\(newText.prefix(40))...\"")
-                    transcripts.removeLast()
+                // ⭐️ 使用忽略大小寫的比較
+                let newTextLower = newText.lowercased()
+                let lastTextLower = lastText.lowercased()
+
+                var shouldReplace = false
+
+                // 1. 新句子包含舊句子（完全包含）
+                if newTextLower.contains(lastTextLower) && newText.count > lastText.count {
+                    print("🔄 [合併] 新句子包含上一句")
+                    shouldReplace = true
                 }
-                // 也檢查是否有高度重疊（上一句是新句子的前綴，且重疊 >= 70%）
-                else if lastText.count >= 5 {
-                    // 找出最長的共同前綴
+                // 2. 新句子以舊句子為前綴（忽略大小寫）
+                else if newTextLower.hasPrefix(lastTextLower) && newText.count > lastText.count {
+                    print("🔄 [合併] 新句子以上一句為前綴")
+                    shouldReplace = true
+                }
+                // 3. 高度重疊檢測（忽略大小寫）
+                else if lastText.count >= 3 {
+                    // 找出最長的共同前綴（忽略大小寫）
                     var commonPrefixLength = 0
-                    let newChars = Array(newText)
-                    let lastChars = Array(lastText)
+                    let newChars = Array(newTextLower)
+                    let lastChars = Array(lastTextLower)
                     for i in 0..<min(newChars.count, lastChars.count) {
                         if newChars[i] == lastChars[i] {
                             commonPrefixLength += 1
@@ -915,13 +939,25 @@ final class TranscriptionViewModel {
                         }
                     }
 
-                    // 如果共同前綴佔上一句的 70% 以上，視為重複
+                    // 如果共同前綴佔上一句的 50% 以上，視為同一句話的延續
                     let overlapRatio = Float(commonPrefixLength) / Float(lastText.count)
-                    if overlapRatio >= 0.7 && commonPrefixLength >= 5 {
-                        print("🔄 [合併] 新句子與上一句高度重疊 (\(Int(overlapRatio * 100))%)，刪除舊句子")
-                        print("   舊: \"\(lastText.prefix(30))...\"")
-                        print("   新: \"\(newText.prefix(40))...\"")
-                        transcripts.removeLast()
+                    if overlapRatio >= 0.5 && commonPrefixLength >= 3 {
+                        print("🔄 [合併] 新句子與上一句重疊 \(Int(overlapRatio * 100))%")
+                        shouldReplace = true
+                    }
+                }
+
+                if shouldReplace {
+                    print("   舊: \"\(lastText.prefix(30))...\"")
+                    print("   新: \"\(newText.prefix(40))...\"")
+                    // ⭐️ 替換而不是刪除：更新最後一個 transcript
+                    transcripts.removeLast()
+                    // ⭐️ 取消待播放的 TTS（因為會有新的翻譯）
+                    if pendingTTS != nil {
+                        print("🔄 [TTS] 取消待播放內容（有更完整的句子）")
+                        ttsDebounceTimer?.invalidate()
+                        ttsDebounceTimer = nil
+                        pendingTTS = nil
                     }
                 }
             }
@@ -1525,7 +1561,7 @@ final class TranscriptionViewModel {
         print("🔄 [Streaming TTS] 狀態已重置")
     }
 
-    /// 將文本加入 TTS 播放隊列
+    /// 將文本加入 TTS 播放隊列（使用防抖機制）
     func enqueueTTS(text: String, languageCode: String) {
         guard !text.isEmpty else { return }
 
@@ -1542,17 +1578,76 @@ final class TranscriptionViewModel {
         }
 
         // ⭐️ 去重：檢查當前正在播放的是否是相同文本
-        if audioManager.currentTTSText == text {
+        if audioManager.currentTTSText == text || appleTTSCurrentText == text {
             print("⚠️ [TTS Queue] 忽略重複文本（正在播放）: \"\(text.prefix(20))...\"")
             return
         }
 
-        ttsQueue.append((text: text, lang: languageCode))
-        print("📥 [TTS Queue] 加入隊列: \"\(text.prefix(20))...\" (\(languageCode))")
+        // ⭐️ 防抖機制：檢查是否是待播放內容的延續
+        if let pending = pendingTTS {
+            // 如果新文本包含待播放文本（是延續），替換
+            if text.contains(pending.text) || pending.text.contains(text) {
+                print("🔄 [TTS 防抖] 檢測到延續，替換待播放內容")
+                print("   舊: \"\(pending.text.prefix(25))...\"")
+                print("   新: \"\(text.prefix(25))...\"")
+                // 使用較長的那個
+                let newText = text.count > pending.text.count ? text : pending.text
+                pendingTTS = (text: newText, lang: languageCode)
+                // 重置計時器
+                ttsDebounceTimer?.invalidate()
+                ttsDebounceTimer = Timer.scheduledTimer(withTimeInterval: ttsDebounceDelay, repeats: false) { [weak self] _ in
+                    self?.flushPendingTTS()
+                }
+                return
+            }
+        }
+
+        // ⭐️ 設置待播放內容並啟動防抖計時器
+        pendingTTS = (text: text, lang: languageCode)
+        ttsDebounceTimer?.invalidate()
+        ttsDebounceTimer = Timer.scheduledTimer(withTimeInterval: ttsDebounceDelay, repeats: false) { [weak self] _ in
+            self?.flushPendingTTS()
+        }
+        print("⏳ [TTS 防抖] 等待 \(ttsDebounceDelay)s: \"\(text.prefix(25))...\"")
+    }
+
+    /// ⭐️ 立即播放待播放的 TTS（防抖計時器觸發或強制播放）
+    private func flushPendingTTS() {
+        print("🔔 [TTS 防抖] flushPendingTTS 被調用")
+        ttsDebounceTimer?.invalidate()
+        ttsDebounceTimer = nil
+
+        guard let pending = pendingTTS else {
+            print("⚠️ [TTS 防抖] pendingTTS 為空，跳過")
+            return
+        }
+        pendingTTS = nil
+
+        print("🎵 [TTS 防抖] 準備播放: \"\(pending.text.prefix(30))...\"")
+
+        // 再次檢查去重
+        if ttsQueue.contains(where: { $0.text == pending.text }) {
+            print("⚠️ [TTS 防抖] 已在隊列中，跳過")
+            return
+        }
+        if currentSynthesizingText == pending.text {
+            print("⚠️ [TTS 防抖] 正在合成，跳過")
+            return
+        }
+        if audioManager.currentTTSText == pending.text || appleTTSCurrentText == pending.text {
+            print("⚠️ [TTS 防抖] 正在播放，跳過")
+            return
+        }
+
+        ttsQueue.append(pending)
+        print("📥 [TTS Queue] 防抖結束，加入隊列: \"\(pending.text.prefix(25))...\" (隊列長度: \(ttsQueue.count))")
 
         // 如果沒有正在處理，開始處理
         if !isProcessingTTS {
+            print("▶️ [TTS] 開始處理隊列")
             processNextTTS()
+        } else {
+            print("⏳ [TTS] 已有任務在處理，等待")
         }
     }
 
@@ -1655,6 +1750,11 @@ final class TranscriptionViewModel {
         }
         ttsQueue.removeAll()
         isProcessingTTS = false
+
+        // ⭐️ 清除 TTS 防抖狀態
+        ttsDebounceTimer?.invalidate()
+        ttsDebounceTimer = nil
+        pendingTTS = nil
     }
 
     /// ⭐️ 停止當前 TTS 並播放下一個（不清空隊列）

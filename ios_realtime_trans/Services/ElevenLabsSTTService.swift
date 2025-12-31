@@ -1402,21 +1402,29 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         // ⭐️ 安全檢查：確保連接仍然有效
         guard let task = webSocketTask,
               task.state == .running else {
-            print("⚠️ [ElevenLabs] WebSocket 任務已結束，停止接收")
+            print("⚠️ [ElevenLabs] WebSocket 任務已結束，停止接收 (state: \(webSocketTask?.state.rawValue ?? -1))")
             return
         }
 
+        print("👂 [ElevenLabs] 開始等待服務器消息...")
+
         task.receive { [weak self] result in
-            guard let self = self else { return }
+            guard let self = self else {
+                print("⚠️ [ElevenLabs] self 已釋放")
+                return
+            }
+
+            print("📬 [ElevenLabs] 收到服務器回調")
 
             // ⭐️ 再次檢查連接狀態
             guard self.connectionState == .connected else {
-                print("⚠️ [ElevenLabs] 連接已斷開，停止接收")
+                print("⚠️ [ElevenLabs] 連接已斷開，停止接收 (state: \(self.connectionState))")
                 return
             }
 
             switch result {
             case .success(let message):
+                print("✅ [ElevenLabs] 收到消息成功")
                 self.handleMessage(message)
                 // ⭐️ 只在連接仍然有效時繼續接收
                 if self.connectionState == .connected {
@@ -1461,7 +1469,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// 解析 ElevenLabs 伺服器回應
     private func parseServerResponse(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
+        // ⭐️ 調試：顯示原始響應（前100字符）
+        let preview = String(text.prefix(100))
+        print("🔍 [ElevenLabs] 原始響應: \(preview)...")
+
+        guard let data = text.data(using: .utf8) else {
+            print("❌ [ElevenLabs] 無法轉換為 UTF8 data")
+            return
+        }
 
         do {
             let response = try JSONDecoder().decode(ElevenLabsResponse.self, from: data)
