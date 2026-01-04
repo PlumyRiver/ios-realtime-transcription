@@ -1819,7 +1819,18 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "dollarsign.circle")
                                     .foregroundStyle(.green)
-                                Text("$0.10/M 輸入 • $0.10/M 輸出")
+                                Text("$0.85/M 輸入 • $1.20/M 輸出")
+                            }
+                        case .qwen:
+                            HStack {
+                                Image(systemName: "brain.head.profile")
+                                    .foregroundStyle(.cyan)
+                                Text("Qwen 3 235B：高品質+快速 ~460ms")
+                            }
+                            HStack {
+                                Image(systemName: "dollarsign.circle")
+                                    .foregroundStyle(.green)
+                                Text("$0.60/M 輸入 • $1.20/M 輸出")
                             }
                         }
                     }
@@ -2158,6 +2169,8 @@ struct SettingsView: View {
             return .yellow
         case .cerebras:
             return .blue
+        case .qwen:
+            return .cyan
         }
     }
 

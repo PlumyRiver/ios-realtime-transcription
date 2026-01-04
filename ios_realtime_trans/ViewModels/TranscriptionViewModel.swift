@@ -281,15 +281,24 @@ final class TranscriptionViewModel {
     /// ⭐️ 當前正在合成的文本（用於去重）
     private var currentSynthesizingText: String?
 
-    // MARK: - TTS 防抖系統
-    // ⭐️ 延遲播放 TTS，避免 VAD 過早觸發導致一句話被拆成多句播放
+    // MARK: - TTS 穩定對話框系統
+    // ⭐️ 等待對話框「穩定」後才播放 TTS，避免 VAD 過早觸發導致一句話被拆成多句
 
-    /// TTS 防抖計時器
-    private var ttsDebounceTimer: Timer?
-    /// 待播放的 TTS（防抖期間暫存）
-    private var pendingTTS: (text: String, lang: String)?
-    /// TTS 防抖延遲時間（秒）- Final 後等待這麼久才播放
-    private let ttsDebounceDelay: TimeInterval = 1.5
+    /// 穩定對話框計時器（等待確認對話框不再變化）
+    private var stableDialogTimer: Timer?
+    /// 待播放的 TTS（等待對話框穩定後播放）
+    private var pendingTTS: (text: String, lang: String, transcriptText: String)?
+    /// 對話框穩定等待時間（秒）- Final 翻譯後等待這麼久才播放
+    /// ⭐️ 如果在這段時間內對話框被更新（合併），會重新計時
+    private let stableDialogDelay: TimeInterval = 1.2
+    /// 最後一個 final 的文本（用於判斷是否為新句子）
+    private var lastFinalText: String = ""
+
+    // MARK: - TTS 保障機制
+    /// ⭐️ 已播放的翻譯文本（用於防止重複播放）
+    private var playedTranslations: Set<String> = []
+    /// ⭐️ 最大記錄數量（避免記憶體無限增長）
+    private let maxPlayedTranslationsCount = 50
 
     // MARK: - Streaming TTS 系統
     // ⭐️ 支援 interim 翻譯時就開始播放，避免等待 final
@@ -610,11 +619,16 @@ final class TranscriptionViewModel {
         // 清除 interim
         interimTranscript = nil
 
-        // ⭐️ 停止錄音時，立即播放待播放的 TTS（不要丟棄）
+        // ⭐️ 停止錄音時，立即播放待播放的 TTS（對話框已確定結束）
         if pendingTTS != nil {
-            print("🎵 [TTS] 停止錄音，立即播放待播放內容")
+            print("🎵 [TTS] 停止錄音，對話框確定結束，立即播放待播放內容")
             flushPendingTTS()
         }
+        lastFinalText = ""  // ⭐️ 重置最後 final 文本
+
+        // ⭐️ 清理已播放記錄（下一次通話重新開始）
+        playedTranslations.removeAll()
+        print("🧹 [TTS] 停止錄音，清理已播放記錄")
 
         // ⭐️ 重置 Streaming TTS 狀態
         resetStreamingTTSState()
@@ -952,34 +966,49 @@ final class TranscriptionViewModel {
                     print("   新: \"\(newText.prefix(40))...\"")
                     // ⭐️ 替換而不是刪除：更新最後一個 transcript
                     transcripts.removeLast()
-                    // ⭐️ 取消待播放的 TTS（因為會有新的翻譯）
+                    // ⭐️ 對話框被合併，重置穩定計時器
+                    // 注意：不清除 pendingTTS！保留翻譯內容，讓新翻譯來替換
+                    // 這樣即使新翻譯沒來，舊翻譯也能播放
                     if pendingTTS != nil {
-                        print("🔄 [TTS] 取消待播放內容（有更完整的句子）")
-                        ttsDebounceTimer?.invalidate()
-                        ttsDebounceTimer = nil
-                        pendingTTS = nil
+                        print("🔄 [TTS] 對話框合併，重置計時器（保留待播放內容）")
+                        stableDialogTimer?.invalidate()
+                        // ⭐️ 重新開始計時，等待新翻譯或穩定
+                        stableDialogTimer = Timer.scheduledTimer(withTimeInterval: stableDialogDelay, repeats: false) { [weak self] _ in
+                            self?.flushPendingTTS()
+                        }
                     }
                 }
             }
 
-            // ⭐️ Chirp3 模式：保留 interim 的翻譯（定時翻譯的結果）
-            // ⭐️ ElevenLabs 模式：不保留，讓 service 層決定是否重新翻譯完整句子
-            //    ElevenLabs 在 VAD commit 時會判斷翻譯是否完整，不完整則重新翻譯
-            if sttProvider == .chirp3 {
-                if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
-                    finalTranscript.translation = interimTranslation
-                    print("✅ [Final/Chirp3] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+            // ⭐️ 記錄最後一個 final 的文本（用於判斷新句子）
+            lastFinalText = transcript.text
 
-                    // ⭐️ 從 interim 保留翻譯時，觸發 TTS 播放
+            // ⭐️ TTS 保障機制：從 interim 保留翻譯並觸發 TTS
+            // 問題：翻譯可能在 transcript 還是 interim 時就到了，此時 matchedFinal=false 不會觸發 TTS
+            // 當 interim 變成 final 時，翻譯不會再發送，導致 TTS 遺漏
+            // 解決：在這裡檢查並補播
+            if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
+                finalTranscript.translation = interimTranslation
+                print("✅ [Final] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+
+                // ⭐️ TTS 保障：檢查這個翻譯是否已經在等待播放
+                let normalizedTranslation = normalizeTextForComparison(interimTranslation)
+                let isAlreadyPending = pendingTTS != nil && normalizeTextForComparison(pendingTTS!.text) == normalizedTranslation
+                let isAlreadyQueued = ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedTranslation })
+                let isAlreadyPlayed = playedTranslations.contains(normalizedTranslation)
+
+                if !isAlreadyPending && !isAlreadyQueued && !isAlreadyPlayed {
+                    // ⭐️ 翻譯還沒觸發過 TTS，現在補播
                     let detectedLanguage = interimTranscript?.language
                     if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
                         let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+                        print("🔧 [TTS 保障] 從 interim 補播翻譯: \"\(interimTranslation.prefix(25))...\"")
                         enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
                     }
+                } else {
+                    print("ℹ️ [TTS] 翻譯已在處理中: pending=\(isAlreadyPending), queued=\(isAlreadyQueued), played=\(isAlreadyPlayed)")
                 }
             }
-            // ElevenLabs 模式：等待 service 層發送完整翻譯
-            // 不在這裡保留 interim 翻譯，避免不完整翻譯覆蓋後續的完整翻譯
 
             transcripts.append(finalTranscript)
             interimTranscript = nil
@@ -992,6 +1021,23 @@ final class TranscriptionViewModel {
             // ⭐️ 中間結果：檢查是否為新的語句
             // 注意：ElevenLabs 使用 VAD 自動 commit，不需要 Pseudo-Final 機制
             // Chirp3 可能需要，因為有時 final 結果會丟失
+
+            // ⭐️ 檢測是否為新句子開始（與上一個 final 不同）
+            // 如果是新句子，立即播放上一個對話框的 TTS
+            if !lastFinalText.isEmpty {
+                let newText = transcript.text.lowercased().replacingOccurrences(of: " ", with: "")
+                let lastText = lastFinalText.lowercased().replacingOccurrences(of: " ", with: "")
+
+                // 新句子的判斷：新 interim 不是上一個 final 的延續
+                let isNewSentence = !newText.hasPrefix(lastText) && !lastText.hasPrefix(newText)
+
+                if isNewSentence && pendingTTS != nil {
+                    print("🆕 [TTS] 檢測到新句子開始，立即播放上一句")
+                    print("   上一句: \"\(lastFinalText.prefix(25))...\"")
+                    print("   新 interim: \"\(transcript.text.prefix(25))...\"")
+                    flushPendingTTS()
+                }
+            }
 
             // 只對 Chirp3 啟用 Pseudo-Final（ElevenLabs VAD 會自動處理）
             if sttProvider == .chirp3, let oldInterim = interimTranscript {
@@ -1039,6 +1085,7 @@ final class TranscriptionViewModel {
     private func handleTranslation(sourceText: String, translatedText: String) {
         // 找到對應的轉錄並添加翻譯
         var detectedLanguage: String? = nil
+        var matchedFinal = false  // ⭐️ 追蹤是否匹配到 final
 
         // ⭐️ DEBUG: 打印匹配信息
         print("🔍 [翻譯匹配] sourceText: \"\(sourceText.prefix(50))\"")
@@ -1054,6 +1101,7 @@ final class TranscriptionViewModel {
             // 精確匹配到 final 結果
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
+            matchedFinal = true  // ⭐️ 匹配到 final
             print("✅ [翻譯匹配] 精確匹配到 transcripts[\(index)]")
         }
         // ⭐️ 再嘗試模糊匹配（前綴匹配，處理標點差異）
@@ -1076,6 +1124,7 @@ final class TranscriptionViewModel {
         }) {
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
+            matchedFinal = true  // ⭐️ 匹配到 final
             print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（語言一致）")
         }
         // ⭐️ 只有當 sourceText 和 interimTranscript 匹配時才更新 interim
@@ -1096,6 +1145,7 @@ final class TranscriptionViewModel {
             if textMatch && langMatch {
                 interimTranscript?.translation = translatedText
                 detectedLanguage = interim.language
+                matchedFinal = false  // ⭐️ 匹配到 interim，不是 final
                 print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
             } else if textMatch && !langMatch {
                 print("⚠️ [翻譯匹配] interim 語言不匹配，丟棄")
@@ -1116,23 +1166,23 @@ final class TranscriptionViewModel {
             return  // ⭐️ 直接返回，不播放 TTS
         }
 
-        // ⭐️ 只在 Final 時播放 TTS（不使用 Streaming TTS）
-        // 判斷是否為 final（匹配到 transcripts 陣列中的 = final，匹配到 interimTranscript = interim）
-        let isFinal = interimTranscript?.text != sourceText
-
-        // 只有 final 才播放 TTS
-        if isFinal {
+        // ⭐️ 只在 Final 時播放 TTS
+        // 使用 matchedFinal 來判斷，而不是比較 interimTranscript
+        if matchedFinal {
             // 檢查 TTS 播放模式
             guard shouldPlayTTSForMode(detectedLanguage: detectedLanguage) else {
+                print("🔇 [TTS] 播放模式不允許，跳過")
                 return
             }
 
             // 判斷翻譯的目標語言
             let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
 
-            // 加入 TTS 播放隊列
+            // 加入 TTS 播放隊列（等待對話框穩定）
             enqueueTTS(text: translatedText, languageCode: targetLangCode)
-            print("🎵 [TTS] Final 播放: \"\(translatedText.prefix(30))...\"")
+            print("🎵 [TTS] Final 翻譯，加入待播放: \"\(translatedText.prefix(30))...\"")
+        } else {
+            print("⏳ [TTS] interim 翻譯，不觸發 TTS")
         }
     }
 
@@ -1551,6 +1601,17 @@ final class TranscriptionViewModel {
         return length
     }
 
+    /// ⭐️ 正規化文本用於比較（移除空格和常見標點）
+    private func normalizeTextForComparison(_ text: String) -> String {
+        let punctuation = CharacterSet.punctuationCharacters.union(.whitespaces)
+        return text.lowercased()
+            .unicodeScalars
+            .filter { !punctuation.contains($0) }
+            .map { Character($0) }
+            .map { String($0) }
+            .joined()
+    }
+
     /// 重置 Streaming TTS 狀態（在停止錄音時調用）
     private func resetStreamingTTSState() {
         // 取消計時器
@@ -1561,86 +1622,132 @@ final class TranscriptionViewModel {
         print("🔄 [Streaming TTS] 狀態已重置")
     }
 
-    /// 將文本加入 TTS 播放隊列（使用防抖機制）
+    /// ⭐️ 將翻譯加入待播放（等待對話框穩定後播放）
+    /// 新策略：不立即播放，而是等待確認對話框不再變化
+    /// 觸發播放的條件：
+    /// 1. 穩定計時器到期（對話框在 stableDialogDelay 秒內沒有變化）
+    /// 2. 檢測到新句子開始（在 handleTranscript 中處理）
+    /// 3. 用戶停止錄音（在 stopRecording 中處理）
     func enqueueTTS(text: String, languageCode: String) {
         guard !text.isEmpty else { return }
 
-        // ⭐️ 去重：檢查隊列中是否已有相同文本
-        if ttsQueue.contains(where: { $0.text == text }) {
-            print("⚠️ [TTS Queue] 忽略重複文本（已在隊列中）: \"\(text.prefix(20))...\"")
+        // ⭐️ 去重：正規化文本（移除空格和標點比較）
+        let normalizedText = normalizeTextForComparison(text)
+
+        // ⭐️ 檢查是否已播放過相同內容
+        if playedTranslations.contains(normalizedText) {
+            print("⚠️ [TTS] 忽略（已播放過相同內容）: \"\(text.prefix(25))...\"")
             return
         }
 
-        // ⭐️ 去重：檢查當前正在合成的是否是相同文本
-        if currentSynthesizingText == text {
-            print("⚠️ [TTS Queue] 忽略重複文本（正在合成）: \"\(text.prefix(20))...\"")
+        // ⭐️ 去重：檢查隊列中是否已有相同文本（只檢查精確匹配）
+        if ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedText }) {
+            print("⚠️ [TTS Queue] 忽略相同文本: \"\(text.prefix(25))...\"")
             return
         }
 
-        // ⭐️ 去重：檢查當前正在播放的是否是相同文本
-        if audioManager.currentTTSText == text || appleTTSCurrentText == text {
-            print("⚠️ [TTS Queue] 忽略重複文本（正在播放）: \"\(text.prefix(20))...\"")
-            return
+        // ⭐️ 去重：檢查當前正在合成/播放的是否相同（只檢查精確匹配）
+        if let synthesizing = currentSynthesizingText {
+            if normalizeTextForComparison(synthesizing) == normalizedText {
+                print("⚠️ [TTS] 忽略（正在合成相同內容）: \"\(text.prefix(25))...\"")
+                return
+            }
         }
-
-        // ⭐️ 防抖機制：檢查是否是待播放內容的延續
-        if let pending = pendingTTS {
-            // 如果新文本包含待播放文本（是延續），替換
-            if text.contains(pending.text) || pending.text.contains(text) {
-                print("🔄 [TTS 防抖] 檢測到延續，替換待播放內容")
-                print("   舊: \"\(pending.text.prefix(25))...\"")
-                print("   新: \"\(text.prefix(25))...\"")
-                // 使用較長的那個
-                let newText = text.count > pending.text.count ? text : pending.text
-                pendingTTS = (text: newText, lang: languageCode)
-                // 重置計時器
-                ttsDebounceTimer?.invalidate()
-                ttsDebounceTimer = Timer.scheduledTimer(withTimeInterval: ttsDebounceDelay, repeats: false) { [weak self] _ in
-                    self?.flushPendingTTS()
-                }
+        if let playing = audioManager.currentTTSText ?? appleTTSCurrentText {
+            if normalizeTextForComparison(playing) == normalizedText {
+                print("⚠️ [TTS] 忽略（正在播放相同內容）: \"\(text.prefix(25))...\"")
                 return
             }
         }
 
-        // ⭐️ 設置待播放內容並啟動防抖計時器
-        pendingTTS = (text: text, lang: languageCode)
-        ttsDebounceTimer?.invalidate()
-        ttsDebounceTimer = Timer.scheduledTimer(withTimeInterval: ttsDebounceDelay, repeats: false) { [weak self] _ in
+        // ⭐️ 穩定對話框機制：等待對話框確定後再播放
+        if let pending = pendingTTS {
+            // 如果新翻譯是 pending 的延續（更完整的版本），替換並重置計時器
+            if text.contains(pending.text) || pending.text.contains(text) {
+                let newText = text.count > pending.text.count ? text : pending.text
+                print("🔄 [TTS 穩定] 對話框更新，替換待播放")
+                print("   舊: \"\(pending.text.prefix(25))...\"")
+                print("   新: \"\(newText.prefix(25))...\"")
+                pendingTTS = (text: newText, lang: languageCode, transcriptText: lastFinalText)
+                // 重置穩定計時器
+                stableDialogTimer?.invalidate()
+                stableDialogTimer = Timer.scheduledTimer(withTimeInterval: stableDialogDelay, repeats: false) { [weak self] _ in
+                    self?.flushPendingTTS()
+                }
+                return
+            }
+            // 如果是完全不同的翻譯（新句子），先播放舊的
+            print("🔀 [TTS 穩定] 檢測到不同翻譯，先 flush 舊的")
+            flushPendingTTS()
+        }
+
+        // ⭐️ 設置待播放內容並啟動穩定計時器
+        pendingTTS = (text: text, lang: languageCode, transcriptText: lastFinalText)
+        stableDialogTimer?.invalidate()
+        stableDialogTimer = Timer.scheduledTimer(withTimeInterval: stableDialogDelay, repeats: false) { [weak self] _ in
             self?.flushPendingTTS()
         }
-        print("⏳ [TTS 防抖] 等待 \(ttsDebounceDelay)s: \"\(text.prefix(25))...\"")
+        print("⏳ [TTS 穩定] 等待對話框穩定 \(stableDialogDelay)s: \"\(text.prefix(25))...\"")
     }
 
-    /// ⭐️ 立即播放待播放的 TTS（防抖計時器觸發或強制播放）
+    /// ⭐️ 直接加入 TTS 隊列（跳過穩定等待）
+    private func directEnqueueTTS(text: String, languageCode: String) {
+        ttsQueue.append((text: text, lang: languageCode))
+        print("📥 [TTS Queue] 直接加入: \"\(text.prefix(25))...\" (隊列長度: \(ttsQueue.count))")
+
+        if !isProcessingTTS {
+            print("▶️ [TTS] 開始處理隊列")
+            processNextTTS()
+        }
+    }
+
+    /// ⭐️ 立即播放待播放的 TTS（穩定計時器觸發、新句子開始、或停止錄音）
     private func flushPendingTTS() {
-        print("🔔 [TTS 防抖] flushPendingTTS 被調用")
-        ttsDebounceTimer?.invalidate()
-        ttsDebounceTimer = nil
+        print("🔔 [TTS 穩定] flushPendingTTS 被調用")
+        stableDialogTimer?.invalidate()
+        stableDialogTimer = nil
 
         guard let pending = pendingTTS else {
-            print("⚠️ [TTS 防抖] pendingTTS 為空，跳過")
+            print("⚠️ [TTS 穩定] pendingTTS 為空，跳過")
             return
         }
         pendingTTS = nil
 
-        print("🎵 [TTS 防抖] 準備播放: \"\(pending.text.prefix(30))...\"")
+        print("🎵 [TTS 穩定] 對話框已穩定，準備播放: \"\(pending.text.prefix(30))...\"")
+        print("   對應原文: \"\(pending.transcriptText.prefix(25))...\"")
 
-        // 再次檢查去重
-        if ttsQueue.contains(where: { $0.text == pending.text }) {
-            print("⚠️ [TTS 防抖] 已在隊列中，跳過")
-            return
-        }
-        if currentSynthesizingText == pending.text {
-            print("⚠️ [TTS 防抖] 正在合成，跳過")
-            return
-        }
-        if audioManager.currentTTSText == pending.text || appleTTSCurrentText == pending.text {
-            print("⚠️ [TTS 防抖] 正在播放，跳過")
+        // ⭐️ 正規化文本用於去重
+        let normalizedText = normalizeTextForComparison(pending.text)
+
+        // ⭐️ 檢查是否已播放過
+        if playedTranslations.contains(normalizedText) {
+            print("⚠️ [TTS 穩定] 已播放過相同內容，跳過")
             return
         }
 
-        ttsQueue.append(pending)
-        print("📥 [TTS Queue] 防抖結束，加入隊列: \"\(pending.text.prefix(25))...\" (隊列長度: \(ttsQueue.count))")
+        // 再次檢查去重（只檢查精確匹配）
+        if ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedText }) {
+            print("⚠️ [TTS 穩定] 已在隊列中，跳過")
+            return
+        }
+        if let synthesizing = currentSynthesizingText {
+            if normalizeTextForComparison(synthesizing) == normalizedText {
+                print("⚠️ [TTS 穩定] 正在合成相同內容，跳過")
+                return
+            }
+        }
+        if let playing = audioManager.currentTTSText ?? appleTTSCurrentText {
+            if normalizeTextForComparison(playing) == normalizedText {
+                print("⚠️ [TTS 穩定] 正在播放相同內容，跳過")
+                return
+            }
+        }
+
+        // ⭐️ 記錄已播放的翻譯（防止重複播放）
+        recordPlayedTranslation(normalizedText)
+
+        ttsQueue.append((text: pending.text, lang: pending.lang))
+        print("📥 [TTS Queue] 對話框穩定，加入隊列: \"\(pending.text.prefix(25))...\" (隊列長度: \(ttsQueue.count))")
 
         // 如果沒有正在處理，開始處理
         if !isProcessingTTS {
@@ -1648,6 +1755,21 @@ final class TranscriptionViewModel {
             processNextTTS()
         } else {
             print("⏳ [TTS] 已有任務在處理，等待")
+        }
+    }
+
+    /// ⭐️ 記錄已播放的翻譯（限制數量避免記憶體無限增長）
+    private func recordPlayedTranslation(_ normalizedText: String) {
+        playedTranslations.insert(normalizedText)
+        // 如果超過限制，清除最早的記錄（Set 無序，簡單清除一半）
+        if playedTranslations.count > maxPlayedTranslationsCount {
+            let removeCount = maxPlayedTranslationsCount / 2
+            for _ in 0..<removeCount {
+                if let first = playedTranslations.first {
+                    playedTranslations.remove(first)
+                }
+            }
+            print("🧹 [TTS] 清理已播放記錄，剩餘: \(playedTranslations.count)")
         }
     }
 
@@ -1751,10 +1873,11 @@ final class TranscriptionViewModel {
         ttsQueue.removeAll()
         isProcessingTTS = false
 
-        // ⭐️ 清除 TTS 防抖狀態
-        ttsDebounceTimer?.invalidate()
-        ttsDebounceTimer = nil
+        // ⭐️ 清除 TTS 穩定對話框狀態
+        stableDialogTimer?.invalidate()
+        stableDialogTimer = nil
         pendingTTS = nil
+        lastFinalText = ""
     }
 
     /// ⭐️ 停止當前 TTS 並播放下一個（不清空隊列）

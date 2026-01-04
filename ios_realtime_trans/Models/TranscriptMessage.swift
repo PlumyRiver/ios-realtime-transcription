@@ -92,6 +92,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     case gemini = "gemini"       // Gemini 3 Flash（預設）
     case grok = "grok"           // Grok 4.1 Fast（高品質）
     case cerebras = "cerebras"   // Cerebras Llama（快速）
+    case qwen = "qwen"           // Qwen 3 235B（高品質+快速）
 
     var id: String { rawValue }
 
@@ -100,6 +101,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "Gemini 3 Flash"
         case .grok: return "Grok 4.1 Fast"
         case .cerebras: return "Cerebras"
+        case .qwen: return "Qwen 3 235B"
         }
     }
 
@@ -108,6 +110,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "Gemini"
         case .grok: return "Grok"
         case .cerebras: return "Cerebras"
+        case .qwen: return "Qwen"
         }
     }
 
@@ -116,6 +119,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "sparkles"
         case .grok: return "star.fill"
         case .cerebras: return "bolt.fill"
+        case .qwen: return "brain.head.profile"
         }
     }
 
@@ -125,6 +129,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "預設，平衡"
         case .grok: return "高品質翻譯"
         case .cerebras: return "極速回應"
+        case .qwen: return "高品質+快速"
         }
     }
 
@@ -134,6 +139,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "~960ms"
         case .grok: return "~800ms"
         case .cerebras: return "~380ms"
+        case .qwen: return "~460ms"
         }
     }
 
@@ -143,6 +149,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return 0.50
         case .grok: return 0.20
         case .cerebras: return 0.85
+        case .qwen: return 0.60
         }
     }
 
@@ -152,6 +159,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return 3.00
         case .grok: return 0.50
         case .cerebras: return 1.20
+        case .qwen: return 1.20
         }
     }
 
@@ -161,6 +169,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return "$$"
         case .grok: return "$"
         case .cerebras: return "$$"
+        case .qwen: return "$"
         }
     }
 
@@ -170,6 +179,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
         case .gemini: return 4
         case .grok: return 5
         case .cerebras: return 3
+        case .qwen: return 4
         }
     }
 }
