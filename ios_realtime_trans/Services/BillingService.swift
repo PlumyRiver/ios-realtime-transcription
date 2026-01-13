@@ -118,6 +118,9 @@ final class BillingService {
     /// ⭐️ PTT 模式：是否正在發送音訊（只有發送時才計費）
     private(set) var isAudioSending: Bool = false
 
+    /// ⭐️ 額度耗盡回調（通知 ViewModel 停止錄音）
+    var onCreditsExhausted: (() -> Void)?
+
     /// ⭐️ 本次 App 使用的累計消耗額度（從 App 啟動開始計算）
     private(set) var sessionTotalCreditsUsed: Int = 0
 
@@ -413,10 +416,19 @@ final class BillingService {
         sessionTotalCreditsUsed += credits
 
         // 先更新本地額度（樂觀更新）
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+
             if var user = AuthService.shared.currentUser {
-                user.slowCredits = max(0, user.slowCredits - credits)
+                let newCredits = max(0, user.slowCredits - credits)
+                user.slowCredits = newCredits
                 AuthService.shared.updateLocalUser(user)
+
+                // ⭐️ 檢查額度是否耗盡
+                if newCredits <= 0 {
+                    print("🚨 [Billing] 額度耗盡！觸發自動停止錄音")
+                    self.onCreditsExhausted?()
+                }
             }
         }
 

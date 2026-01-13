@@ -25,6 +25,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private var pingTimer: Timer?
     private let pingInterval: TimeInterval = 20.0
 
+    /// ⭐️ 自動重連機制
+    /// ElevenLabs STT 會在閒置時自動斷線，需要自動重連
+    private var shouldAutoReconnect: Bool = false  // 是否應該自動重連（用戶主動斷開時為 false）
+    private var reconnectAttempts: Int = 0  // 重連嘗試次數
+    private let maxReconnectAttempts: Int = 3  // 最大重連次數
+    private let reconnectDelay: TimeInterval = 1.0  // 重連延遲（秒）
+
     /// ⭐️ 定時智能翻譯計時器（用於 interim 結果）
     private var translationTimer: Timer?
     private let translationInterval: TimeInterval = 0.5  // 每 0.5 秒檢查一次
@@ -245,6 +252,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             return
         }
 
+        // ⭐️ 啟用自動重連（用戶主動 connect 時）
+        shouldAutoReconnect = true
+        reconnectAttempts = 0
+
         // 保存語言設定
         currentSourceLang = sourceLang
         currentTargetLang = targetLang
@@ -279,6 +290,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// 斷開連接
     func disconnect() {
+        // ⭐️ 禁用自動重連（用戶主動斷開）
+        shouldAutoReconnect = false
+        reconnectAttempts = 0
+
         stopPingTimer()
         stopTranslationTimer()  // ⭐️ 停止定時翻譯
 
@@ -471,6 +486,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             URLQueryItem(name: "vad_threshold", value: String(vadThreshold)),
             URLQueryItem(name: "min_speech_duration_ms", value: String(minSpeechDurationMs)),
             URLQueryItem(name: "min_silence_duration_ms", value: "500")  // 最小靜音 500ms
+            // ⚠️ 注意：inactivity_timeout 是 TTS 參數，STT 不支持！
         ]
 
         print("🎚️ [ElevenLabs] VAD 設定: threshold=\(vadThreshold), minSpeech=\(minSpeechDurationMs)ms, silence=\(vadSilenceThresholdSecs)s")
@@ -981,6 +997,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// Cerebras 會自動判斷輸入語言並翻譯到另一種語言
     /// 不需要客戶端判斷語言，完全由 LLM 處理
     /// ⭐️ 分句一致性：傳遞 previousSegments 讓 LLM 保持前文分句邊界
+    /// ⭐️ 失敗重試：最多重試 2 次，每次間隔 300ms
     private func callSmartTranslateAPI(text: String, includePreviousSegments: Bool = true) async {
         let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
 
@@ -1013,31 +1030,58 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             "provider": translationProvider.rawValue  // ⭐️ 傳遞用戶選擇的翻譯模型
         ]
 
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, _) = try await URLSession.shared.data(for: request)
+        // ⭐️ 重試機制：最多重試 2 次
+        let maxRetries = 2
+        var lastError: Error?
 
-            // 解析智能翻譯結果（使用類別級別的 SmartTranslateResponse）
-            let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
+        for attempt in 0..<maxRetries {
+            do {
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, _) = try await URLSession.shared.data(for: request)
 
-            // ⭐️ 記錄 LLM token 用量（用於計費，根據 provider 使用對應價格）
-            if let usage = response.usage {
-                BillingService.shared.recordLLMUsage(
-                    inputTokens: usage.inputTokens,
-                    outputTokens: usage.outputTokens,
-                    provider: translationProvider
-                )
+                // 解析智能翻譯結果（使用類別級別的 SmartTranslateResponse）
+                let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
+
+                // ⭐️ 檢查翻譯結果是否有效（不是空的或佔位符）
+                let hasValidTranslation = response.segments.contains { segment in
+                    guard let translation = segment.translation else { return false }
+                    return !translation.isEmpty && !(translation.hasPrefix("[") && translation.hasSuffix("]"))
+                }
+
+                guard hasValidTranslation else {
+                    throw TranslationError.emptyResult
+                }
+
+                // ⭐️ 記錄 LLM token 用量（用於計費，根據 provider 使用對應價格）
+                if let usage = response.usage {
+                    BillingService.shared.recordLLMUsage(
+                        inputTokens: usage.inputTokens,
+                        outputTokens: usage.outputTokens,
+                        provider: translationProvider
+                    )
+                }
+
+                await MainActor.run {
+                    processSmartTranslateResponse(response, originalText: text)
+                }
+
+                // 成功，直接返回
+                return
+
+            } catch {
+                lastError = error
+                print("⚠️ [智能翻譯] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
+
+                // 如果不是最後一次嘗試，等待 300ms 再重試
+                if attempt < maxRetries - 1 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                }
             }
-
-            await MainActor.run {
-                processSmartTranslateResponse(response, originalText: text)
-            }
-
-        } catch {
-            print("❌ [智能翻譯] 錯誤: \(error.localizedDescription)")
-            // 備用方案：使用普通翻譯
-            await translateTextDirectly(text, isInterim: true)
         }
+
+        // ⭐️ 所有重試都失敗，使用備用方案
+        print("❌ [智能翻譯] \(maxRetries) 次重試都失敗，使用備用翻譯")
+        await translateTextDirectly(text, isInterim: true)
     }
 
     /// ⭐️ 處理智能翻譯響應（核心改進：增量分句累積）
@@ -1384,11 +1428,17 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         guard connectionState == .connected else { return }
 
         webSocketTask?.sendPing { [weak self] error in
+            guard let self else { return }
             if let error {
                 print("❌ [ElevenLabs] Ping 失敗: \(error.localizedDescription)")
                 Task { @MainActor in
-                    self?.connectionState = .error("連接已斷開")
-                    self?.errorSubject.send("連接已斷開")
+                    // ⭐️ 關鍵：如果正在自動重連，不發送錯誤給 ViewModel（避免 UI 閃爍）
+                    if self.shouldAutoReconnect && self.reconnectAttempts <= self.maxReconnectAttempts {
+                        print("🔄 [ElevenLabs] 自動重連中，忽略 Ping 錯誤（不通知 ViewModel）")
+                        return
+                    }
+                    self.connectionState = .error("連接已斷開")
+                    self.errorSubject.send("連接已斷開")
                 }
             } else {
                 print("💓 [ElevenLabs] Ping 成功")
@@ -1441,14 +1491,21 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 }
 
                 Task { @MainActor in
-                    // ⭐️ 只在未主動斷開時設置錯誤狀態
+                    // 清除 token 快取
+                    self.cachedToken = nil
+                    self.tokenExpireTime = nil
+
+                    // ⭐️ 關鍵：如果正在自動重連，不發送錯誤給 ViewModel（避免 UI 閃爍）
+                    if self.shouldAutoReconnect && self.reconnectAttempts <= self.maxReconnectAttempts {
+                        print("🔄 [ElevenLabs] 自動重連中，忽略接收錯誤（不通知 ViewModel）")
+                        return
+                    }
+
+                    // ⭐️ 只在未主動斷開且非重連時設置錯誤狀態
                     if self.connectionState != .disconnected {
                         self.connectionState = .error(errorMessage)
                         self.errorSubject.send(errorMessage)
                     }
-                    // 清除 token 快取
-                    self.cachedToken = nil
-                    self.tokenExpireTime = nil
                 }
             }
         }
@@ -1657,17 +1714,79 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     // 檢查是否已在 confirmedSegments 中
                     let alreadySent = confirmedSegments.contains { $0.original == pending.original }
                     if !alreadySent {
+                        // ⭐️ 修復：如果 transcriptText 比 pending.original 更長，使用 transcriptText
+                        // 這處理了智能翻譯回調延遲導致的「最後幾個字丟失」問題
+                        let actualText: String
+                        let actualTranslation: String?
+
+                        if pending.original != transcriptText {
+                            // transcriptText 與 pending 不同（可能更長或完全不同）
+                            // 使用 ElevenLabs 實際確認的文本
+                            actualText = transcriptText
+                            actualTranslation = nil  // 需要重新翻譯
+                            print("⚠️ [VAD Commit] 發現差異:")
+                            print("   pending: \"\(pending.original)\"")
+                            print("   actual:  \"\(transcriptText)\"")
+                        } else {
+                            // 完全匹配，使用 pending 的翻譯
+                            actualText = pending.original
+                            actualTranslation = pending.translation
+                        }
+
                         var pendingTranscript = TranscriptMessage(
-                            text: pending.original,
+                            text: actualText,
                             isFinal: true,
                             confidence: response.confidence ?? 0.9,
                             language: detectedLanguage,
                             converted: wasConverted,
                             originalText: nil
                         )
-                        pendingTranscript.translation = pending.translation
+
+                        if let translation = actualTranslation {
+                            pendingTranscript.translation = translation
+                            print("   [+] 「\(actualText.prefix(20))」→「\(translation.prefix(25))」(pending)")
+                        } else {
+                            print("   [+] 「\(actualText.prefix(25))」(需重新翻譯)")
+                        }
+
                         transcriptSubject.send(pendingTranscript)
-                        print("   [+] 「\(pending.original.prefix(20))」→「\(pending.translation.prefix(25))」(pending)")
+
+                        // 如果沒有翻譯，觸發翻譯
+                        if actualTranslation == nil {
+                            Task {
+                                await self.translateAndSendFinal(actualText)
+                            }
+                        }
+                    }
+                }
+
+                // ⭐️ 檢查是否有增量未被覆蓋（confirmedSegments 有內容但沒有 pending）
+                if !confirmedSegments.isEmpty && pendingIncompleteSegment == nil {
+                    // 計算已發送的原文總長度
+                    let sentLength = confirmedSegments.reduce(0) { $0 + $1.original.count }
+                    if sentLength < transcriptText.count {
+                        // 有增量未被覆蓋，發送完整的 transcriptText 並重新翻譯
+                        let incrementalText = String(transcriptText.dropFirst(sentLength))
+                        print("⚠️ [VAD Commit] 發現未覆蓋增量:")
+                        print("   已發送: \(sentLength) 字")
+                        print("   實際: \(transcriptText.count) 字")
+                        print("   增量: \"\(incrementalText)\"")
+
+                        // 發送完整的 transcript（會在 ViewModel 中合併）
+                        var fullTranscript = TranscriptMessage(
+                            text: transcriptText,
+                            isFinal: true,
+                            confidence: response.confidence ?? 0.9,
+                            language: detectedLanguage,
+                            converted: wasConverted,
+                            originalText: nil
+                        )
+                        transcriptSubject.send(fullTranscript)
+
+                        // 觸發翻譯
+                        Task {
+                            await self.translateAndSendFinal(transcriptText)
+                        }
                     }
                 }
 
@@ -1806,6 +1925,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     // MARK: - 翻譯功能（備用，當智能翻譯失敗時使用）
 
     /// 調用後端翻譯 API（簡單版，不含分句）
+    /// ⭐️ 失敗重試：最多重試 2 次，每次間隔 300ms
     /// - Parameters:
     ///   - text: 要翻譯的原文
     ///   - targetLang: 目標語言
@@ -1826,26 +1946,47 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             "sourceLang": "auto"
         ]
 
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            let (data, _) = try await URLSession.shared.data(for: request)
+        // ⭐️ 重試機制：最多重試 2 次
+        let maxRetries = 2
 
-            struct TranslateResponse: Decodable {
-                let translatedText: String
+        for attempt in 0..<maxRetries {
+            do {
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let (data, _) = try await URLSession.shared.data(for: request)
+
+                struct TranslateResponse: Decodable {
+                    let translatedText: String
+                }
+
+                let response = try JSONDecoder().decode(TranslateResponse.self, from: data)
+                let translatedText = response.translatedText
+
+                // ⭐️ 檢查翻譯結果是否有效
+                guard !translatedText.isEmpty,
+                      !(translatedText.hasPrefix("[") && translatedText.hasSuffix("]")) else {
+                    throw TranslationError.emptyResult
+                }
+
+                await MainActor.run {
+                    // 發送翻譯結果
+                    translationSubject.send((text, translatedText))
+                    print("🌐 [翻譯] \(translatedText)")
+                }
+
+                // 成功，直接返回
+                return
+
+            } catch {
+                print("⚠️ [翻譯] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
+
+                // 如果不是最後一次嘗試，等待 300ms 再重試
+                if attempt < maxRetries - 1 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                }
             }
-
-            let response = try JSONDecoder().decode(TranslateResponse.self, from: data)
-            let translatedText = response.translatedText
-
-            await MainActor.run {
-                // 發送翻譯結果
-                translationSubject.send((text, translatedText))
-                print("🌐 [翻譯] \(translatedText)")
-            }
-
-        } catch {
-            print("❌ [ElevenLabs] 翻譯錯誤: \(error.localizedDescription)")
         }
+
+        print("❌ [翻譯] \(maxRetries) 次重試都失敗")
     }
 }
 
@@ -1861,6 +2002,7 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
             print("✅ [ElevenLabs] WebSocket 連接成功")
             self.connectionState = .connected
             self.sendErrorCount = 0  // 重置錯誤計數
+            self.reconnectAttempts = 0  // ⭐️ 連接成功，重置重連計數
             self.startPingTimer()
             self.startTranslationTimer()  // ⭐️ 啟動定時翻譯
         }
@@ -1874,14 +2016,37 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
     ) {
         Task { @MainActor in
             print("📱 [ElevenLabs] WebSocket 連接關閉 (code: \(closeCode.rawValue))")
-            self.connectionState = .disconnected
+
             // ⭐️ 清除 token 快取（single-use token 只能用一次）
             self.cachedToken = nil
             self.tokenExpireTime = nil
 
-            // ⭐️ 通知 ViewModel 連接已斷開（讓它可以停止錄音）
-            if closeCode != .normalClosure {
-                self.errorSubject.send("連接已斷開 (code: \(closeCode.rawValue))")
+            // ⭐️ 自動重連邏輯
+            if self.shouldAutoReconnect && self.reconnectAttempts < self.maxReconnectAttempts {
+                self.reconnectAttempts += 1
+                print("🔄 [ElevenLabs] 連接斷開，嘗試自動重連 (\(self.reconnectAttempts)/\(self.maxReconnectAttempts))...")
+
+                // ⭐️ 關鍵：設為 connecting 而不是 disconnected，UI 保持原狀態
+                self.connectionState = .connecting
+
+                // 延遲後重連
+                try? await Task.sleep(nanoseconds: UInt64(self.reconnectDelay * 1_000_000_000))
+
+                // 確認仍然需要重連
+                if self.shouldAutoReconnect && self.connectionState == .connecting {
+                    print("🔗 [ElevenLabs] 執行自動重連...")
+                    // 重新獲取 token 並連接
+                    await self.fetchTokenAndConnect(sourceLang: self.currentSourceLang ?? .zh)
+                }
+            } else if self.shouldAutoReconnect && self.reconnectAttempts >= self.maxReconnectAttempts {
+                print("❌ [ElevenLabs] 已達最大重連次數 (\(self.maxReconnectAttempts))，停止重連")
+                self.shouldAutoReconnect = false
+                self.connectionState = .disconnected  // ⭐️ 重連失敗才設為 disconnected
+                self.errorSubject.send("連接失敗，請重新開始")
+            } else {
+                // 用戶主動斷開，不重連
+                print("📱 [ElevenLabs] 用戶主動斷開，不自動重連")
+                self.connectionState = .disconnected  // ⭐️ 用戶主動斷開才設為 disconnected
             }
         }
     }
@@ -1894,11 +2059,21 @@ extension ElevenLabsSTTService: URLSessionWebSocketDelegate {
         Task { @MainActor in
             if let error {
                 print("❌ [ElevenLabs] URLSession 錯誤: \(error.localizedDescription)")
-                self.connectionState = .error(error.localizedDescription)
-                self.errorSubject.send(error.localizedDescription)
+
                 // ⭐️ 清除 token 快取（連接失敗後 token 可能已失效）
                 self.cachedToken = nil
                 self.tokenExpireTime = nil
+
+                // ⭐️ 關鍵：如果正在自動重連，不發送錯誤給 ViewModel（避免 UI 閃爍）
+                if self.shouldAutoReconnect && self.reconnectAttempts <= self.maxReconnectAttempts {
+                    print("🔄 [ElevenLabs] 自動重連中，忽略臨時錯誤（不通知 ViewModel）")
+                    // 不設置 connectionState，讓 didCloseWith 處理重連邏輯
+                    return
+                }
+
+                // 只有在非重連情況下才發送錯誤
+                self.connectionState = .error(error.localizedDescription)
+                self.errorSubject.send(error.localizedDescription)
             }
         }
     }

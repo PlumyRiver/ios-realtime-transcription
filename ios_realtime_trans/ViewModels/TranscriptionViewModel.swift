@@ -59,6 +59,9 @@ final class TranscriptionViewModel {
     var targetLang: Language = .en
     var status: ConnectionStatus = .disconnected
 
+    /// ⭐️ 額度不足對話框
+    var showCreditsExhaustedAlert: Bool = false
+
     var transcripts: [TranscriptMessage] = []
     var interimTranscript: TranscriptMessage?
 
@@ -186,16 +189,47 @@ final class TranscriptionViewModel {
         }
     }
 
-    // MARK: - VAD 設定
+    // MARK: - ElevenLabs VAD 設定
 
-    /// ⭐️ VAD 閾值（0.0 ~ 1.0）
+    /// ⭐️ ElevenLabs VAD 閾值（0.0 ~ 1.0）
     /// 越高越嚴格，需要更大聲音才會觸發語音識別
     var vadThreshold: Float = 0.3 {
         didSet {
             elevenLabsService.vadThreshold = vadThreshold
-            print("🎚️ [VAD] 閾值調整: \(vadThreshold)")
+            print("🎚️ [ElevenLabs VAD] 閾值調整: \(vadThreshold)")
         }
     }
+
+    // MARK: - 本地 VAD 設定（節省 STT 費用）
+    // ⭐️ 靜音時停止發送音頻，說話時自動恢復
+    // ⭐️ 偵測到說話時會發送 0.5 秒的前詞填充
+
+    /// 本地 VAD 開關（預設開啟，節省 STT 費用）
+    var isLocalVADEnabled: Bool = true {
+        didSet {
+            audioManager.isVADEnabled = isLocalVADEnabled
+            print("🎙️ [本地 VAD] \(isLocalVADEnabled ? "已啟用" : "已停用")")
+        }
+    }
+
+    /// 本地 VAD 音量閾值（0.0 ~ 1.0，建議 0.01 ~ 0.05）
+    var localVADVolumeThreshold: Float = 0.02 {
+        didSet {
+            audioManager.vadVolumeThreshold = localVADVolumeThreshold
+            print("🎚️ [本地 VAD] 音量閾值: \(localVADVolumeThreshold)")
+        }
+    }
+
+    /// 本地 VAD 靜音閾值（秒）- 靜音超過此時間暫停發送
+    var localVADSilenceThreshold: TimeInterval = 2.0 {
+        didSet {
+            audioManager.vadSilenceThreshold = localVADSilenceThreshold
+            print("🎚️ [本地 VAD] 靜音閾值: \(localVADSilenceThreshold)s")
+        }
+    }
+
+    /// 本地 VAD 當前狀態
+    private(set) var localVADState: VADState = .paused
 
     // MARK: - 音頻加速設定
 
@@ -205,7 +239,8 @@ final class TranscriptionViewModel {
 
     /// ⭐️ 是否啟用音頻加速（1.5x 速度，300ms 額外延遲）
     /// 注意：Apple STT 免費，不需要加速
-    var isAudioSpeedUpEnabled: Bool = false {
+    /// 預設開啟，節省 33% STT 成本
+    var isAudioSpeedUpEnabled: Bool = true {
         didSet {
             audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
 
@@ -293,6 +328,13 @@ final class TranscriptionViewModel {
     private let stableDialogDelay: TimeInterval = 1.2
     /// 最後一個 final 的文本（用於判斷是否為新句子）
     private var lastFinalText: String = ""
+
+    // MARK: - TTS 新對話檢測
+    /// ⭐️ 最後收到 transcript 的時間（用於判斷是否有新對話進來）
+    private var lastTranscriptTime: Date?
+    /// ⭐️ TTS 播放前檢查的時間窗口（秒）
+    /// 如果在這個時間內有新的 transcript，跳過 TTS 播放
+    private let ttsPrePlayCheckWindow: TimeInterval = 0.5
 
     // MARK: - TTS 保障機制
     /// ⭐️ 已播放的翻譯文本（用於防止重複播放）
@@ -412,6 +454,8 @@ final class TranscriptionViewModel {
         // 2. 翻譯模型同步到各 STT 服務
         elevenLabsService.translationProvider = translationProvider
         appleSTTService.translationProvider = translationProvider
+        // 3. 本地 VAD 同步到 AudioManager
+        audioManager.isVADEnabled = isLocalVADEnabled
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
@@ -438,6 +482,8 @@ final class TranscriptionViewModel {
     /// ⭐️ 結束通話（同步方法，立即更新 UI）
     @MainActor
     func endCall() {
+        // ⭐️ 強制重置 isProcessing，允許用戶重新連接
+        isProcessing = false
         // 立即設置狀態，UI 會立即切換
         status = .disconnected
         // 在背景執行清理
@@ -499,9 +545,16 @@ final class TranscriptionViewModel {
         await Task.yield()
 
         // ⭐️ 檢查用戶額度（至少需要 100 額度才能開始）
-        guard AuthService.shared.hasEnoughCredits(100) else {
-            status = .error("額度不足，請購買額度")
-            return
+        // Apple STT 免費，不需要檢查額度
+        if sttProvider != .apple {
+            guard AuthService.shared.hasEnoughCredits(100) else {
+                let currentCredits = AuthService.shared.currentUser?.slowCredits ?? 0
+                print("🚨 [ViewModel] 拒絕連線：額度不足（剩餘 \(currentCredits)）")
+                status = .disconnected
+                // ⭐️ 顯示額度不足對話框
+                showCreditsExhaustedAlert = true
+                return
+            }
         }
 
         // 請求麥克風權限
@@ -894,6 +947,23 @@ final class TranscriptionViewModel {
                 }
             }
             .store(in: &cancellables)
+
+        // ⭐️ 訂閱本地 VAD 狀態變化
+        audioManager.onVADStateChanged = { [weak self] state in
+            self?.localVADState = state
+        }
+
+        // ⭐️ 訂閱額度耗盡回調（自動停止錄音）
+        BillingService.shared.onCreditsExhausted = { [weak self] in
+            guard let self = self else { return }
+            print("🚨 [ViewModel] 額度耗盡，自動停止錄音")
+            // 先停止錄音
+            Task { @MainActor in
+                await self.toggleRecording()
+                // 停止後顯示對話框
+                self.showCreditsExhaustedAlert = true
+            }
+        }
     }
 
     /// 切換 STT 提供商（三選一循環）
@@ -908,11 +978,56 @@ final class TranscriptionViewModel {
         }
     }
 
+    /// ⭐️ 判斷新文本是否是舊文本的延續（用於合併對話框）
+    /// 返回 true 表示應該合併，false 表示應該創建新對話框
+    private func shouldMergeTexts(newText: String, lastText: String) -> Bool {
+        guard !lastText.isEmpty else { return false }
+
+        let newTextLower = newText.lowercased()
+        let lastTextLower = lastText.lowercased()
+
+        // 1. 新句子包含舊句子（完全包含）
+        if newTextLower.contains(lastTextLower) && newText.count > lastText.count {
+            return true
+        }
+        // 2. 新句子以舊句子為前綴（忽略大小寫）
+        if newTextLower.hasPrefix(lastTextLower) && newText.count > lastText.count {
+            return true
+        }
+        // 3. 高度重疊檢測（忽略大小寫）
+        if lastText.count >= 3 {
+            var commonPrefixLength = 0
+            let newChars = Array(newTextLower)
+            let lastChars = Array(lastTextLower)
+            for i in 0..<min(newChars.count, lastChars.count) {
+                if newChars[i] == lastChars[i] {
+                    commonPrefixLength += 1
+                } else {
+                    break
+                }
+            }
+
+            let overlapRatio = Float(commonPrefixLength) / Float(lastText.count)
+            if overlapRatio >= 0.5 && commonPrefixLength >= 3 {
+                return true
+            }
+        }
+
+        return false
+    }
+
     /// 處理轉錄結果
     private func handleTranscript(_ transcript: TranscriptMessage) {
+        // ⭐️ 記錄收到 transcript 的時間（用於 TTS 播放前檢查）
+        lastTranscriptTime = Date()
+
         if transcript.isFinal {
             // 最終結果：添加到列表末尾（最新的在下面）
             var finalTranscript = transcript
+
+            // ⭐️ 修復：合併時保留被移除 transcript 的翻譯
+            var removedTranslation: String? = nil
+            var removedTranslationSegments: [TranslationSegment]? = nil
 
             // ⭐️ 檢查新句子是否是上一句的「延續」（ElevenLabs 分段問題）
             // 例如：
@@ -923,87 +1038,64 @@ final class TranscriptionViewModel {
                 let newText = transcript.text
                 let lastText = lastTranscript.text
 
-                // ⭐️ 使用忽略大小寫的比較
-                let newTextLower = newText.lowercased()
-                let lastTextLower = lastText.lowercased()
-
-                var shouldReplace = false
-
-                // 1. 新句子包含舊句子（完全包含）
-                if newTextLower.contains(lastTextLower) && newText.count > lastText.count {
-                    print("🔄 [合併] 新句子包含上一句")
-                    shouldReplace = true
-                }
-                // 2. 新句子以舊句子為前綴（忽略大小寫）
-                else if newTextLower.hasPrefix(lastTextLower) && newText.count > lastText.count {
-                    print("🔄 [合併] 新句子以上一句為前綴")
-                    shouldReplace = true
-                }
-                // 3. 高度重疊檢測（忽略大小寫）
-                else if lastText.count >= 3 {
-                    // 找出最長的共同前綴（忽略大小寫）
-                    var commonPrefixLength = 0
-                    let newChars = Array(newTextLower)
-                    let lastChars = Array(lastTextLower)
-                    for i in 0..<min(newChars.count, lastChars.count) {
-                        if newChars[i] == lastChars[i] {
-                            commonPrefixLength += 1
-                        } else {
-                            break
-                        }
-                    }
-
-                    // 如果共同前綴佔上一句的 50% 以上，視為同一句話的延續
-                    let overlapRatio = Float(commonPrefixLength) / Float(lastText.count)
-                    if overlapRatio >= 0.5 && commonPrefixLength >= 3 {
-                        print("🔄 [合併] 新句子與上一句重疊 \(Int(overlapRatio * 100))%")
-                        shouldReplace = true
-                    }
-                }
-
-                if shouldReplace {
+                if shouldMergeTexts(newText: newText, lastText: lastText) {
+                    print("🔄 [Final 合併] 新句子是上一句的延續")
                     print("   舊: \"\(lastText.prefix(30))...\"")
                     print("   新: \"\(newText.prefix(40))...\"")
+
+                    // ⭐️ 取消舊對話的 TTS（只播放合併後對話的翻譯）
+                    cancelTTSForMergedDialog(oldText: lastText)
+
+                    // ⭐️ 修復：在移除前保留翻譯（避免翻譯丟失）
+                    removedTranslation = lastTranscript.translation
+                    removedTranslationSegments = lastTranscript.translationSegments
+
                     // ⭐️ 替換而不是刪除：更新最後一個 transcript
                     transcripts.removeLast()
-                    // ⭐️ 對話框被合併，重置穩定計時器
-                    // 注意：不清除 pendingTTS！保留翻譯內容，讓新翻譯來替換
-                    // 這樣即使新翻譯沒來，舊翻譯也能播放
-                    if pendingTTS != nil {
-                        print("🔄 [TTS] 對話框合併，重置計時器（保留待播放內容）")
-                        stableDialogTimer?.invalidate()
-                        // ⭐️ 重新開始計時，等待新翻譯或穩定
-                        stableDialogTimer = Timer.scheduledTimer(withTimeInterval: stableDialogDelay, repeats: false) { [weak self] _ in
-                            self?.flushPendingTTS()
-                        }
-                    }
                 }
             }
 
             // ⭐️ 記錄最後一個 final 的文本（用於判斷新句子）
             lastFinalText = transcript.text
 
-            // ⭐️ TTS 保障機制：從 interim 保留翻譯並觸發 TTS
+            // ⭐️ TTS 保障機制：從 interim 或被移除的 transcript 保留翻譯並觸發 TTS
             // 問題：翻譯可能在 transcript 還是 interim 時就到了，此時 matchedFinal=false 不會觸發 TTS
             // 當 interim 變成 final 時，翻譯不會再發送，導致 TTS 遺漏
             // 解決：在這裡檢查並補播
+
+            // ⭐️ 修復：優先使用 interim 翻譯，其次使用被移除 transcript 的翻譯，最後使用 transcript 自帶的翻譯
+            let preservedTranslation: String?
+            let preservedTranslationSegments: [TranslationSegment]?
+
             if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
-                finalTranscript.translation = interimTranslation
-                print("✅ [Final] 保留 interim 翻譯: \"\(interimTranslation.prefix(30))...\"")
+                preservedTranslation = interimTranslation
+                preservedTranslationSegments = interimTranscript?.translationSegments
+            } else if let removed = removedTranslation, !removed.isEmpty {
+                preservedTranslation = removed
+                preservedTranslationSegments = removedTranslationSegments
+            } else {
+                preservedTranslation = transcript.translation
+                preservedTranslationSegments = transcript.translationSegments
+            }
+
+            if let translation = preservedTranslation, !translation.isEmpty {
+                finalTranscript.translation = translation
+                finalTranscript.translationSegments = preservedTranslationSegments
+                print("✅ [Final] 保留翻譯: \"\(translation.prefix(30))...\"")
 
                 // ⭐️ TTS 保障：檢查這個翻譯是否已經在等待播放
-                let normalizedTranslation = normalizeTextForComparison(interimTranslation)
+                let normalizedTranslation = normalizeTextForComparison(translation)
                 let isAlreadyPending = pendingTTS != nil && normalizeTextForComparison(pendingTTS!.text) == normalizedTranslation
                 let isAlreadyQueued = ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedTranslation })
                 let isAlreadyPlayed = playedTranslations.contains(normalizedTranslation)
 
                 if !isAlreadyPending && !isAlreadyQueued && !isAlreadyPlayed {
                     // ⭐️ 翻譯還沒觸發過 TTS，現在補播
-                    let detectedLanguage = interimTranscript?.language
+                    let detectedLanguage = interimTranscript?.language ?? finalTranscript.language
                     if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
                         let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
-                        print("🔧 [TTS 保障] 從 interim 補播翻譯: \"\(interimTranslation.prefix(25))...\"")
-                        enqueueTTS(text: interimTranslation, languageCode: targetLangCode)
+                        print("🔧 [TTS 保障] 補播翻譯: \"\(translation.prefix(25))...\"")
+                        enqueueTTS(text: translation, languageCode: targetLangCode)
                     }
                 } else {
                     print("ℹ️ [TTS] 翻譯已在處理中: pending=\(isAlreadyPending), queued=\(isAlreadyQueued), played=\(isAlreadyPlayed)")
@@ -1021,6 +1113,57 @@ final class TranscriptionViewModel {
             // ⭐️ 中間結果：檢查是否為新的語句
             // 注意：ElevenLabs 使用 VAD 自動 commit，不需要 Pseudo-Final 機制
             // Chirp3 可能需要，因為有時 final 結果會丟失
+
+            // ⭐️ 關鍵改進：預先檢查是否能與 transcripts.last 合併
+            // 避免新泡泡閃現後又合併消失的問題
+            if let lastTranscript = transcripts.last,
+               shouldMergeTexts(newText: transcript.text, lastText: lastTranscript.text) {
+                // ⭐️ 直接更新 transcripts.last，不創建新的 interimTranscript
+                print("🔄 [Interim→合併] 直接更新上一個對話框")
+                print("   舊: \"\(lastTranscript.text.prefix(30))...\"")
+                print("   新: \"\(transcript.text.prefix(40))...\"")
+
+                // 取消舊對話的 TTS
+                cancelTTSForMergedDialog(oldText: lastTranscript.text)
+
+                // ⭐️ 修復：合併翻譯時優先使用 interimTranscript 的翻譯（可能更新）
+                // 避免 interimTranscript 有翻譯但 lastTranscript 沒有的情況導致翻譯丟失
+                let mergedTranslation: String?
+                let mergedTranslationSegments: [TranslationSegment]?
+
+                if let interimTrans = interimTranscript?.translation, !interimTrans.isEmpty {
+                    // 優先使用 interim 的翻譯（通常更新）
+                    mergedTranslation = interimTrans
+                    mergedTranslationSegments = interimTranscript?.translationSegments
+                } else {
+                    // 否則保留 lastTranscript 的翻譯
+                    mergedTranslation = lastTranscript.translation
+                    mergedTranslationSegments = lastTranscript.translationSegments
+                }
+
+                // ⭐️ 創建新的 TranscriptMessage（保留原有 ID 和翻譯）
+                let updatedTranscript = TranscriptMessage(
+                    id: lastTranscript.id,  // 保留原有 ID（避免 UI 閃爍）
+                    text: transcript.text,  // 使用新文本
+                    isFinal: lastTranscript.isFinal,  // 保持 final 狀態
+                    confidence: transcript.confidence,  // 使用新的信心度
+                    language: transcript.language ?? lastTranscript.language,  // 優先使用新語言
+                    converted: lastTranscript.converted,
+                    originalText: lastTranscript.originalText,
+                    speakerTag: lastTranscript.speakerTag,
+                    timestamp: lastTranscript.timestamp,  // 保留原有時間戳
+                    translation: mergedTranslation,  // ⭐️ 使用合併後的翻譯
+                    translationSegments: mergedTranslationSegments
+                )
+                transcripts[transcripts.count - 1] = updatedTranscript
+
+                // ⭐️ 記錄為最後的 final 文本（這樣後續 interim 能正確判斷）
+                lastFinalText = transcript.text
+
+                // ⭐️ 清除 interimTranscript（避免顯示重複泡泡）
+                interimTranscript = nil
+                return
+            }
 
             // ⭐️ 檢測是否為新句子開始（與上一個 final 不同）
             // 如果是新句子，立即播放上一個對話框的 TTS
@@ -1068,11 +1211,55 @@ final class TranscriptionViewModel {
                 }
             }
 
-            // ⭐️ 更新 interim，但保留舊的翻譯（避免翻譯閃現後消失）
-            let oldTranslation = interimTranscript?.translation
-            interimTranscript = transcript
-            if let translation = oldTranslation, !translation.isEmpty {
-                interimTranscript?.translation = translation
+            // ⭐️ 更新 interim，但保留舊的 ID 和翻譯（避免 UI 閃爍和翻譯消失）
+            if let oldInterim = interimTranscript {
+                // ⭐️ 檢查新 interim 是否是舊 interim 的延續
+                if shouldMergeTexts(newText: transcript.text, lastText: oldInterim.text) {
+                    // 是延續：保留舊 ID，只更新文本和其他屬性
+                    print("🔄 [Interim→Interim 合併] 保留舊 ID，更新內容")
+                    print("   舊: \"\(oldInterim.text.prefix(30))...\"")
+                    print("   新: \"\(transcript.text.prefix(40))...\"")
+
+                    interimTranscript = TranscriptMessage(
+                        id: oldInterim.id,  // ⭐️ 保留舊 ID，避免 UI 閃爍
+                        text: transcript.text,
+                        isFinal: false,
+                        confidence: transcript.confidence,
+                        language: transcript.language ?? oldInterim.language,
+                        converted: transcript.converted,
+                        originalText: transcript.originalText,
+                        speakerTag: transcript.speakerTag,
+                        timestamp: oldInterim.timestamp,  // 保留舊時間戳
+                        translation: oldInterim.translation,  // 保留舊翻譯
+                        translationSegments: oldInterim.translationSegments
+                    )
+                } else {
+                    // 是新句子：使用新的 transcript（新 ID）
+                    // ⭐️ 修復：為避免翻譯閃爍，在設置之前就構建好完整的對象
+                    // 不要分兩步（先設置 transcript，再設置 translation），這會導致中間狀態
+                    if let oldTranslation = oldInterim.translation, !oldTranslation.isEmpty {
+                        // 有舊翻譯：創建新對象時就包含翻譯（避免閃爍）
+                        interimTranscript = TranscriptMessage(
+                            id: transcript.id,
+                            text: transcript.text,
+                            isFinal: transcript.isFinal,
+                            confidence: transcript.confidence,
+                            language: transcript.language,
+                            converted: transcript.converted,
+                            originalText: transcript.originalText,
+                            speakerTag: transcript.speakerTag,
+                            timestamp: transcript.timestamp,
+                            translation: oldTranslation,  // ⭐️ 保留舊翻譯
+                            translationSegments: oldInterim.translationSegments
+                        )
+                    } else {
+                        // 沒有舊翻譯：直接設置
+                        interimTranscript = transcript
+                    }
+                }
+            } else {
+                // 沒有舊 interim，直接設置
+                interimTranscript = transcript
             }
         }
     }
@@ -1701,6 +1888,49 @@ final class TranscriptionViewModel {
         }
     }
 
+    /// ⭐️ 對話框合併時取消舊對話的 TTS
+    /// 只播放合併後對話的翻譯，避免播放不完整的舊翻譯
+    private func cancelTTSForMergedDialog(oldText: String) {
+        print("🔄 [TTS] 對話框合併，取消舊對話 TTS")
+
+        // 1. 取消 pendingTTS
+        if pendingTTS != nil {
+            print("   取消 pendingTTS: \"\(pendingTTS!.text.prefix(25))...\"")
+            stableDialogTimer?.invalidate()
+            stableDialogTimer = nil
+            pendingTTS = nil
+        }
+
+        // 2. 從 TTS 隊列中移除（通常隊列中的翻譯與被合併的對話相關）
+        if !ttsQueue.isEmpty {
+            let removedCount = ttsQueue.count
+            ttsQueue.removeAll()
+            print("   清空 TTS 隊列（\(removedCount) 項）")
+        }
+
+        // 3. 停止當前正在播放的 TTS（可能是舊對話的翻譯）
+        if isPlayingTTS {
+            print("   停止當前播放的 TTS")
+            switch ttsProvider {
+            case .azure:
+                audioManager.stopTTS()
+            case .apple:
+                appleTTSService.stop()
+                isAppleTTSPlaying = false
+                appleTTSCurrentText = nil
+            }
+            isProcessingTTS = false
+            currentSynthesizingText = nil
+        }
+
+        // 4. 從已播放記錄中移除（允許新翻譯播放）
+        // 不清除整個 playedTranslations，只移除可能與舊對話相關的
+        // 實際上我們應該讓合併後的新翻譯能夠播放
+        // 所以不需要額外處理
+
+        print("   等待合併後對話的新翻譯")
+    }
+
     /// ⭐️ 立即播放待播放的 TTS（穩定計時器觸發、新句子開始、或停止錄音）
     private func flushPendingTTS() {
         print("🔔 [TTS 穩定] flushPendingTTS 被調用")
@@ -1784,6 +2014,25 @@ final class TranscriptionViewModel {
         isProcessingTTS = true
         let item = ttsQueue.removeFirst()
 
+        // ⭐️ 檢查是否有新的 transcript 進來（用戶還在說話）
+        // 如果最近有新對話，跳過這個 TTS，讓新的翻譯取代
+        if let lastTime = lastTranscriptTime {
+            let timeSinceLastTranscript = Date().timeIntervalSince(lastTime)
+            if timeSinceLastTranscript < ttsPrePlayCheckWindow {
+                print("⏭️ [TTS] 跳過播放（\(String(format: "%.2f", timeSinceLastTranscript))s 前有新對話）: \"\(item.text.prefix(25))...\"")
+                // 繼續處理隊列中的下一個（可能也會被跳過）
+                processNextTTS()
+                return
+            }
+        }
+
+        // ⭐️ 檢查是否有待處理的新翻譯（pendingTTS 比當前隊列項目更新）
+        if pendingTTS != nil {
+            print("⏭️ [TTS] 跳過播放（有新的待播放翻譯）: \"\(item.text.prefix(25))...\"")
+            processNextTTS()
+            return
+        }
+
         // ⭐️ 記錄當前正在合成的文本（用於去重）
         currentSynthesizingText = item.text
 
@@ -1800,6 +2049,24 @@ final class TranscriptionViewModel {
                         text: item.text,
                         languageCode: item.lang
                     )
+
+                    // ⭐️ 合成完成後再次檢查是否應該播放
+                    // 可能在合成期間有新的 transcript 進來
+                    if let lastTime = lastTranscriptTime {
+                        let timeSinceLastTranscript = Date().timeIntervalSince(lastTime)
+                        if timeSinceLastTranscript < ttsPrePlayCheckWindow {
+                            print("⏭️ [Azure TTS] 合成完成但跳過播放（\(String(format: "%.2f", timeSinceLastTranscript))s 前有新對話）")
+                            currentSynthesizingText = nil
+                            processNextTTS()
+                            return
+                        }
+                    }
+                    if pendingTTS != nil {
+                        print("⏭️ [Azure TTS] 合成完成但跳過播放（有新的待播放翻譯）")
+                        currentSynthesizingText = nil
+                        processNextTTS()
+                        return
+                    }
 
                     // ⭐️ 使用 AudioManager 播放（同一 Engine，AEC 啟用）
                     try audioManager.playTTS(audioData: audioData, text: item.text)
@@ -1893,6 +2160,34 @@ final class TranscriptionViewModel {
             appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
         }
         // 不清空隊列，繼續播放下一個
+        processNextTTS()
+    }
+
+    /// ⭐️ 立即播放指定的 TTS（中斷當前播放，清空隊列）
+    /// 用於用戶手動點擊對話框的播放按鈕
+    func playTTSImmediately(text: String, languageCode: String) {
+        print("▶️ [TTS] 立即播放（中斷當前）: \"\(text.prefix(30))...\"")
+
+        // 1. 停止當前播放
+        switch ttsProvider {
+        case .azure:
+            audioManager.stopTTS()
+        case .apple:
+            appleTTSService.stop()
+            isAppleTTSPlaying = false
+            appleTTSCurrentText = nil
+        }
+
+        // 2. 清空隊列和 pending
+        ttsQueue.removeAll()
+        stableDialogTimer?.invalidate()
+        stableDialogTimer = nil
+        pendingTTS = nil
+        isProcessingTTS = false
+        currentSynthesizingText = nil
+
+        // 3. 直接加入隊列並開始播放
+        ttsQueue.append((text: text, lang: languageCode))
         processNextTTS()
     }
 

@@ -41,6 +41,17 @@ enum WebRTCRecordingState: Equatable {
     }
 }
 
+// MARK: - VAD State（語音活動偵測狀態）
+
+enum VADState: String {
+    /// 偵測到說話中，正在發送音頻
+    case speaking
+    /// 偵測到靜音，但還沒超過閾值，繼續發送
+    case silent
+    /// 靜音超過閾值（2秒），暫停發送（不計費）
+    case paused
+}
+
 // MARK: - Recording Error
 
 enum WebRTCRecordingError: Error, LocalizedError {
@@ -208,6 +219,51 @@ final class WebRTCAudioManager: NSObject {
 
     /// ⭐️ 是否正在發送尾音緩衝
     private(set) var isTrailingBuffer: Bool = false
+
+    // MARK: - VAD 系統（語音活動偵測）
+    // ⭐️ 節省 STT 費用：靜音時停止發送音頻
+
+    /// VAD 開關（預設關閉，由 ViewModel 控制）
+    var isVADEnabled: Bool = false {
+        didSet {
+            if isVADEnabled {
+                print("🎙️ [VAD] 已啟用（靜音 \(vadSilenceThreshold)s 後暫停發送）")
+            } else {
+                print("🎙️ [VAD] 已停用")
+                // 停用時重置狀態
+                vadState = .speaking
+            }
+        }
+    }
+
+    /// VAD 當前狀態
+    private(set) var vadState: VADState = .paused
+
+    /// VAD 音量閾值（RMS，0.0 ~ 1.0）
+    /// 低於此值視為靜音，建議範圍 0.01 ~ 0.05
+    var vadVolumeThreshold: Float = 0.02
+
+    /// VAD 靜音閾值（秒）- 靜音超過此時間暫停發送
+    var vadSilenceThreshold: TimeInterval = 2.0
+
+    /// VAD 前詞填充時間（秒）- 偵測到說話時發送之前緩衝的音頻
+    var vadPreBufferDuration: TimeInterval = 0.5
+
+    /// 靜音開始時間
+    private var silenceStartTime: Date?
+
+    /// Pre-buffer 環形緩衝區（持續保存最近 0.5 秒的音頻）
+    /// 使用 (data, timestamp) 元組來追蹤每個塊的時間
+    private var preBuffer: [(data: Data, timestamp: Date)] = []
+
+    /// Pre-buffer 最大位元組數
+    /// 16kHz * 2 bytes * 0.5 秒 = 16000 bytes
+    private var preBufferMaxBytes: Int {
+        Int(16000.0 * 2.0 * vadPreBufferDuration)
+    }
+
+    /// VAD 狀態變化回調（用於 UI 更新）
+    var onVADStateChanged: ((VADState) -> Void)?
 
     // MARK: - Combine Publishers
 
@@ -410,8 +466,14 @@ final class WebRTCAudioManager: NSObject {
         // 啟動緩衝區定時器
         startBufferTimer()
 
+        // ⭐️ 重置 VAD 狀態
+        resetVADState()
+
         recordingState = .recording
         print("🎙️ [WebRTC] 開始錄音（AudioEngine 模式）")
+        if isVADEnabled {
+            print("   VAD: 啟用（閾值: \(vadVolumeThreshold), 靜音: \(vadSilenceThreshold)s）")
+        }
     }
 
     /// 停止錄音
@@ -461,7 +523,126 @@ final class WebRTCAudioManager: NSObject {
         updateVolume(rms)
 
         guard let data = convertToWebSocketFormat(buffer) else { return }
-        audioBufferCollector.append(data)
+
+        // ⭐️ VAD 處理：根據音量判斷語音活動
+        if isVADEnabled && !isManualSendingPaused {
+            updateVADState(rms: rms, audioData: data)
+        } else {
+            // VAD 未啟用，直接加入緩衝區
+            audioBufferCollector.append(data)
+        }
+    }
+
+    // MARK: - VAD Processing
+
+    /// 更新 VAD 狀態
+    /// - Parameters:
+    ///   - rms: 當前 RMS 音量
+    ///   - audioData: 當前音頻數據
+    private func updateVADState(rms: Float, audioData: Data) {
+        let isSpeaking = rms >= vadVolumeThreshold
+        let previousState = vadState
+
+        if isSpeaking {
+            // ⭐️ 偵測到說話
+            silenceStartTime = nil
+
+            if vadState == .paused {
+                // 從暫停恢復：先發送 pre-buffer（前詞填充）
+                let preBufferData = getPreBufferData()
+                let preBufferMs = Int(preBufferDuration * 1000)
+                print("🎤 [VAD] 偵測到說話，發送 \(preBufferData.count) 個前詞填充（\(preBufferMs)ms）")
+                vadState = .speaking
+
+                // ⭐️ 通知計費系統開始計費
+                BillingService.shared.startAudioSending()
+
+                // 發送 pre-buffer
+                for preData in preBufferData {
+                    audioBufferCollector.append(preData)
+                }
+                preBuffer.removeAll()
+            } else {
+                vadState = .speaking
+            }
+
+            // 加入當前音頻
+            audioBufferCollector.append(audioData)
+
+        } else {
+            // ⭐️ 偵測到靜音
+            if silenceStartTime == nil {
+                silenceStartTime = Date()
+            }
+
+            let silenceDuration = Date().timeIntervalSince(silenceStartTime!)
+
+            if silenceDuration >= vadSilenceThreshold {
+                // 靜音超過閾值，暫停發送
+                if vadState != .paused {
+                    print("🔇 [VAD] 靜音 \(String(format: "%.1f", silenceDuration))s，暫停發送")
+                    vadState = .paused
+
+                    // ⭐️ 發送剩餘緩衝區和尾音
+                    flushRemainingAudio()
+                    sendTrailingSilence()
+                    onEndUtterance?()
+
+                    // ⭐️ 通知計費系統停止計費
+                    BillingService.shared.stopAudioSending()
+                }
+
+                // 暫停狀態：只保存到 pre-buffer（不發送）
+                addToPreBuffer(audioData)
+
+            } else {
+                // 靜音但還沒超過閾值，繼續發送
+                vadState = .silent
+                audioBufferCollector.append(audioData)
+            }
+        }
+
+        // 狀態變化回調
+        if previousState != vadState {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.onVADStateChanged?(self.vadState)
+            }
+        }
+    }
+
+    /// 加入 Pre-buffer（環形緩衝區）
+    /// 基於位元組數而非數量，確保精確的時間長度
+    private func addToPreBuffer(_ data: Data) {
+        preBuffer.append((data: data, timestamp: Date()))
+
+        // 保持緩衝區大小不超過最大位元組數
+        var totalBytes = preBuffer.reduce(0) { $0 + $1.data.count }
+        while totalBytes > preBufferMaxBytes && preBuffer.count > 1 {
+            totalBytes -= preBuffer.removeFirst().data.count
+        }
+    }
+
+    /// 獲取 pre-buffer 中的所有音頻數據
+    private func getPreBufferData() -> [Data] {
+        preBuffer.map { $0.data }
+    }
+
+    /// Pre-buffer 當前總位元組數
+    private var preBufferTotalBytes: Int {
+        preBuffer.reduce(0) { $0 + $1.data.count }
+    }
+
+    /// Pre-buffer 當前時長（秒）
+    private var preBufferDuration: TimeInterval {
+        Double(preBufferTotalBytes) / (16000.0 * 2.0)
+    }
+
+    /// 重置 VAD 狀態（開始錄音時調用）
+    private func resetVADState() {
+        vadState = isVADEnabled ? .paused : .speaking
+        silenceStartTime = nil
+        preBuffer.removeAll()
     }
 
     /// ⭐️ 放大輸入音頻緩衝區（in-place 修改）
@@ -606,18 +787,32 @@ final class WebRTCAudioManager: NSObject {
         isTrailingBuffer = false
 
         isManualSendingPaused = false
-        print("🎙️ [WebRTC] 開始發送音頻")
 
-        // ⭐️ 通知 BillingService 開始計費
-        BillingService.shared.startAudioSending()
+        if isVADEnabled {
+            // ⭐️ VAD 模式：從 paused 開始，等偵測到說話再發送
+            // 計費會在 updateVADState() 中偵測到說話時開始
+            print("🎙️ [WebRTC] 開始監聽（VAD 模式，等待偵測說話）")
+        } else {
+            // ⭐️ 非 VAD 模式：立即開始發送和計費
+            print("🎙️ [WebRTC] 開始發送音頻")
+            BillingService.shared.startAudioSending()
 
-        if !audioBufferCollector.isEmpty {
-            print("📦 [WebRTC] 立即發送緩衝: \(audioBufferCollector.count) 個片段")
-            flushBuffer()
+            if !audioBufferCollector.isEmpty {
+                print("📦 [WebRTC] 立即發送緩衝: \(audioBufferCollector.count) 個片段")
+                flushBuffer()
+            }
         }
     }
 
     func stopSending() {
+        if isVADEnabled && vadState == .paused {
+            // ⭐️ VAD 模式且目前是 paused：直接停止，不需要尾音緩衝
+            isManualSendingPaused = true
+            preBuffer.removeAll()
+            print("⏸️ [WebRTC] 停止監聽（VAD 模式，目前已是暫停狀態）")
+            return
+        }
+
         // ⭐️ 開始尾音緩衝：繼續發送 0.5 秒的音頻
         isTrailingBuffer = true
         print("🔊 [WebRTC] 開始 \(pttTrailingDuration) 秒尾音緩衝")
@@ -637,8 +832,10 @@ final class WebRTCAudioManager: NSObject {
         sendTrailingSilence()
         onEndUtterance?()
 
-        // ⭐️ 通知 BillingService 停止計費
-        BillingService.shared.stopAudioSending()
+        // ⭐️ 通知 BillingService 停止計費（只有非 VAD 模式或 VAD 正在發送時）
+        if !isVADEnabled || vadState != .paused {
+            BillingService.shared.stopAudioSending()
+        }
 
         isManualSendingPaused = true
         print("⏸️ [WebRTC] 停止發送音頻（尾音緩衝結束）")

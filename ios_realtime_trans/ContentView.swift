@@ -43,8 +43,8 @@ struct ContentView: View {
                                     sourceLang: viewModel.sourceLang,
                                     targetLang: viewModel.targetLang,
                                     onPlayTTS: { text, langCode in
-                                        // ⭐️ 使用統一的 AudioManager 播放（啟用 AEC）
-                                        viewModel.enqueueTTS(text: text, languageCode: langCode)
+                                        // ⭐️ 中斷當前 TTS，立即播放指定對話的翻譯
+                                        viewModel.playTTSImmediately(text: text, languageCode: langCode)
                                     },
                                     onStopTTS: {
                                         // ⭐️ 停止當前播放，繼續播放下一個
@@ -62,7 +62,8 @@ struct ContentView: View {
                                     sourceLang: viewModel.sourceLang,
                                     targetLang: viewModel.targetLang,
                                     onPlayTTS: { text, langCode in
-                                        viewModel.enqueueTTS(text: text, languageCode: langCode)
+                                        // ⭐️ 中斷當前 TTS，立即播放指定對話的翻譯
+                                        viewModel.playTTSImmediately(text: text, languageCode: langCode)
                                     },
                                     onStopTTS: {
                                         viewModel.skipCurrentTTS()
@@ -180,6 +181,15 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView(viewModel: viewModel)
             }
+            // ⭐️ 額度不足對話框
+            .alert("額度已使用完畢", isPresented: $viewModel.showCreditsExhaustedAlert) {
+                Button("購買額度") {
+                    showSettings = true
+                }
+                Button("取消", role: .cancel) { }
+            } message: {
+                Text("請購買額度以繼續使用語音翻譯服務")
+            }
             // ⭐️ App 出現時預取 ElevenLabs token（只執行一次）
             .onAppear {
                 if !hasPreFetchedToken {
@@ -272,7 +282,7 @@ struct ConversationBubbleView: View {
         HStack(alignment: .center, spacing: 8) {
             // 左邊留空（來源語言在右側）
             if isSourceLanguage {
-                Spacer(minLength: 60)
+                Spacer()
             }
 
             // 控制按鈕（左側，僅來源語言/右邊氣泡顯示）
@@ -295,10 +305,15 @@ struct ConversationBubbleView: View {
 
             // 右邊留空（目標語言在左側）
             if !isSourceLanguage {
-                Spacer(minLength: 60)
+                Spacer()
             }
         }
         // ⭐️ 不再使用透明度區分 interim/final，讓所有氣泡看起來一樣
+    }
+
+    /// ⭐️ 對話框固定寬度（螢幕寬度的 70%）
+    private var bubbleFixedWidth: CGFloat {
+        UIScreen.main.bounds.width * 0.70
     }
 
     /// 氣泡內容
@@ -308,12 +323,17 @@ struct ConversationBubbleView: View {
             Text(transcript.text)
                 .font(.body)
                 .foregroundStyle(textColor)
+                .fixedSize(horizontal: false, vertical: true)  // ⭐️ 允許垂直擴展，水平固定
 
             // 翻譯（較小字體）
-            if let translation = transcript.translation {
+            // ⭐️ 關鍵：使用固定容器避免新舊翻譯切換時的空白閃爍
+            if let translation = transcript.translation, !translation.isEmpty {
                 Text(translation)
                     .font(.subheadline)
                     .foregroundStyle(secondaryTextColor)
+                    .fixedSize(horizontal: false, vertical: true)  // ⭐️ 允許垂直擴展
+                    .id("translation-\(transcript.id)")  // ⭐️ 保持視圖身份穩定
+                    .transition(.identity)  // ⭐️ 無過渡動畫，直接替換
             }
 
             // 元數據行（⭐️ 簡化：不顯示 TypingIndicator，interim 和 final 看起來完全一樣）
@@ -333,8 +353,11 @@ struct ConversationBubbleView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+        .frame(width: bubbleFixedWidth, alignment: .leading)  // ⭐️ 固定寬度
         .background(bubbleColor)
         .cornerRadius(18)
+        // ⭐️ 禁用翻譯更新時的動畫，避免空白閃爍
+        .animation(nil, value: transcript.translation)
     }
 
     /// 摺疊後的指示器
@@ -1507,6 +1530,26 @@ struct SettingsView: View {
     @State private var showPurchaseSheet = false
     @State private var authService = AuthService.shared
 
+    // MARK: - VAD 狀態顯示
+
+    /// VAD 狀態文字
+    private var vadStateText: String {
+        switch viewModel.localVADState {
+        case .speaking: return "說話中"
+        case .silent: return "靜音中"
+        case .paused: return "已暫停"
+        }
+    }
+
+    /// VAD 狀態顏色
+    private var vadStateColor: Color {
+        switch viewModel.localVADState {
+        case .speaking: return .green
+        case .silent: return .orange
+        case .paused: return .gray
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -1755,6 +1798,34 @@ struct SettingsView: View {
                             }
                         }
                         .tint(.green)
+                    }
+
+                    // 🎙️ 本地 VAD 選項（僅非 Apple STT 顯示）
+                    if viewModel.shouldShowSpeedUpOption {
+                        Toggle(isOn: $viewModel.isLocalVADEnabled) {
+                            HStack {
+                                Image(systemName: viewModel.isLocalVADEnabled ? "waveform.circle.fill" : "waveform.circle")
+                                    .foregroundStyle(viewModel.isLocalVADEnabled ? .blue : .secondary)
+                                VStack(alignment: .leading) {
+                                    HStack {
+                                        Text("靜音偵測")
+                                        if viewModel.isLocalVADEnabled {
+                                            Text(vadStateText)
+                                                .font(.caption2)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(vadStateColor.opacity(0.2))
+                                                .foregroundStyle(vadStateColor)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                    Text("靜音 2 秒後暫停發送，節省 STT 費用")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.blue)
                     }
                 }
 
@@ -2198,7 +2269,15 @@ struct CreditsToolbarView: View {
     @State private var showPurchaseSheet = false
 
     private var authService: AuthService { AuthService.shared }
-    private var billingService: BillingService { BillingService.shared }
+    // ⭐️ 使用 @Bindable 監聽 BillingService 變化（斷開連結後也能顯示消耗）
+    @Bindable private var billingService = BillingService.shared
+
+    /// ⭐️ 格式化額度（完整數字，千位分隔符）
+    private func formatUsageCredits(_ credits: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: credits)) ?? "\(credits)"
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -2207,9 +2286,10 @@ struct CreditsToolbarView: View {
                 Image(systemName: "dollarsign.circle.fill")
                     .foregroundStyle(.green)
                     .font(.system(size: 14))
-                Text("\(authService.currentUser?.slowCredits ?? 0)")
+                Text("\(formatUsageCredits(authService.currentUser?.slowCredits ?? 0))")
                     .font(.system(size: 15, weight: .semibold))
             }
+            .fixedSize()  // ⭐️ 防止被壓縮
 
             // 購買額度按鈕（通話中隱藏）
             if !isRecording {
@@ -2240,8 +2320,8 @@ struct CreditsToolbarView: View {
                 }
             }
 
-            // ⭐️ 本次消耗額度（可點擊查看明細）
-            if billingService.sessionTotalCreditsUsed > 0 {
+            // ⭐️ 本次消耗額度（只在通話中顯示）
+            if isRecording && billingService.sessionTotalCreditsUsed > 0 {
                 Button {
                     showUsageDetail = true
                 } label: {
@@ -2249,7 +2329,7 @@ struct CreditsToolbarView: View {
                         Image(systemName: "flame.fill")
                             .foregroundStyle(.orange)
                             .font(.system(size: 12))
-                        Text("-\(billingService.sessionTotalCreditsUsed)")
+                        Text("-\(formatUsageCredits(billingService.sessionTotalCreditsUsed))")
                             .font(.system(size: 14, weight: .bold))
                             .foregroundStyle(.orange)
                     }
@@ -2261,6 +2341,8 @@ struct CreditsToolbarView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .fixedSize()  // ⭐️ 防止被壓縮折疊
+                .layoutPriority(1)  // ⭐️ 通話中優先顯示消耗額度
                 .popover(isPresented: $showUsageDetail, arrowEdge: .top) {
                     UsageDetailPopover(billingService: billingService)
                 }
