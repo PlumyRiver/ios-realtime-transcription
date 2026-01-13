@@ -34,6 +34,10 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
     private var sourceLang: Language = .zh
     private var targetLang: Language = .en
 
+    /// ⭐️ 經濟模式：單語言模式
+    private(set) var isSingleLanguageMode: Bool = false
+    private(set) var currentActiveLanguage: Language = .zh
+
     /// 連接狀態
     private(set) var connectionState: WebSocketConnectionState = .disconnected
 
@@ -110,6 +114,11 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
     private var recognitionStartTime: Date?
     private var totalAudioDuration: TimeInterval = 0
 
+    /// ⭐️ 辨識延遲統計
+    private var lastAudioSendTime: Date?           // 最後一次發送音頻的時間
+    private var audioSendTimestamps: [Date] = []   // 音頻發送時間記錄（最近 10 個）
+    private var recognitionLatencies: [TimeInterval] = []  // 辨識延遲記錄（ms）
+
     // MARK: - 防止無限重啟
 
     /// 重建冷卻時間（防止快速循環重啟）
@@ -133,6 +142,7 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         self.serverURL = serverURL
         self.sourceLang = sourceLang
         self.targetLang = targetLang
+        self.isSingleLanguageMode = false  // 預設為雙語言模式
 
         connectionState = .connecting
 
@@ -141,6 +151,192 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             DispatchQueue.main.async {
                 self?.handleAuthorizationStatus(status)
             }
+        }
+    }
+
+    // MARK: - ⭐️ 經濟模式：單語言模式
+
+    /// 單語言模式連接（經濟模式用）
+    /// 只開啟一個語言識別器，節省資源
+    func connectSingleLanguage(
+        serverURL: String,
+        sourceLang: Language,
+        targetLang: Language,
+        activeLanguage: Language
+    ) {
+        self.serverURL = serverURL
+        self.sourceLang = sourceLang
+        self.targetLang = targetLang
+        self.isSingleLanguageMode = true
+        self.currentActiveLanguage = activeLanguage
+
+        connectionState = .connecting
+
+        print("🌿 [Apple STT] 經濟模式：單語言連接 (\(activeLanguage.shortName))")
+
+        // 請求語音識別權限
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            DispatchQueue.main.async {
+                self?.handleAuthorizationStatus(status)
+            }
+        }
+    }
+
+    /// 切換語言（經濟模式專用）
+    /// 返回切換耗時（毫秒）
+    @discardableResult
+    func switchLanguage(to language: Language) -> TimeInterval {
+        guard isSingleLanguageMode else {
+            print("⚠️ [Apple STT] switchLanguage 只能在單語言模式下使用")
+            return 0
+        }
+
+        guard language != currentActiveLanguage else {
+            print("ℹ️ [Apple STT] 已經是 \(language.shortName)，無需切換")
+            return 0
+        }
+
+        let startTime = Date()
+        print("🔄 [Apple STT] 開始切換語言: \(currentActiveLanguage.shortName) → \(language.shortName)")
+
+        // 停止當前識別
+        stopSingleLanguageRecognition()
+
+        // 更新當前語言
+        currentActiveLanguage = language
+
+        // 啟動新語言識別
+        startSingleLanguageRecognition()
+
+        // 計算切換時間
+        let switchTime = Date().timeIntervalSince(startTime) * 1000  // 轉換為毫秒
+        print("⏱️ [Apple STT] 語言切換完成，耗時: \(String(format: "%.0f", switchTime))ms")
+
+        return switchTime
+    }
+
+    /// 停止單語言識別
+    private func stopSingleLanguageRecognition() {
+        sourceTask?.cancel()
+        sourceTask = nil
+        sourceRequest?.endAudio()
+        sourceRequest = nil
+        sourceRecognizer = nil
+
+        // 重置結果
+        lastSourceResult = nil
+        lastEmittedText = ""
+        lastEmittedLanguage = ""
+    }
+
+    /// 啟動單語言識別
+    private func startSingleLanguageRecognition() {
+        let locale = Locale(identifier: currentActiveLanguage.azureLocale)
+        sourceRecognizer = SFSpeechRecognizer(locale: locale)
+
+        guard let recognizer = sourceRecognizer else {
+            connectionState = .error("\(currentActiveLanguage.displayName) 識別器創建失敗")
+            _errorSubject.send("不支援 \(currentActiveLanguage.displayName) 語音識別")
+            return
+        }
+
+        guard recognizer.isAvailable else {
+            connectionState = .error("\(currentActiveLanguage.displayName) 識別器不可用")
+            _errorSubject.send("請下載 \(currentActiveLanguage.displayName) 語言包")
+            return
+        }
+
+        // 創建識別請求
+        sourceRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let request = sourceRequest else {
+            connectionState = .error("無法創建識別請求")
+            return
+        }
+
+        request.shouldReportPartialResults = true
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+
+        // 啟動識別任務
+        sourceTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            self?.handleSingleLanguageResult(result: result, error: error)
+        }
+
+        connectionState = .connected
+        print("✅ [Apple STT] 單語言識別已啟動: \(currentActiveLanguage.shortName)")
+    }
+
+    /// 處理單語言識別結果
+    private func handleSingleLanguageResult(
+        result: SFSpeechRecognitionResult?,
+        error: Error?
+    ) {
+        // 複用現有的錯誤處理邏輯
+        if let error = error {
+            let nsError = error as NSError
+            if nsError.code == 1 || nsError.code == 216 { return }
+
+            if nsError.code == 1110 {
+                consecutiveErrorCount += 1
+                if consecutiveErrorCount == 1 {
+                    print("ℹ️ [Apple STT/\(currentActiveLanguage.shortName)] 等待語音輸入...")
+                }
+                return
+            }
+
+            print("⚠️ [Apple STT/\(currentActiveLanguage.shortName)] 錯誤: \(error.localizedDescription)")
+            return
+        }
+
+        consecutiveErrorCount = 0
+
+        guard let result = result else { return }
+
+        let text = result.bestTranscription.formattedString
+        guard !text.isEmpty else { return }
+
+        let confidence = result.bestTranscription.segments.last?.confidence ?? 0
+        let isFinal = result.isFinal
+
+        // 去重
+        if text == lastEmittedText && !isFinal { return }
+
+        // ⭐️ 計算辨識延遲
+        var latencyInfo = ""
+        if let lastSend = lastAudioSendTime {
+            let latency = Date().timeIntervalSince(lastSend) * 1000  // ms
+            recognitionLatencies.append(latency)
+            if recognitionLatencies.count > 20 {
+                recognitionLatencies.removeFirst()
+            }
+            let avgLatency = recognitionLatencies.reduce(0, +) / Double(recognitionLatencies.count)
+            latencyInfo = " | 延遲: \(String(format: "%.0f", latency))ms (平均: \(String(format: "%.0f", avgLatency))ms)"
+        }
+
+        // ⭐️ Interim 結果沒有信心度（Apple 的設計），只有 Final 才顯示
+        let confidenceInfo = isFinal ? " (信心: \(String(format: "%.2f", confidence)))" : ""
+        let finalTag = isFinal ? "✅ Final" : "⏳ Interim"
+        print("🎤 [Apple STT/\(currentActiveLanguage.shortName)] \(finalTag): \"\(text.prefix(40))\"\(confidenceInfo)\(latencyInfo)")
+
+        // 創建 TranscriptMessage
+        let transcript = TranscriptMessage(
+            text: text,
+            isFinal: isFinal,
+            confidence: Double(confidence),
+            language: currentActiveLanguage.rawValue
+        )
+
+        if isFinal {
+            lastEmittedText = ""
+            // 觸發翻譯
+            translateText(text: text, detectedLang: currentActiveLanguage.rawValue)
+        } else {
+            lastEmittedText = text
+        }
+
+        DispatchQueue.main.async {
+            self._transcriptSubject.send(transcript)
         }
     }
 
@@ -182,6 +378,12 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         consecutiveErrorCount = 0
         lastRebuildTime = nil
 
+        // ⭐️ 重置延遲統計
+        lastAudioSendTime = nil
+        audioSendTimestamps.removeAll()
+        recognitionLatencies.removeAll()
+        totalAudioDuration = 0
+
         connectionState = .disconnected
     }
 
@@ -219,12 +421,24 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             return
         }
 
-        // 檢查 request 是否存在
-        guard let srcReq = sourceRequest, let tgtReq = targetRequest else {
-            print("❌ [Apple STT] Request 為空，無法發送音頻")
-            print("   sourceRequest: \(sourceRequest != nil)")
-            print("   targetRequest: \(targetRequest != nil)")
-            return
+        // ⭐️ 根據模式檢查 request
+        if isSingleLanguageMode {
+            // 單語言模式：只需要 sourceRequest
+            guard let srcReq = sourceRequest else {
+                print("❌ [Apple STT] 單語言模式：Request 為空")
+                return
+            }
+            srcReq.append(buffer)
+        } else {
+            // 雙語言模式：需要兩個 request
+            guard let srcReq = sourceRequest, let tgtReq = targetRequest else {
+                print("❌ [Apple STT] Request 為空，無法發送音頻")
+                print("   sourceRequest: \(sourceRequest != nil)")
+                print("   targetRequest: \(targetRequest != nil)")
+                return
+            }
+            srcReq.append(buffer)
+            tgtReq.append(buffer)
         }
 
         // ⭐️ 計算音頻振幅（調試用）
@@ -243,13 +457,17 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             avgAmplitude = sum / Float(frameCount)
         }
 
-        // 發送給兩個識別器
-        srcReq.append(buffer)
-        tgtReq.append(buffer)
-
         // 統計音頻時長
         let duration = Double(buffer.frameLength) / 16000.0
         totalAudioDuration += duration
+
+        // ⭐️ 記錄發送時間（用於計算辨識延遲）
+        let now = Date()
+        lastAudioSendTime = now
+        audioSendTimestamps.append(now)
+        if audioSendTimestamps.count > 10 {
+            audioSendTimestamps.removeFirst()
+        }
 
         // 每 20 次打印一次（包含振幅資訊）
         if audioSendCount == 1 || audioSendCount % 20 == 0 {
@@ -268,8 +486,20 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         // 但我們可以強制結束當前識別並重建任務
         print("📤 [Apple STT] 收到結束語句信號")
 
-        // 立即發送當前最佳結果（如果有）
-        emitBestResult(forceFinal: true)
+        if isSingleLanguageMode {
+            // ⭐️ 單語言模式：強制結束並重建識別
+            print("🔚 [Apple STT] 單語言模式：強制結束識別")
+            sourceRequest?.endAudio()
+
+            // 短暫延遲後重建（讓 Final 結果返回）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self, self.connectionState == .connected else { return }
+                self.startSingleLanguageRecognition()
+            }
+        } else {
+            // 雙語言模式：立即發送當前最佳結果
+            emitBestResult(forceFinal: true)
+        }
     }
 
     // MARK: - Authorization
@@ -278,7 +508,12 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         switch status {
         case .authorized:
             print("✅ [Apple STT] 語音識別已授權")
-            setupRecognizers()
+            // ⭐️ 根據模式啟動不同的識別器
+            if isSingleLanguageMode {
+                startSingleLanguageRecognition()
+            } else {
+                setupRecognizers()
+            }
 
         case .denied:
             connectionState = .error("語音識別權限被拒絕")
@@ -563,9 +798,22 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             lastTargetResult = recognitionResult
         }
 
-        // Debug 輸出
-        let finalTag = isFinal ? "Final" : "Interim"
-        print("🎤 [Apple STT/\(langName)] \(finalTag): \"\(text.prefix(40))\" (信心: \(String(format: "%.2f", confidence)))")
+        // ⭐️ 計算辨識延遲
+        var latencyInfo = ""
+        if let lastSend = lastAudioSendTime {
+            let latency = Date().timeIntervalSince(lastSend) * 1000  // ms
+            recognitionLatencies.append(latency)
+            if recognitionLatencies.count > 20 {
+                recognitionLatencies.removeFirst()
+            }
+            let avgLatency = recognitionLatencies.reduce(0, +) / Double(recognitionLatencies.count)
+            latencyInfo = " | 延遲: \(String(format: "%.0f", latency))ms (平均: \(String(format: "%.0f", avgLatency))ms)"
+        }
+
+        // ⭐️ Interim 結果沒有信心度（Apple 的設計），只有 Final 才顯示
+        let confidenceInfo = isFinal ? " (信心: \(String(format: "%.2f", confidence)))" : ""
+        let finalTag = isFinal ? "✅ Final" : "⏳ Interim"
+        print("🎤 [Apple STT/\(langName)] \(finalTag): \"\(text.prefix(40))\"\(confidenceInfo)\(latencyInfo)")
 
         // 防抖處理：合併短時間內的結果
         scheduleResultEmission(isFinal: isFinal)

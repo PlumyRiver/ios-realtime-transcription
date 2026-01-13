@@ -568,18 +568,32 @@ struct InCallControlRow: View {
             ZStack {
                 // 正常狀態：TTS + 錄音 真正居中，結束通話用 overlay 放右側
                 if !isEndCallPressed {
-                    // TTS + 錄音 並排置中（使用 ZStack 確保真正居中）
-                    HStack(spacing: 40) {
-                        ttsButton
-                        microphoneButton
+                    // ⭐️ 根據經濟模式切換 UI
+                    if viewModel.isEconomyMode {
+                        // 經濟模式：TTS + 雙麥克風
+                        HStack(spacing: 20) {
+                            ttsButton
+                            economyDualMicButtons
+                        }
+                        .frame(maxWidth: .infinity)
+                        .overlay(alignment: .trailing) {
+                            endCallButton
+                                .padding(.trailing, 4)
+                        }
+                        .transition(.opacity)
+                    } else {
+                        // 一般模式：TTS + 單麥克風
+                        HStack(spacing: 40) {
+                            ttsButton
+                            microphoneButton
+                        }
+                        .frame(maxWidth: .infinity)
+                        .overlay(alignment: .trailing) {
+                            endCallButton
+                                .padding(.trailing, 4)
+                        }
+                        .transition(.opacity)
                     }
-                    .frame(maxWidth: .infinity)  // 填滿寬度以居中
-                    .overlay(alignment: .trailing) {
-                        // 結束通話按鈕（右側 overlay，不影響居中）
-                        endCallButton
-                            .padding(.trailing, 4)
-                    }
-                    .transition(.opacity)
                 } else {
                     // 滑動軌道（填滿整個寬度）
                     endCallSlider(width: sliderWidth)
@@ -715,6 +729,78 @@ struct InCallControlRow: View {
                 .fontWeight(.medium)
                 .foregroundStyle(isVADMode ? .green : (isPressed ? .red : .secondary))
                 .offset(y: 28)
+        }
+    }
+
+    // MARK: - ⭐️ 經濟模式雙麥克風按鈕
+
+    private var economyDualMicButtons: some View {
+        HStack(spacing: 16) {
+            // 來源語言麥克風
+            economyMicButton(
+                language: viewModel.sourceLang,
+                isActive: viewModel.economyActiveLanguage == viewModel.sourceLang
+            )
+
+            // 目標語言麥克風
+            economyMicButton(
+                language: viewModel.targetLang,
+                isActive: viewModel.economyActiveLanguage == viewModel.targetLang
+            )
+        }
+    }
+
+    @State private var economyPulseAnimation = false
+
+    private func economyMicButton(language: Language, isActive: Bool) -> some View {
+        Button {
+            viewModel.switchEconomyLanguage(to: language)
+            hapticGenerator.impactOccurred()
+        } label: {
+            ZStack {
+                // 背景圓圈
+                Circle()
+                    .fill(isActive ? Color.green.opacity(0.15) : Color(.systemGray6))
+                    .frame(width: 60, height: 60)
+                    .scaleEffect(isActive && economyPulseAnimation ? 1.15 : 1.0)
+                    .opacity(isActive && economyPulseAnimation ? 0.0 : 1.0)
+                    .animation(isActive ? .easeInOut(duration: 1.5).repeatForever(autoreverses: false) : .default, value: economyPulseAnimation)
+
+                // 按鈕主體
+                Circle()
+                    .fill(isActive ? Color.green : Color(.systemGray4))
+                    .frame(width: 52, height: 52)
+                    .shadow(color: isActive ? Color.green.opacity(0.4) : .clear, radius: 6)
+
+                // 圖標和文字
+                VStack(spacing: 2) {
+                    Image(systemName: isActive ? "waveform" : "mic")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(.white)
+                        .scaleEffect(isActive && economyPulseAnimation ? 1.1 : 1.0)
+                        .animation(isActive ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: economyPulseAnimation)
+
+                    Text(language.shortName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                Text(isActive ? "說話中" : "切換")
+                    .font(.caption2)
+                    .fontWeight(.medium)
+                    .foregroundStyle(isActive ? .green : .secondary)
+                    .offset(y: 24)
+            }
+        }
+        .buttonStyle(.plain)
+        .onAppear {
+            if isActive {
+                economyPulseAnimation = true
+            }
+        }
+        .onChange(of: isActive) { _, newValue in
+            economyPulseAnimation = newValue
         }
     }
 
@@ -1553,6 +1639,54 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // ⭐️ 經濟模式開關
+                Section {
+                    Toggle(isOn: $viewModel.isEconomyMode) {
+                        HStack {
+                            Image(systemName: "leaf.fill")
+                                .foregroundStyle(.green)
+                            VStack(alignment: .leading) {
+                                Text("經濟模式")
+                                Text("使用免費的系統語音辨識和合成")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .tint(.green)
+
+                    if viewModel.isEconomyMode {
+                        // 經濟模式說明
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("STT：Apple 語音辨識（免費）")
+                                    .font(.subheadline)
+                            }
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                Text("TTS：Apple 語音合成（免費）")
+                                    .font(.subheadline)
+                            }
+                            HStack(spacing: 8) {
+                                Image(systemName: "info.circle.fill")
+                                    .foregroundStyle(.orange)
+                                Text("通話時需手動切換語言")
+                                    .font(.subheadline)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } header: {
+                    Text("模式")
+                } footer: {
+                    if viewModel.isEconomyMode {
+                        Text("經濟模式不消耗額度，但需要手動切換說話語言")
+                    }
+                }
+
                 // ⭐️ TTS 服務商選擇
                 Section {
                     Picker(selection: $viewModel.ttsProvider) {

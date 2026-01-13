@@ -160,6 +160,31 @@ final class TranscriptionViewModel {
     /// 伺服器 URL（Cloud Run 部署的服務）
     var serverURL: String = "chirp3-ios-api-1027448899164.asia-east1.run.app"
 
+    // MARK: - ⭐️ 經濟模式
+
+    /// 經濟模式：使用免費的 Apple STT 和 TTS
+    var isEconomyMode: Bool = false {
+        didSet {
+            if oldValue != isEconomyMode {
+                if isEconomyMode {
+                    print("🌿 [經濟模式] 啟用 - 切換到 Apple STT/TTS")
+                    sttProvider = .apple
+                    ttsProvider = .apple
+                } else {
+                    print("💎 [經濟模式] 停用 - 恢復預設提供商")
+                    sttProvider = .elevenLabs
+                    ttsProvider = .azure
+                }
+            }
+        }
+    }
+
+    /// 經濟模式下當前活動的語言（用於雙麥克風切換）
+    var economyActiveLanguage: Language = .zh
+
+    /// 經濟模式語言切換統計
+    private(set) var lastLanguageSwitchTime: TimeInterval = 0
+
     /// ⭐️ STT 提供商選擇（預設 ElevenLabs，延遲更低）
     var sttProvider: STTProvider = .elevenLabs {
         didSet {
@@ -567,11 +592,23 @@ final class TranscriptionViewModel {
         print("🔌 開始連接伺服器: \(serverURL) (使用 \(sttProvider.displayName))")
 
         // ⭐️ 根據選擇的 STT 提供商連接
-        currentSTTService.connect(
-            serverURL: serverURL,
-            sourceLang: sourceLang,
-            targetLang: targetLang
-        )
+        if isEconomyMode {
+            // 經濟模式：使用單語言 Apple STT
+            print("🌿 [經濟模式] 使用單語言識別: \(economyActiveLanguage.shortName)")
+            appleSTTService.connectSingleLanguage(
+                serverURL: serverURL,
+                sourceLang: sourceLang,
+                targetLang: targetLang,
+                activeLanguage: economyActiveLanguage
+            )
+        } else {
+            // 一般模式：使用選擇的 STT 提供商
+            currentSTTService.connect(
+                serverURL: serverURL,
+                sourceLang: sourceLang,
+                targetLang: targetLang
+            )
+        }
 
         // 等待連接成功（ElevenLabs 需要較長時間：token + WebSocket）
         let timeout: TimeInterval = (sttProvider == .elevenLabs) ? 20.0 : 10.0
@@ -709,6 +746,44 @@ final class TranscriptionViewModel {
         isSpeakerMode.toggle()
         // AudioManager 會通過 didSet 自動同步
         print("🔊 [ViewModel] 擴音模式: \(isSpeakerMode ? "開啟" : "關閉")")
+    }
+
+    // MARK: - ⭐️ 經濟模式語言切換
+
+    /// 經濟模式下切換語言（雙麥克風按鈕用）
+    @MainActor
+    func switchEconomyLanguage(to language: Language) {
+        guard isEconomyMode else {
+            print("⚠️ [經濟模式] 非經濟模式，無法切換語言")
+            return
+        }
+
+        guard isRecording else {
+            print("⚠️ [經濟模式] 未在通話中，無法切換語言")
+            return
+        }
+
+        guard language != economyActiveLanguage else {
+            print("ℹ️ [經濟模式] 已經是 \(language.shortName)")
+            return
+        }
+
+        print("🔄 [經濟模式] 切換語言: \(economyActiveLanguage.shortName) → \(language.shortName)")
+
+        // 調用 Apple STT 的語言切換方法
+        let switchTime = appleSTTService.switchLanguage(to: language)
+
+        // 更新狀態
+        economyActiveLanguage = language
+        lastLanguageSwitchTime = switchTime
+
+        print("⏱️ [經濟模式] 語言切換耗時: \(String(format: "%.0f", switchTime))ms")
+    }
+
+    /// 經濟模式下是否為當前活動語言
+    func isEconomyActiveLanguage(_ language: Language) -> Bool {
+        guard isEconomyMode else { return false }
+        return language == economyActiveLanguage
     }
 
     // MARK: - Voice Isolation
