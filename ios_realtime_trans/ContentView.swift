@@ -570,10 +570,10 @@ struct InCallControlRow: View {
                 if !isEndCallPressed {
                     // ⭐️ 根據經濟模式切換 UI
                     if viewModel.isEconomyMode {
-                        // 經濟模式：TTS + 雙麥克風
-                        HStack(spacing: 20) {
+                        // 經濟模式：TTS + 單麥克風（按住錄音，放開比較兩種語言）
+                        HStack(spacing: 40) {
                             ttsButton
-                            economyDualMicButtons
+                            economySingleMicButton
                         }
                         .frame(maxWidth: .infinity)
                         .overlay(alignment: .trailing) {
@@ -732,76 +732,70 @@ struct InCallControlRow: View {
         }
     }
 
-    // MARK: - ⭐️ 經濟模式雙麥克風按鈕
+    // MARK: - ⭐️ 經濟模式單麥克風按鈕（按住錄音，放開比較兩種語言）
 
-    private var economyDualMicButtons: some View {
-        HStack(spacing: 16) {
-            // 來源語言麥克風
-            economyMicButton(
-                language: viewModel.sourceLang,
-                isActive: viewModel.economyActiveLanguage == viewModel.sourceLang
-            )
+    @State private var isEconomyMicPressed = false
 
-            // 目標語言麥克風
-            economyMicButton(
-                language: viewModel.targetLang,
-                isActive: viewModel.economyActiveLanguage == viewModel.targetLang
-            )
+    private var economySingleMicButton: some View {
+        ZStack {
+            // 外圈（按住時光暈）- 與一般模式相同
+            Circle()
+                .fill(isEconomyMicPressed ? Color.red.opacity(0.2) : Color(.systemGray6))
+                .frame(width: buttonSize, height: buttonSize)
+                .scaleEffect(isEconomyMicPressed ? 1.15 : 1.0)
+                .animation(.easeInOut(duration: 0.3).repeatForever(autoreverses: true), value: isEconomyMicPressed)
+
+            // 主圈 - 使用橙色（與一般 PTT 相同）
+            Circle()
+                .fill(isEconomyMicPressed ? Color.red : Color.orange)
+                .frame(width: buttonSize - 10, height: buttonSize - 10)
+                .shadow(
+                    color: isEconomyMicPressed ? Color.red.opacity(0.5) : Color.orange.opacity(0.3),
+                    radius: isEconomyMicPressed ? 12 : 6,
+                    x: 0, y: 2
+                )
+
+            // 麥克風圖標
+            Image(systemName: isEconomyMicPressed ? "mic.fill" : "mic")
+                .font(.system(size: iconSize, weight: .medium))
+                .foregroundStyle(.white)
+                .scaleEffect(isEconomyMicPressed ? 1.1 : 1.0)
+                .animation(.spring(response: 0.2, dampingFraction: 0.5), value: isEconomyMicPressed)
         }
-    }
-
-    @State private var economyPulseAnimation = false
-
-    private func economyMicButton(language: Language, isActive: Bool) -> some View {
-        Button {
-            viewModel.switchEconomyLanguage(to: language)
-            hapticGenerator.impactOccurred()
-        } label: {
-            ZStack {
-                // 背景圓圈
-                Circle()
-                    .fill(isActive ? Color.green.opacity(0.15) : Color(.systemGray6))
-                    .frame(width: 60, height: 60)
-                    .scaleEffect(isActive && economyPulseAnimation ? 1.15 : 1.0)
-                    .opacity(isActive && economyPulseAnimation ? 0.0 : 1.0)
-                    .animation(isActive ? .easeInOut(duration: 1.5).repeatForever(autoreverses: false) : .default, value: economyPulseAnimation)
-
-                // 按鈕主體
-                Circle()
-                    .fill(isActive ? Color.green : Color(.systemGray4))
-                    .frame(width: 52, height: 52)
-                    .shadow(color: isActive ? Color.green.opacity(0.4) : .clear, radius: 6)
-
-                // 圖標和文字
-                VStack(spacing: 2) {
-                    Image(systemName: isActive ? "waveform" : "mic")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(.white)
-                        .scaleEffect(isActive && economyPulseAnimation ? 1.1 : 1.0)
-                        .animation(isActive ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: economyPulseAnimation)
-
-                    Text(language.shortName)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-            }
-            .overlay(alignment: .bottom) {
-                Text(isActive ? "說話中" : "切換")
+        .scaleEffect(isEconomyMicPressed ? 1.05 : 1.0)
+        .animation(.spring(response: 0.3, dampingFraction: 0.6), value: isEconomyMicPressed)
+        .overlay(alignment: .bottom) {
+            // 顯示語言對
+            VStack(spacing: 1) {
+                Text(isEconomyMicPressed ? "錄音中" : "按住說話")
                     .font(.caption2)
                     .fontWeight(.medium)
-                    .foregroundStyle(isActive ? .green : .secondary)
-                    .offset(y: 24)
+                    .foregroundStyle(isEconomyMicPressed ? .red : .secondary)
+
+                Text("\(viewModel.sourceLang.shortName) ↔ \(viewModel.targetLang.shortName)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary.opacity(0.8))
             }
+            .offset(y: 28)
         }
-        .buttonStyle(.plain)
-        .onAppear {
-            if isActive {
-                economyPulseAnimation = true
-            }
-        }
-        .onChange(of: isActive) { _, newValue in
-            economyPulseAnimation = newValue
-        }
+        // 按住錄音手勢
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    if !isEconomyMicPressed {
+                        isEconomyMicPressed = true
+                        hapticGenerator.impactOccurred()
+                        // 開始錄音
+                        viewModel.startEconomyRecording()
+                    }
+                }
+                .onEnded { _ in
+                    isEconomyMicPressed = false
+                    hapticGenerator.impactOccurred()
+                    // 停止錄音，觸發雙語言比較
+                    viewModel.stopEconomyRecordingAndCompare()
+                }
+        )
     }
 
     // MARK: - 結束通話按鈕（右側）
@@ -1670,20 +1664,71 @@ struct SettingsView: View {
                                 Text("TTS：Apple 語音合成（免費）")
                                     .font(.subheadline)
                             }
-                            HStack(spacing: 8) {
-                                Image(systemName: "info.circle.fill")
-                                    .foregroundStyle(.orange)
-                                Text("通話時需手動切換語言")
-                                    .font(.subheadline)
-                            }
                         }
                         .padding(.vertical, 4)
+
+                        // ⭐️ 自動語言切換開關
+                        Toggle(isOn: $viewModel.isAutoLanguageSwitchEnabled) {
+                            HStack {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                    .foregroundStyle(.blue)
+                                VStack(alignment: .leading) {
+                                    Text("自動語言切換")
+                                    Text("信心度低時自動嘗試另一語言")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.blue)
+
+                        // 信心度閾值滑桿
+                        if viewModel.isAutoLanguageSwitchEnabled && !viewModel.isComparisonDisplayMode {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("切換閾值")
+                                    Spacer()
+                                    Text("\(Int(viewModel.autoSwitchConfidenceThreshold * 100))%")
+                                        .foregroundStyle(.secondary)
+                                }
+                                Slider(
+                                    value: $viewModel.autoSwitchConfidenceThreshold,
+                                    in: 0.5...0.9,
+                                    step: 0.05
+                                )
+                                .tint(.blue)
+                                Text("識別信心度低於此值時，自動切換語言重試")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        // ⭐️ 比較顯示模式開關
+                        Toggle(isOn: $viewModel.isComparisonDisplayMode) {
+                            HStack {
+                                Image(systemName: "eye.fill")
+                                    .foregroundStyle(.orange)
+                                VStack(alignment: .leading) {
+                                    Text("比較顯示模式")
+                                    Text("顯示兩種語言的辨識結果")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(.orange)
                     }
                 } header: {
                     Text("模式")
                 } footer: {
                     if viewModel.isEconomyMode {
-                        Text("經濟模式不消耗額度，但需要手動切換說話語言")
+                        if viewModel.isComparisonDisplayMode {
+                            Text("比較模式：每句話都會同時顯示兩種語言的辨識結果和信心度，方便比較效果")
+                        } else if viewModel.isAutoLanguageSwitchEnabled {
+                            Text("自動切換：識別結果信心度低於 \(Int(viewModel.autoSwitchConfidenceThreshold * 100))% 時，會自動嘗試另一語言並比較結果")
+                        } else {
+                            Text("經濟模式不消耗額度，但需要手動切換說話語言")
+                        }
                     }
                 }
 

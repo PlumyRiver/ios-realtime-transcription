@@ -185,6 +185,32 @@ final class TranscriptionViewModel {
     /// 經濟模式語言切換統計
     private(set) var lastLanguageSwitchTime: TimeInterval = 0
 
+    /// ⭐️ 自動語言切換（經濟模式專用）
+    /// 當識別信心度低於閾值時，自動切換語言重試並比較結果
+    var isAutoLanguageSwitchEnabled: Bool = true {
+        didSet {
+            appleSTTService.isAutoLanguageSwitchEnabled = isAutoLanguageSwitchEnabled
+            print("🔄 [經濟模式] 自動語言切換: \(isAutoLanguageSwitchEnabled ? "啟用" : "停用")")
+        }
+    }
+
+    /// 自動切換的信心度閾值（0.0 ~ 1.0）
+    var autoSwitchConfidenceThreshold: Float = 0.70 {
+        didSet {
+            appleSTTService.confidenceThreshold = autoSwitchConfidenceThreshold
+            print("🔄 [經濟模式] 信心度閾值: \(String(format: "%.0f", autoSwitchConfidenceThreshold * 100))%")
+        }
+    }
+
+    /// ⭐️ 比較顯示模式：強制兩種語言都辨識一次，並顯示兩個結果
+    /// 用於調試和比較兩種語言的辨識效果
+    var isComparisonDisplayMode: Bool = false {
+        didSet {
+            appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
+            print("🔬 [經濟模式] 比較顯示模式: \(isComparisonDisplayMode ? "啟用" : "停用")")
+        }
+    }
+
     /// ⭐️ STT 提供商選擇（預設 ElevenLabs，延遲更低）
     var sttProvider: STTProvider = .elevenLabs {
         didSet {
@@ -786,6 +812,40 @@ final class TranscriptionViewModel {
         return language == economyActiveLanguage
     }
 
+    // MARK: - ⭐️ 經濟模式 PTT 錄音（按住錄音，放開比較兩種語言）
+
+    /// 開始經濟模式錄音（按住麥克風時調用）
+    func startEconomyRecording() {
+        guard isEconomyMode, isRecording else {
+            print("⚠️ [經濟模式] 未在通話中或非經濟模式")
+            return
+        }
+
+        print("🎙️ [經濟模式] 開始錄音...")
+
+        // 清空音頻緩衝區，準備接收新的錄音
+        appleSTTService.clearAudioBuffer()
+
+        // 開始發送音頻到 STT
+        audioManager.startSending()
+    }
+
+    /// 停止經濟模式錄音並觸發雙語言比較（放開麥克風時調用）
+    func stopEconomyRecordingAndCompare() {
+        guard isEconomyMode, isRecording else {
+            print("⚠️ [經濟模式] 未在通話中或非經濟模式")
+            return
+        }
+
+        print("🛑 [經濟模式] 停止錄音，開始雙語言比較...")
+
+        // 停止發送音頻
+        audioManager.stopSending()
+
+        // 觸發雙語言比較（使用緩衝區中的音頻）
+        appleSTTService.startDualLanguageComparison()
+    }
+
     // MARK: - Voice Isolation
 
     /// 顯示系統麥克風模式選擇器（Voice Isolation、Wide Spectrum、Standard）
@@ -992,6 +1052,59 @@ final class TranscriptionViewModel {
                 }
             }
             .store(in: &cancellables)
+
+        // ⭐️ 設置自動語言切換回調（同步 UI）
+        appleSTTService.onLanguageSwitched = { [weak self] language in
+            guard let self, self.isEconomyMode else { return }
+            if self.economyActiveLanguage != language {
+                print("🔄 [經濟模式] UI 同步語言: \(self.economyActiveLanguage.shortName) → \(language.shortName)")
+                self.economyActiveLanguage = language
+            }
+        }
+
+        // ⭐️ 比較顯示模式：接收兩種語言的比較結果（舊版，僅用於調試）
+        appleSTTService.onComparisonResults = { [weak self] results in
+            guard let self, self.isEconomyMode, self.isComparisonDisplayMode else { return }
+
+            print("🔬 [比較模式] 收到 \(results.count) 個比較結果")
+
+            // 創建兩個對話框，顯示兩種語言的結果
+            for result in results {
+                let confidenceStr = String(format: "%.0f%%", result.confidence * 100)
+                let langLabel = "[\(result.lang.shortName)] "
+
+                let transcript = TranscriptMessage(
+                    text: langLabel + result.text,
+                    isFinal: true,
+                    confidence: Double(result.confidence),
+                    language: result.lang.rawValue,
+                    translation: "信心度: \(confidenceStr)"  // 用翻譯欄位顯示信心度
+                )
+
+                // 添加到對話列表
+                self.transcripts.append(transcript)
+                self.transcriptCount += 1
+            }
+        }
+
+        // ⭐️ 經濟模式 PTT：接收最佳比較結果（自動選擇信心最高的語言）
+        appleSTTService.onBestComparisonResult = { [weak self] bestLang, text, confidence in
+            guard let self, self.isEconomyMode else { return }
+
+            print("🏆 [經濟模式 PTT] 選中: \(bestLang.shortName) (信心: \(String(format: "%.0f%%", confidence * 100)))")
+            print("   文本: \"\(text.prefix(40))...\"")
+
+            // ⭐️ 同步語言到 UI（下次錄音預設用這個語言）
+            if self.economyActiveLanguage != bestLang {
+                print("🔄 [經濟模式] 切換預設語言: \(self.economyActiveLanguage.shortName) → \(bestLang.shortName)")
+                self.economyActiveLanguage = bestLang
+            }
+
+            // ⭐️ 注意：transcript 和翻譯已由 AppleSTTService 處理
+            // - _transcriptSubject.send() 發送到 UI
+            // - translateText() 觸發翻譯 API
+            // - 翻譯結果會通過 translationPublisher 發送，觸發 TTS
+        }
 
         // ⭐️ TTS 播放完成回調（播放隊列中的下一個）
         audioManager.onTTSPlaybackFinished = { [weak self] in

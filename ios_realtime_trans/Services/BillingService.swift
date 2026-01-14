@@ -118,6 +118,9 @@ final class BillingService {
     /// ⭐️ PTT 模式：是否正在發送音訊（只有發送時才計費）
     private(set) var isAudioSending: Bool = false
 
+    /// ⭐️ STT 計費開關（經濟模式用 Apple STT 免費，不計費）
+    private(set) var isSTTBillingEnabled: Bool = false
+
     /// ⭐️ 額度耗盡回調（通知 ViewModel 停止錄音）
     var onCreditsExhausted: (() -> Void)?
 
@@ -193,9 +196,11 @@ final class BillingService {
 
     /// 開始 STT 計時（每秒即時扣款）
     /// ⭐️ PTT 模式：只有在 isAudioSending = true 時才計費
+    /// ⭐️ 經濟模式：不調用此函數，isSTTBillingEnabled = false，跳過 STT 計費
     func startSTTTimer() {
         guard isBilling else { return }
         sttStartTime = Date()
+        isSTTBillingEnabled = true  // ⭐️ 啟用 STT 計費
 
         // ⭐️ 只有正在發送音訊時才開始計費
         if isAudioSending {
@@ -215,16 +220,22 @@ final class BillingService {
     func startAudioSending() {
         guard !isAudioSending else { return }
         isAudioSending = true
-        lastSTTBillingTime = Date()
-        print("💰 [Billing] PTT 開始發送，計費啟動")
+
+        // ⭐️ 只有啟用 STT 計費時才記錄時間
+        if isSTTBillingEnabled {
+            lastSTTBillingTime = Date()
+            print("💰 [Billing] PTT 開始發送，計費啟動")
+        } else {
+            print("💰 [Billing] PTT 開始發送（免費 STT，不計費）")
+        }
     }
 
     /// ⭐️ 停止發送音訊（PTT 放開）- 暫停計費
     func stopAudioSending() {
         guard isAudioSending else { return }
 
-        // 結算最後一段時間
-        if isBilling, let lastTime = lastSTTBillingTime {
+        // ⭐️ 只有啟用 STT 計費時才結算
+        if isSTTBillingEnabled, isBilling, let lastTime = lastSTTBillingTime {
             let duration = Date().timeIntervalSince(lastTime)
             if duration > 0 {
                 currentUsage.sttDurationSeconds += duration
@@ -240,19 +251,22 @@ final class BillingService {
                     deductCreditsImmediately(credits: credits, reason: "STT(PTT結束)\(speedInfo)")
                 }
             }
+            print("💰 [Billing] PTT 停止發送，計費暫停")
+        } else {
+            print("💰 [Billing] PTT 停止發送（免費 STT，不計費）")
         }
 
         isAudioSending = false
         lastSTTBillingTime = nil
-        print("💰 [Billing] PTT 停止發送，計費暫停")
     }
 
     /// ⭐️ 處理 STT 即時扣款（每秒調用）
     /// PTT 模式：只有在發送音訊時才計費
     /// 加速模式：計費時長 = 實際時長 / 加速比
+    /// 經濟模式：isSTTBillingEnabled = false，跳過計費
     private func processSTTBilling() {
-        // ⭐️ 只有正在發送音訊時才計費
-        guard isBilling, isAudioSending, let lastTime = lastSTTBillingTime else { return }
+        // ⭐️ 只有啟用 STT 計費且正在發送音訊時才計費
+        guard isSTTBillingEnabled, isBilling, isAudioSending, let lastTime = lastSTTBillingTime else { return }
 
         let now = Date()
         let duration = now.timeIntervalSince(lastTime)
@@ -283,8 +297,8 @@ final class BillingService {
         sttBillingTimer?.invalidate()
         sttBillingTimer = nil
 
-        // ⭐️ 如果還在發送，結算最後一段時間
-        if isAudioSending, let lastTime = lastSTTBillingTime {
+        // ⭐️ 只有啟用 STT 計費時才結算
+        if isSTTBillingEnabled, isAudioSending, let lastTime = lastSTTBillingTime {
             let duration = Date().timeIntervalSince(lastTime)
             currentUsage.sttDurationSeconds += duration
             sessionSTTSeconds += duration  // ⭐️ 累計
@@ -303,13 +317,21 @@ final class BillingService {
         sttStartTime = nil
         lastSTTBillingTime = nil
         isAudioSending = false
-        let speedInfo = sttSpeedRatio > 1.0 ? "（\(sttSpeedRatio)x加速，節省\(String(format: "%.0f", (1 - 1/sttSpeedRatio) * 100))%）" : ""
-        print("💰 [Billing] STT 計時停止，累計: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒\(speedInfo)")
+
+        if isSTTBillingEnabled {
+            let speedInfo = sttSpeedRatio > 1.0 ? "（\(sttSpeedRatio)x加速，節省\(String(format: "%.0f", (1 - 1/sttSpeedRatio) * 100))%）" : ""
+            print("💰 [Billing] STT 計時停止，累計: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒\(speedInfo)")
+        } else {
+            print("💰 [Billing] STT 計時停止（免費 STT，無計費）")
+        }
+
+        isSTTBillingEnabled = false  // ⭐️ 重置，下次錄音重新設定
     }
 
     /// 直接添加 STT 時長（秒）- 已改為即時扣款
+    /// ⭐️ 經濟模式：isSTTBillingEnabled = false，跳過計費
     func addSTTDuration(seconds: Double) {
-        guard isBilling else { return }
+        guard isSTTBillingEnabled, isBilling else { return }
         currentUsage.sttDurationSeconds += seconds
         sessionSTTSeconds += seconds  // ⭐️ 累計
 
