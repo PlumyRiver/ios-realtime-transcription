@@ -35,6 +35,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// ⭐️ 定時智能翻譯計時器（用於 interim 結果）
     private var translationTimer: Timer?
     private let translationInterval: TimeInterval = 0.5  // 每 0.5 秒檢查一次
+    private var isTranslating: Bool = false  // ⭐️ 翻譯併發鎖，防止請求堆積
     private var currentInterimText: String = ""  // 當前累積的 interim 文本（完整）
     private var lastInterimLength: Int = 0  // 上次 interim 長度（用於檢測是否變長）
     private var lastTranslatedText: String = ""  // 上次翻譯的文本（避免重複翻譯）
@@ -173,6 +174,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// ⭐️ 靜音閾值（秒）
     /// 靜音超過此時間後自動 commit
     var vadSilenceThresholdSecs: Float = 1.0
+
+    /// ⭐️ 指定語言代碼（nil = 自動偵測）
+    /// 設定後，ElevenLabs 只會識別該語言，避免背景噪音被誤判
+    var specifiedLanguageCode: String? = nil
 
     // MARK: - Public Methods
 
@@ -474,20 +479,27 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private func connectWithToken(_ token: String, sourceLang: Language) {
         // 建立 WebSocket URL
         var urlComponents = URLComponents(string: elevenLabsWSEndpoint)!
-        urlComponents.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "model_id", value: modelId),
             URLQueryItem(name: "token", value: token),
-            // ⭐️ 省略 language_code 以啟用自動語言檢測
-            // ElevenLabs 會自動檢測說話者的語言，支援雙向翻譯場景
             URLQueryItem(name: "include_timestamps", value: "true"),
-            URLQueryItem(name: "commit_strategy", value: "vad"),  // ⭐️ 使用 VAD 自動 commit
-            // ⭐️ 使用可調整的 VAD 參數
+            URLQueryItem(name: "commit_strategy", value: "vad"),
             URLQueryItem(name: "vad_silence_threshold_secs", value: String(vadSilenceThresholdSecs)),
             URLQueryItem(name: "vad_threshold", value: String(vadThreshold)),
             URLQueryItem(name: "min_speech_duration_ms", value: String(minSpeechDurationMs)),
-            URLQueryItem(name: "min_silence_duration_ms", value: "500")  // 最小靜音 500ms
-            // ⚠️ 注意：inactivity_timeout 是 TTS 參數，STT 不支持！
+            URLQueryItem(name: "min_silence_duration_ms", value: "500")
         ]
+
+        // ⭐️ 如果有指定語言代碼，添加 language_code 參數
+        // 指定後 ElevenLabs 只識別該語言，避免背景噪音被誤判為其他語言
+        if let langCode = specifiedLanguageCode {
+            queryItems.append(URLQueryItem(name: "language_code", value: langCode))
+            print("🌐 [ElevenLabs] 指定語言: \(langCode)")
+        } else {
+            print("🌐 [ElevenLabs] 自動偵測語言")
+        }
+
+        urlComponents.queryItems = queryItems
 
         print("🎚️ [ElevenLabs] VAD 設定: threshold=\(vadThreshold), minSpeech=\(minSpeechDurationMs)ms, silence=\(vadSilenceThresholdSecs)s")
 
@@ -723,7 +735,68 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
             return true
         }
+        // 檢查常見錯誤佔位符
+        let errorPatterns = ["翻譯失敗", "請稍候", "error", "failed", "loading"]
+        for pattern in errorPatterns {
+            if trimmed.lowercased().contains(pattern.lowercased()) {
+                return true
+            }
+        }
         return false
+    }
+
+    // MARK: - ⭐️ 翻譯相似度檢查
+
+    /// 相似度閾值（超過則視為翻譯失敗）
+    private let translationSimilarityThreshold: Double = 0.70
+
+    /// ⭐️ 檢查翻譯結果是否與原文過於相似
+    /// 如果相似度 > 70%，視為翻譯失敗（可能 LLM 沒有正確翻譯）
+    private func isTranslationTooSimilar(original: String, translation: String) -> Bool {
+        // 正規化文本：去除空白、標點
+        let normalizedOriginal = normalizeTextForComparison(original)
+        let normalizedTranslation = normalizeTextForComparison(translation)
+
+        // 如果翻譯後長度差異很大，肯定不同
+        let lengthRatio = Double(normalizedTranslation.count) / Double(max(normalizedOriginal.count, 1))
+        if lengthRatio < 0.5 || lengthRatio > 2.0 {
+            return false
+        }
+
+        // 計算字符相似度
+        let similarity = calculateTextSimilarity(normalizedOriginal, normalizedTranslation)
+
+        if similarity > translationSimilarityThreshold {
+            print("⚠️ [翻譯檢查] 相似度 \(String(format: "%.1f%%", similarity * 100)) > \(String(format: "%.0f%%", translationSimilarityThreshold * 100))")
+            print("   原文: \"\(original.prefix(30))...\"")
+            print("   翻譯: \"\(translation.prefix(30))...\"")
+            return true
+        }
+
+        return false
+    }
+
+    /// 正規化文本（去除空白、標點）用於比較
+    private func normalizeTextForComparison(_ text: String) -> String {
+        var result = text.lowercased()
+        // 移除常見標點和空白
+        let punctuation = CharacterSet.punctuationCharacters.union(.whitespaces)
+        result = result.unicodeScalars.filter { !punctuation.contains($0) }.map { String($0) }.joined()
+        return result
+    }
+
+    /// 計算兩個字符串的相似度（Jaccard similarity）
+    private func calculateTextSimilarity(_ s1: String, _ s2: String) -> Double {
+        guard !s1.isEmpty && !s2.isEmpty else { return 0 }
+
+        // 使用字符集合計算 Jaccard 相似度
+        let set1 = Set(s1)
+        let set2 = Set(s2)
+
+        let intersection = set1.intersection(set2).count
+        let union = set1.union(set2).count
+
+        return Double(intersection) / Double(union)
     }
 
     /// ⭐️ 從 pendingSegments 獲取有效翻譯（過濾佔位符）
@@ -981,6 +1054,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         pendingSegments = []
         pendingSourceText = ""
         lastInterimGrowthTime = Date()  // 重置計時
+        isTranslating = false  // ⭐️ 重置翻譯鎖
 
         // ⭐️ 重置分句累積器
         let previousConfirmedCount = confirmedSegments.count
@@ -999,6 +1073,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// ⭐️ 分句一致性：傳遞 previousSegments 讓 LLM 保持前文分句邊界
     /// ⭐️ 失敗重試：最多重試 2 次，每次間隔 300ms
     private func callSmartTranslateAPI(text: String, includePreviousSegments: Bool = true) async {
+        // ⭐️ 併發鎖：上一個翻譯還在跑就跳過，防止堆積
+        guard !isTranslating else {
+            print("⏭️ [智能翻譯] 上一個請求尚未完成，跳過")
+            return
+        }
+        isTranslating = true
+        defer { isTranslating = false }
+
         let smartTranslateURL = tokenEndpoint.replacingOccurrences(of: "/elevenlabs-token", with: "/smart-translate")
 
         guard let url = URL(string: smartTranslateURL) else { return }
@@ -1011,6 +1093,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 8  // ⭐️ 翻譯 API 最多等 8 秒，避免堆積
 
         // ⭐️ 構建前文分句陣列（讓 LLM 保持分句一致性）
         var previousSegmentsArray: [[String: Any]] = []
@@ -1030,8 +1113,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             "provider": translationProvider.rawValue  // ⭐️ 傳遞用戶選擇的翻譯模型
         ]
 
-        // ⭐️ 重試機制：最多重試 2 次
-        let maxRetries = 2
+        // ⭐️ 重試機制：最多重試 3 次（包括相似度檢查失敗）
+        let maxRetries = 3
         var lastError: Error?
 
         for attempt in 0..<maxRetries {
@@ -1043,13 +1126,20 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 let response = try JSONDecoder().decode(SmartTranslateResponse.self, from: data)
 
                 // ⭐️ 檢查翻譯結果是否有效（不是空的或佔位符）
-                let hasValidTranslation = response.segments.contains { segment in
+                let validSegments = response.segments.filter { segment in
                     guard let translation = segment.translation else { return false }
-                    return !translation.isEmpty && !(translation.hasPrefix("[") && translation.hasSuffix("]"))
+                    return !translation.isEmpty && !isErrorPlaceholder(translation)
                 }
 
-                guard hasValidTranslation else {
+                guard !validSegments.isEmpty else {
                     throw TranslationError.emptyResult
+                }
+
+                // ⭐️ 檢查翻譯結果是否與原文過於相似（表示翻譯可能失敗）
+                let fullTranslation = validSegments.compactMap { $0.translation }.joined(separator: " ")
+                if isTranslationTooSimilar(original: text, translation: fullTranslation) {
+                    print("⚠️ [智能翻譯] 第 \(attempt + 1) 次翻譯結果與原文過於相似，重試...")
+                    throw TranslationError.emptyResult  // 視為翻譯失敗
                 }
 
                 // ⭐️ 記錄 LLM token 用量（用於計費，根據 provider 使用對應價格）
@@ -1066,15 +1156,17 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 }
 
                 // 成功，直接返回
+                print("✅ [智能翻譯] 第 \(attempt + 1) 次成功")
                 return
 
             } catch {
                 lastError = error
                 print("⚠️ [智能翻譯] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
 
-                // 如果不是最後一次嘗試，等待 300ms 再重試
+                // 如果不是最後一次嘗試，等待後再重試（指數退避）
                 if attempt < maxRetries - 1 {
-                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                    let delay = UInt64(300_000_000 * (attempt + 1))  // 300ms, 600ms, ...
+                    try? await Task.sleep(nanoseconds: delay)
                 }
             }
         }
@@ -1309,6 +1401,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// ⭐️ 增量翻譯並發送（只翻譯新增部分，合併已確認翻譯）
     /// 用於 VAD Commit 時，已有部分翻譯但有增量的情況
+    /// ⭐️ 增強：添加相似度檢查和重試機制
     /// - Parameters:
     ///   - fullText: 完整的 Final 文本
     ///   - confirmedTranslation: 已確認分句的翻譯
@@ -1316,36 +1409,56 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     private func translateIncrementalAndSend(fullText: String, confirmedTranslation: String, incrementalText: String) async {
         print("🔄 [增量翻譯] 只翻譯增量: \"\(incrementalText.prefix(30))...\"")
 
-        do {
-            // 只翻譯增量部分
-            let incrementalTranslation = try await fetchSmartTranslation(text: incrementalText)
+        // ⭐️ 重試機制
+        let maxRetries = 2
 
-            if !incrementalTranslation.isEmpty && !isErrorPlaceholder(incrementalTranslation) {
+        for attempt in 0..<maxRetries {
+            do {
+                // 只翻譯增量部分
+                let incrementalTranslation = try await fetchSmartTranslation(text: incrementalText)
+
+                // ⭐️ 檢查翻譯是否有效
+                guard !incrementalTranslation.isEmpty && !isErrorPlaceholder(incrementalTranslation) else {
+                    throw TranslationError.emptyResult
+                }
+
+                // ⭐️ 檢查翻譯結果是否與原文過於相似
+                if isTranslationTooSimilar(original: incrementalText, translation: incrementalTranslation) {
+                    print("⚠️ [增量翻譯] 第 \(attempt + 1) 次翻譯結果與原文過於相似")
+                    throw TranslationError.emptyResult
+                }
+
                 // 合併已確認翻譯 + 增量翻譯
                 let combinedTranslation = confirmedTranslation + " " + incrementalTranslation
 
                 await MainActor.run {
                     translationSubject.send((fullText, combinedTranslation))
-                    print("✅ [增量翻譯] 成功合併:")
+                    print("✅ [增量翻譯] 第 \(attempt + 1) 次成功合併:")
                     print("   已確認: \(confirmedTranslation.prefix(30))...")
                     print("   增量: \(incrementalTranslation.prefix(30))...")
                 }
                 return
+
+            } catch {
+                print("⚠️ [增量翻譯] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
+
+                if attempt < maxRetries - 1 {
+                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                }
             }
-        } catch {
-            print("⚠️ [增量翻譯] 失敗: \(error.localizedDescription)")
         }
 
         // 增量翻譯失敗，回退到完整翻譯
-        print("⚠️ [增量翻譯] 回退到完整翻譯")
+        print("⚠️ [增量翻譯] \(maxRetries) 次重試都失敗，回退到完整翻譯")
         await translateAndSendFinal(fullText)
     }
 
     /// ⭐️ 翻譯並發送 Final 結果（確保翻譯不會丟失）
     /// 專門用於 VAD commit 時需要重新翻譯的情況
     /// 會嘗試 smart-translate，失敗則使用 translate API，最後使用重試機制
+    /// ⭐️ 增強：添加相似度檢查，翻譯結果與原文過於相似時重試
     private func translateAndSendFinal(_ text: String) async {
-        let maxRetries = 2
+        let maxRetries = 3  // 增加重試次數
         var lastError: Error?
 
         for attempt in 0..<maxRetries {
@@ -1353,30 +1466,37 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 // 嘗試使用 smart-translate API
                 let translation = try await fetchSmartTranslation(text: text)
 
-                if !translation.isEmpty && !isErrorPlaceholder(translation) {
-                    await MainActor.run {
-                        translationSubject.send((text, translation))
-                        print("✅ [翻譯成功] \(text.prefix(30))... → \(translation.prefix(40))...")
-                    }
-                    return
-                } else {
-                    // 翻譯為空或是佔位符，嘗試備用 API
+                // ⭐️ 檢查翻譯是否為空或佔位符
+                guard !translation.isEmpty && !isErrorPlaceholder(translation) else {
                     throw TranslationError.emptyResult
                 }
+
+                // ⭐️ 檢查翻譯結果是否與原文過於相似
+                if isTranslationTooSimilar(original: text, translation: translation) {
+                    print("⚠️ [翻譯重試] 第 \(attempt + 1) 次翻譯結果與原文過於相似")
+                    throw TranslationError.emptyResult
+                }
+
+                await MainActor.run {
+                    translationSubject.send((text, translation))
+                    print("✅ [翻譯成功] 第 \(attempt + 1) 次: \(text.prefix(30))... → \(translation.prefix(40))...")
+                }
+                return
 
             } catch {
                 lastError = error
                 print("⚠️ [翻譯重試] 第 \(attempt + 1) 次失敗: \(error.localizedDescription)")
 
-                // 如果不是最後一次嘗試，等待一下再重試
+                // 如果不是最後一次嘗試，等待後再重試（指數退避）
                 if attempt < maxRetries - 1 {
-                    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
+                    let delay = UInt64(300_000_000 * (attempt + 1))  // 300ms, 600ms, ...
+                    try? await Task.sleep(nanoseconds: delay)
                 }
             }
         }
 
         // 所有重試都失敗，嘗試使用簡單翻譯 API
-        print("⚠️ [翻譯] smart-translate 失敗，嘗試 translate API")
+        print("⚠️ [翻譯] smart-translate \(maxRetries) 次失敗，嘗試 translate API")
         await translateTextDirectly(text, isInterim: false)
     }
 

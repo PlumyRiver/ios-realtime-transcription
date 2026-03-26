@@ -260,11 +260,19 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         sourceRequest = nil
         sourceRecognizer = nil
 
+        // ⭐️ 停止重建計時器
+        singleLanguageRebuildTimer?.invalidate()
+        singleLanguageRebuildTimer = nil
+
         // 重置結果
         lastSourceResult = nil
         lastEmittedText = ""
         lastEmittedLanguage = ""
     }
+
+    /// ⭐️ 單語言模式任務重建計時器
+    private var singleLanguageRebuildTimer: Timer?
+    private let singleLanguageRebuildInterval: TimeInterval = 50.0  // 50 秒重建（Apple 限制約 1 分鐘）
 
     /// 啟動單語言識別
     private func startSingleLanguageRecognition() {
@@ -300,8 +308,82 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             self?.handleSingleLanguageResult(result: result, error: error)
         }
 
+        // ⭐️ 設置任務重建計時器（避免 Apple STT 1 分鐘超時限制）
+        setupSingleLanguageRebuildTimer()
+
         connectionState = .connected
         print("✅ [Apple STT] 單語言識別已啟動: \(currentActiveLanguage.shortName)")
+    }
+
+    /// ⭐️ 設置單語言模式的任務重建計時器
+    private func setupSingleLanguageRebuildTimer() {
+        singleLanguageRebuildTimer?.invalidate()
+        // ⭐️ 使用 .common mode，確保 UI 操作時 timer 也能觸發
+        singleLanguageRebuildTimer = Timer(timeInterval: singleLanguageRebuildInterval, repeats: true) { [weak self] _ in
+            self?.rebuildSingleLanguageTask()
+        }
+        if let timer = singleLanguageRebuildTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        print("⏰ [Apple STT] 單語言重建計時器已啟動 (\(Int(singleLanguageRebuildInterval))秒, .common mode)")
+    }
+
+    /// ⭐️ 重建單語言識別任務（避免 1 分鐘超時）
+    private func rebuildSingleLanguageTask() {
+        guard isSingleLanguageMode, connectionState == .connected else { return }
+
+        // ⭐️ 如果正在比較語言，跳過重建
+        guard !isComparingLanguages else {
+            print("⏸️ [Apple STT] 比較模式中，跳過重建")
+            return
+        }
+
+        // ⭐️ 冷卻時間檢查（防止快速循環重啟）
+        if let lastRebuild = lastRebuildTime,
+           Date().timeIntervalSince(lastRebuild) < rebuildCooldown {
+            print("⏳ [Apple STT] 重建冷卻中，跳過本次重建")
+            return
+        }
+
+        lastRebuildTime = Date()
+        print("🔄 [Apple STT] 重建單語言識別任務（避免超時）")
+
+        // 結束舊任務
+        sourceTask?.cancel()
+        sourceRequest?.endAudio()
+        sourceTask = nil
+        sourceRequest = nil
+
+        // 重置狀態
+        lastEmittedText = ""
+
+        // 短暫延遲後重建（讓系統釋放資源）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self, self.isSingleLanguageMode, self.connectionState == .connected else { return }
+
+            // 重新創建識別請求和任務
+            guard let recognizer = self.sourceRecognizer, recognizer.isAvailable else {
+                print("⚠️ [Apple STT] 識別器不可用，無法重建")
+                return
+            }
+
+            self.sourceRequest = SFSpeechAudioBufferRecognitionRequest()
+            guard let request = self.sourceRequest else {
+                print("⚠️ [Apple STT] 無法創建識別請求")
+                return
+            }
+
+            request.shouldReportPartialResults = true
+            if recognizer.supportsOnDeviceRecognition {
+                request.requiresOnDeviceRecognition = true
+            }
+
+            self.sourceTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+                self?.handleSingleLanguageResult(result: result, error: error)
+            }
+
+            print("✅ [Apple STT] 單語言識別任務已重建")
+        }
     }
 
     /// 處理單語言識別結果
@@ -318,6 +400,25 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
                 consecutiveErrorCount += 1
                 if consecutiveErrorCount == 1 {
                     print("ℹ️ [Apple STT/\(currentActiveLanguage.shortName)] 等待語音輸入...")
+                } else if consecutiveErrorCount % 10 == 0 {
+                    print("ℹ️ [Apple STT] 持續等待語音... (已等待 \(consecutiveErrorCount) 次)")
+                }
+
+                // ⭐️ 修復：單語言模式也要有重建邏輯（和雙語言模式一致）
+                if consecutiveErrorCount >= maxConsecutiveErrors * 2 {
+                    // 檢查冷卻時間
+                    if let lastRebuild = lastRebuildTime,
+                       Date().timeIntervalSince(lastRebuild) < rebuildCooldown {
+                        // 還在冷卻中，不重建
+                        return
+                    }
+
+                    print("🔄 [Apple STT] 長時間無語音，嘗試重建單語言任務...")
+                    consecutiveErrorCount = 0
+                    lastRebuildTime = Date()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self?.rebuildSingleLanguageTask()
+                    }
                 }
                 return
             }
@@ -440,6 +541,8 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
         debounceTimer = nil
         taskRebuildTimer?.invalidate()
         taskRebuildTimer = nil
+        singleLanguageRebuildTimer?.invalidate()  // ⭐️ 單語言模式重建計時器
+        singleLanguageRebuildTimer = nil
 
         // 重置狀態
         lastSourceResult = nil
@@ -741,12 +844,14 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
     private func setupTaskRebuildTimer() {
         taskRebuildTimer?.invalidate()
-        taskRebuildTimer = Timer.scheduledTimer(
-            withTimeInterval: taskRebuildInterval,
-            repeats: true
-        ) { [weak self] _ in
+        // ⭐️ 使用 .common mode，確保 UI 操作時 timer 也能觸發
+        taskRebuildTimer = Timer(timeInterval: taskRebuildInterval, repeats: true) { [weak self] _ in
             self?.rebuildRecognitionTasks()
         }
+        if let timer = taskRebuildTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        print("⏰ [Apple STT] 雙語言重建計時器已啟動 (\(Int(taskRebuildInterval))秒, .common mode)")
     }
 
     /// 重建識別任務（避免 1 分鐘超時限制）
@@ -1055,6 +1160,19 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
     // MARK: - Translation
 
+    /// 翻譯錯誤類型
+    private enum TranslationError: Error {
+        case emptyResult          // 空結果
+        case similarToOriginal    // 翻譯結果與原文過於相似
+        case networkError         // 網絡錯誤
+        case invalidResponse      // 無效響應
+    }
+
+    /// ⭐️ 翻譯重試配置
+    private let maxTranslationRetries = 3        // 最大重試次數
+    private let translationRetryDelay: UInt64 = 500_000_000  // 500ms
+    private let similarityThreshold: Double = 0.70  // 相似度閾值（超過則視為翻譯失敗）
+
     private func translateText(text: String, detectedLang: String) {
         Task {
             await callTranslationAPI(text: text, detectedLang: detectedLang)
@@ -1068,17 +1186,77 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
         print("🌐 [Apple STT] 翻譯: \(detectedLang) → \(translateTo)")
 
+        // ⭐️ 重試機制
+        var lastError: TranslationError?
+
+        for attempt in 1...maxTranslationRetries {
+            do {
+                let (translation, segments) = try await performTranslationRequest(
+                    text: text,
+                    originalText: text,
+                    attempt: attempt
+                )
+
+                // ⭐️ 檢查翻譯結果是否與原文過於相似
+                if isTranslationTooSimilar(original: text, translation: translation) {
+                    print("⚠️ [Apple STT] 第 \(attempt) 次翻譯結果與原文過於相似，重試...")
+                    throw TranslationError.similarToOriginal
+                }
+
+                // ⭐️ 翻譯成功，發送結果
+                DispatchQueue.main.async {
+                    if let segments = segments, !segments.isEmpty {
+                        self._segmentedTranslationSubject.send((text, segments))
+                    }
+                    self._translationSubject.send((text, translation))
+                }
+
+                print("✅ [Apple STT] 翻譯成功（第 \(attempt) 次）: \"\(translation.prefix(40))...\"")
+                return
+
+            } catch let error as TranslationError {
+                lastError = error
+                print("⚠️ [Apple STT] 第 \(attempt) 次翻譯失敗: \(error)")
+
+                // 如果不是最後一次嘗試，等待後重試
+                if attempt < maxTranslationRetries {
+                    try? await Task.sleep(nanoseconds: translationRetryDelay)
+                }
+            } catch {
+                print("⚠️ [Apple STT] 第 \(attempt) 次翻譯異常: \(error.localizedDescription)")
+
+                if attempt < maxTranslationRetries {
+                    try? await Task.sleep(nanoseconds: translationRetryDelay)
+                }
+            }
+        }
+
+        // ⭐️ 所有重試都失敗
+        print("❌ [Apple STT] 翻譯 \(maxTranslationRetries) 次重試都失敗，最後錯誤: \(String(describing: lastError))")
+
+        // 發送錯誤通知（可選：發送佔位符翻譯）
+        DispatchQueue.main.async {
+            self._errorSubject.send("翻譯失敗，請重試")
+        }
+    }
+
+    /// ⭐️ 執行單次翻譯請求
+    private func performTranslationRequest(
+        text: String,
+        originalText: String,
+        attempt: Int
+    ) async throws -> (translation: String, segments: [TranslationSegment]?) {
         // 構建 API URL
         let urlString = "https://\(serverURL)/smart-translate"
         guard let url = URL(string: urlString) else {
-            print("❌ [Apple STT] 無效的翻譯 URL")
-            return
+            throw TranslationError.networkError
         }
 
         // 構建請求
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10.0  // 10 秒超時
 
         let body: [String: Any] = [
             "text": text,
@@ -1087,74 +1265,140 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
             "provider": translationProvider.rawValue
         ]
 
-        do {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
 
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                print("❌ [Apple STT] 翻譯 API 錯誤")
-                return
-            }
-
-            // 解析響應
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                // ⭐️ 解析 LLM usage 並記錄計費（API 返回駝峰命名）
-                if let usage = json["usage"] as? [String: Any] {
-                    let inputTokens = usage["inputTokens"] as? Int ?? 0
-                    let outputTokens = usage["outputTokens"] as? Int ?? 0
-
-                    if inputTokens > 0 || outputTokens > 0 {
-                        BillingService.shared.recordLLMUsage(
-                            inputTokens: inputTokens,
-                            outputTokens: outputTokens,
-                            provider: translationProvider
-                        )
-                        print("💰 [Apple STT] LLM 計費: \(inputTokens) + \(outputTokens) tokens")
-                    }
-                }
-
-                // 嘗試解析 segments
-                if let segmentsArray = json["segments"] as? [[String: Any]] {
-                    var segments: [TranslationSegment] = []
-                    for seg in segmentsArray {
-                        if let original = seg["original"] as? String,
-                           let translation = seg["translation"] as? String {
-                            let isComplete = seg["isComplete"] as? Bool ?? true
-                            segments.append(TranslationSegment(
-                                original: original,
-                                translation: translation,
-                                isComplete: isComplete
-                            ))
-                        }
-                    }
-
-                    if !segments.isEmpty {
-                        let fullTranslation = segments.map { $0.translation }.joined(separator: " ")
-
-                        DispatchQueue.main.async {
-                            self._segmentedTranslationSubject.send((text, segments))
-                            self._translationSubject.send((text, fullTranslation))
-                        }
-
-                        print("✅ [Apple STT] 翻譯完成: \"\(fullTranslation.prefix(40))...\"")
-                        return
-                    }
-                }
-
-                // 回退：使用簡單翻譯
-                if let translation = json["translation"] as? String {
-                    DispatchQueue.main.async {
-                        self._translationSubject.send((text, translation))
-                    }
-                    print("✅ [Apple STT] 翻譯完成: \"\(translation.prefix(40))...\"")
-                }
-            }
-
-        } catch {
-            print("❌ [Apple STT] 翻譯請求失敗: \(error.localizedDescription)")
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw TranslationError.networkError
         }
+
+        // 解析響應
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw TranslationError.invalidResponse
+        }
+
+        // ⭐️ 解析 LLM usage 並記錄計費
+        if let usage = json["usage"] as? [String: Any] {
+            let inputTokens = usage["inputTokens"] as? Int ?? 0
+            let outputTokens = usage["outputTokens"] as? Int ?? 0
+
+            if inputTokens > 0 || outputTokens > 0 {
+                BillingService.shared.recordLLMUsage(
+                    inputTokens: inputTokens,
+                    outputTokens: outputTokens,
+                    provider: translationProvider
+                )
+                print("💰 [Apple STT] LLM 計費: \(inputTokens) + \(outputTokens) tokens")
+            }
+        }
+
+        // 嘗試解析 segments
+        if let segmentsArray = json["segments"] as? [[String: Any]] {
+            var segments: [TranslationSegment] = []
+            for seg in segmentsArray {
+                if let original = seg["original"] as? String,
+                   let translation = seg["translation"] as? String {
+                    // ⭐️ 過濾佔位符
+                    guard !isErrorPlaceholder(translation) else { continue }
+
+                    let isComplete = seg["isComplete"] as? Bool ?? true
+                    segments.append(TranslationSegment(
+                        original: original,
+                        translation: translation,
+                        isComplete: isComplete
+                    ))
+                }
+            }
+
+            if !segments.isEmpty {
+                let fullTranslation = segments.map { $0.translation }.joined(separator: " ")
+
+                // ⭐️ 檢查翻譯是否為空或佔位符
+                guard !fullTranslation.isEmpty && !isErrorPlaceholder(fullTranslation) else {
+                    throw TranslationError.emptyResult
+                }
+
+                return (fullTranslation, segments)
+            }
+        }
+
+        // 回退：使用簡單翻譯
+        if let translation = json["translation"] as? String {
+            guard !translation.isEmpty && !isErrorPlaceholder(translation) else {
+                throw TranslationError.emptyResult
+            }
+            return (translation, nil)
+        }
+
+        throw TranslationError.emptyResult
+    }
+
+    /// ⭐️ 檢查翻譯結果是否與原文過於相似
+    /// 如果相似度 > 70%，視為翻譯失敗（可能 LLM 沒有正確翻譯）
+    private func isTranslationTooSimilar(original: String, translation: String) -> Bool {
+        // 正規化文本：去除空白、標點
+        let normalizedOriginal = normalizeText(original)
+        let normalizedTranslation = normalizeText(translation)
+
+        // 如果翻譯後長度差異很大，肯定不同
+        let lengthRatio = Double(normalizedTranslation.count) / Double(max(normalizedOriginal.count, 1))
+        if lengthRatio < 0.5 || lengthRatio > 2.0 {
+            return false
+        }
+
+        // 計算字符相似度
+        let similarity = calculateSimilarity(normalizedOriginal, normalizedTranslation)
+
+        if similarity > similarityThreshold {
+            print("⚠️ [翻譯檢查] 相似度 \(String(format: "%.1f%%", similarity * 100)) > \(String(format: "%.0f%%", similarityThreshold * 100))")
+            print("   原文: \"\(original.prefix(30))...\"")
+            print("   翻譯: \"\(translation.prefix(30))...\"")
+            return true
+        }
+
+        return false
+    }
+
+    /// 正規化文本（去除空白、標點）
+    private func normalizeText(_ text: String) -> String {
+        var result = text.lowercased()
+        // 移除常見標點和空白
+        let punctuation = CharacterSet.punctuationCharacters.union(.whitespaces)
+        result = result.unicodeScalars.filter { !punctuation.contains($0) }.map { String($0) }.joined()
+        return result
+    }
+
+    /// 計算兩個字符串的相似度（Jaccard similarity）
+    private func calculateSimilarity(_ s1: String, _ s2: String) -> Double {
+        guard !s1.isEmpty && !s2.isEmpty else { return 0 }
+
+        // 使用字符集合計算 Jaccard 相似度
+        let set1 = Set(s1)
+        let set2 = Set(s2)
+
+        let intersection = set1.intersection(set2).count
+        let union = set1.union(set2).count
+
+        return Double(intersection) / Double(union)
+    }
+
+    /// 檢查是否為錯誤佔位符
+    private func isErrorPlaceholder(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        // 檢查 [xxx] 格式的佔位符
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            return true
+        }
+        // 檢查常見錯誤佔位符
+        let errorPatterns = ["翻譯失敗", "請稍候", "error", "failed", "loading"]
+        for pattern in errorPatterns {
+            if trimmed.lowercased().contains(pattern.lowercased()) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Audio Conversion

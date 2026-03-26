@@ -50,13 +50,53 @@ enum ConnectionStatus {
     }
 }
 
+/// ⭐️ ViewModel 設定的 UserDefaults 鍵值（放在類外避免 @Observable macro 干擾）
+private enum VMSettingsKey: String {
+    case sourceLang
+    case targetLang
+    case ttsPlaybackMode
+    case ttsProvider
+    case inputMode
+    case isEconomyMode
+    case sttProvider
+    case translationProvider
+    case vadThreshold
+    case isLocalVADEnabled
+    case localVADVolumeThreshold
+    case localVADSilenceThreshold
+    case isAudioSpeedUpEnabled
+    case minSpeechDurationMs
+    case isSpeakerMode
+    case isAutoLanguageSwitchEnabled
+    case autoSwitchConfidenceThreshold
+    case isComparisonDisplayMode
+    case sttLanguageDetectionMode
+}
+
 @Observable
 final class TranscriptionViewModel {
 
     // MARK: - Published Properties
 
-    var sourceLang: Language = .zh
-    var targetLang: Language = .en
+    var sourceLang: Language = .zh {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.sourceLang, value: sourceLang.rawValue)
+            // 語言變更時同步更新 ElevenLabs 指定語言
+            if sttLanguageDetectionMode == .specifySource {
+                updateElevenLabsLanguageCode()
+            }
+        }
+    }
+    var targetLang: Language = .en {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.targetLang, value: targetLang.rawValue)
+            if sttLanguageDetectionMode == .specifyTarget {
+                updateElevenLabsLanguageCode()
+            }
+        }
+    }
     var status: ConnectionStatus = .disconnected
 
     /// ⭐️ 額度不足對話框
@@ -82,16 +122,27 @@ final class TranscriptionViewModel {
     /// 擴音模式狀態（默認開啟，提升 TTS 音量）
     var isSpeakerMode: Bool = true {
         didSet {
-            // 同步到 AudioManager
+            guard !isInitializing else { return }
             audioManager.isSpeakerMode = isSpeakerMode
+            saveSetting(.isSpeakerMode, value: isSpeakerMode)
         }
     }
 
     /// TTS 播放模式（四段切換）
-    var ttsPlaybackMode: TTSPlaybackMode = .all
+    var ttsPlaybackMode: TTSPlaybackMode = .all {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.ttsPlaybackMode, value: ttsPlaybackMode.rawValue)
+        }
+    }
 
     /// ⭐️ TTS 服務商（Azure 或 Apple）
-    var ttsProvider: TTSProvider = .apple
+    var ttsProvider: TTSProvider = .apple {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.ttsProvider, value: ttsProvider.rawValue)
+        }
+    }
 
     /// 自動播放翻譯（TTS）- 計算屬性，向後兼容
     var autoPlayTTS: Bool {
@@ -144,9 +195,11 @@ final class TranscriptionViewModel {
 
     var inputMode: InputMode = .ptt {
         didSet {
+            guard !isInitializing else { return }
             if oldValue != inputMode {
                 handleInputModeChange()
             }
+            saveSetting(.inputMode, value: inputMode.rawValue)
         }
     }
 
@@ -165,6 +218,7 @@ final class TranscriptionViewModel {
     /// 經濟模式：使用免費的 Apple STT 和 TTS
     var isEconomyMode: Bool = false {
         didSet {
+            guard !isInitializing else { return }
             if oldValue != isEconomyMode {
                 if isEconomyMode {
                     print("🌿 [經濟模式] 啟用 - 切換到 Apple STT/TTS")
@@ -176,6 +230,7 @@ final class TranscriptionViewModel {
                     ttsProvider = .azure
                 }
             }
+            saveSetting(.isEconomyMode, value: isEconomyMode)
         }
     }
 
@@ -189,7 +244,9 @@ final class TranscriptionViewModel {
     /// 當識別信心度低於閾值時，自動切換語言重試並比較結果
     var isAutoLanguageSwitchEnabled: Bool = true {
         didSet {
+            guard !isInitializing else { return }
             appleSTTService.isAutoLanguageSwitchEnabled = isAutoLanguageSwitchEnabled
+            saveSetting(.isAutoLanguageSwitchEnabled, value: isAutoLanguageSwitchEnabled)
             print("🔄 [經濟模式] 自動語言切換: \(isAutoLanguageSwitchEnabled ? "啟用" : "停用")")
         }
     }
@@ -197,7 +254,9 @@ final class TranscriptionViewModel {
     /// 自動切換的信心度閾值（0.0 ~ 1.0）
     var autoSwitchConfidenceThreshold: Float = 0.70 {
         didSet {
+            guard !isInitializing else { return }
             appleSTTService.confidenceThreshold = autoSwitchConfidenceThreshold
+            saveSetting(.autoSwitchConfidenceThreshold, value: autoSwitchConfidenceThreshold)
             print("🔄 [經濟模式] 信心度閾值: \(String(format: "%.0f", autoSwitchConfidenceThreshold * 100))%")
         }
     }
@@ -206,7 +265,9 @@ final class TranscriptionViewModel {
     /// 用於調試和比較兩種語言的辨識效果
     var isComparisonDisplayMode: Bool = false {
         didSet {
+            guard !isInitializing else { return }
             appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
+            saveSetting(.isComparisonDisplayMode, value: isComparisonDisplayMode)
             print("🔬 [經濟模式] 比較顯示模式: \(isComparisonDisplayMode ? "啟用" : "停用")")
         }
     }
@@ -214,30 +275,69 @@ final class TranscriptionViewModel {
     /// ⭐️ STT 提供商選擇（預設 ElevenLabs，延遲更低）
     var sttProvider: STTProvider = .elevenLabs {
         didSet {
+            guard !isInitializing else { return }
             if oldValue != sttProvider {
                 print("🔄 [STT] 切換提供商: \(oldValue.displayName) → \(sttProvider.displayName)")
-                // 如果正在錄音，需要重新連接
                 if isRecording {
                     Task { @MainActor in
                         stopRecording()
-                        try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s 延遲
+                        try? await Task.sleep(nanoseconds: 500_000_000)
                         await startRecording()
                     }
                 }
             }
+            saveSetting(.sttProvider, value: sttProvider.rawValue)
         }
     }
 
     /// ⭐️ 翻譯模型選擇（預設 Grok）
     var translationProvider: TranslationProvider = .grok {
         didSet {
+            guard !isInitializing else { return }
             if oldValue != translationProvider {
                 print("🔄 [翻譯] 切換模型: \(oldValue.displayName) → \(translationProvider.displayName)")
-                // 更新各 STT 服務的翻譯模型
                 elevenLabsService.translationProvider = translationProvider
                 appleSTTService.translationProvider = translationProvider
             }
+            saveSetting(.translationProvider, value: translationProvider.rawValue)
         }
+    }
+
+    // MARK: - ⭐️ STT 語言偵測模式
+
+    /// 語言偵測模式：自動偵測 / 指定來源語言 / 指定目標語言
+    var sttLanguageDetectionMode: STTLanguageDetectionMode = .auto {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.sttLanguageDetectionMode, value: sttLanguageDetectionMode.rawValue)
+            updateElevenLabsLanguageCode()
+            print("🌐 [STT] 語言偵測模式: \(sttLanguageDetectionMode.displayName)")
+        }
+    }
+
+    /// 根據當前模式計算 ElevenLabs 應使用的語言代碼
+    private func getSpecifiedLanguageCode() -> String? {
+        switch sttLanguageDetectionMode {
+        case .auto:
+            return nil  // 不指定，自動偵測
+        case .specifySource:
+            return mapToElevenLabsCode(sourceLang)
+        case .specifyTarget:
+            return mapToElevenLabsCode(targetLang)
+        }
+    }
+
+    /// 將 Language enum 映射為 ElevenLabs 語言代碼
+    private func mapToElevenLabsCode(_ lang: Language) -> String {
+        switch lang {
+        case .isLang: return "is"
+        default: return lang.rawValue
+        }
+    }
+
+    /// 更新 ElevenLabs 的語言代碼設定
+    private func updateElevenLabsLanguageCode() {
+        elevenLabsService.specifiedLanguageCode = getSpecifiedLanguageCode()
     }
 
     // MARK: - ElevenLabs VAD 設定
@@ -246,7 +346,9 @@ final class TranscriptionViewModel {
     /// 越高越嚴格，需要更大聲音才會觸發語音識別
     var vadThreshold: Float = 0.3 {
         didSet {
+            guard !isInitializing else { return }
             elevenLabsService.vadThreshold = vadThreshold
+            saveSetting(.vadThreshold, value: vadThreshold)
             print("🎚️ [ElevenLabs VAD] 閾值調整: \(vadThreshold)")
         }
     }
@@ -258,7 +360,9 @@ final class TranscriptionViewModel {
     /// 本地 VAD 開關（預設開啟，節省 STT 費用）
     var isLocalVADEnabled: Bool = true {
         didSet {
+            guard !isInitializing else { return }
             audioManager.isVADEnabled = isLocalVADEnabled
+            saveSetting(.isLocalVADEnabled, value: isLocalVADEnabled)
             print("🎙️ [本地 VAD] \(isLocalVADEnabled ? "已啟用" : "已停用")")
         }
     }
@@ -266,7 +370,9 @@ final class TranscriptionViewModel {
     /// 本地 VAD 音量閾值（0.0 ~ 1.0，建議 0.01 ~ 0.05）
     var localVADVolumeThreshold: Float = 0.02 {
         didSet {
+            guard !isInitializing else { return }
             audioManager.vadVolumeThreshold = localVADVolumeThreshold
+            saveSetting(.localVADVolumeThreshold, value: localVADVolumeThreshold)
             print("🎚️ [本地 VAD] 音量閾值: \(localVADVolumeThreshold)")
         }
     }
@@ -274,7 +380,9 @@ final class TranscriptionViewModel {
     /// 本地 VAD 靜音閾值（秒）- 靜音超過此時間暫停發送
     var localVADSilenceThreshold: TimeInterval = 2.0 {
         didSet {
+            guard !isInitializing else { return }
             audioManager.vadSilenceThreshold = localVADSilenceThreshold
+            saveSetting(.localVADSilenceThreshold, value: localVADSilenceThreshold)
             print("🎚️ [本地 VAD] 靜音閾值: \(localVADSilenceThreshold)s")
         }
     }
@@ -293,11 +401,10 @@ final class TranscriptionViewModel {
     /// 預設開啟，節省 33% STT 成本
     var isAudioSpeedUpEnabled: Bool = true {
         didSet {
+            guard !isInitializing else { return }
             audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
-
-            // ⭐️ 更新計費服務的加速比（1.5x 加速 → 計費降為 66.7%）
             BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
-
+            saveSetting(.isAudioSpeedUpEnabled, value: isAudioSpeedUpEnabled)
             if isAudioSpeedUpEnabled {
                 print("🚀 [STT] 音頻加速已啟用（1.5x，節省 33% 成本，+300ms 延遲）")
             } else {
@@ -321,7 +428,9 @@ final class TranscriptionViewModel {
     /// ⭐️ 最小語音長度（毫秒）
     var minSpeechDurationMs: Int = 100 {
         didSet {
+            guard !isInitializing else { return }
             elevenLabsService.minSpeechDurationMs = minSpeechDurationMs
+            saveSetting(.minSpeechDurationMs, value: minSpeechDurationMs)
             print("🎚️ [VAD] 最小語音長度: \(minSpeechDurationMs)ms")
         }
     }
@@ -485,28 +594,123 @@ final class TranscriptionViewModel {
     private var durationTimer: Timer?
     private var startTime: Date?
 
+    /// ⭐️ 初始化標記：@Observable 會讓 didSet 在 init() 中也觸發，
+    /// 此 flag 防止初始化期間的連鎖副作用（寫入 UserDefaults、同步服務等）
+    private var isInitializing = true
+
     /// ⭐️ Streaming TTS 穩定計時器
     /// 收到 interim 後等待 1 秒，如果沒有新的更新才開始播放
     private var streamingTTSTimer: Timer?
 
+    // MARK: - ⭐️ 設定持久化（UserDefaults）
+
+    /// 儲存單一設定到 UserDefaults
+    private func saveSetting(_ key: VMSettingsKey, value: Any) {
+        guard !isInitializing else { return }
+        UserDefaults.standard.set(value, forKey: key.rawValue)
+    }
+
     // MARK: - Initialization
 
     init() {
-        setupSubscriptions()
-        // ⭐️ 不在 init 中預取 token，避免 ViewModel 多次初始化導致重複預取
-        // 改為在 ContentView 的 onAppear 中手動調用
+        // ⭐️ 直接在 init 中載入 UserDefaults（直接賦值不觸發 didSet，避免連鎖副作用）
+        let defaults = UserDefaults.standard
 
-        // ⭐️ 同步初始化預設設定（didSet 不會在初始化時觸發）
-        // 1. 音頻加速 1.5x
-        if isAudioSpeedUpEnabled {
-            audioTimeStretcher.setEnabled(true)
-            BillingService.shared.setSTTSpeedRatio(1.5)
+        if let raw = defaults.string(forKey: VMSettingsKey.sourceLang.rawValue),
+           let lang = Language(rawValue: raw) {
+            sourceLang = lang
         }
-        // 2. 翻譯模型同步到各 STT 服務
+        if let raw = defaults.string(forKey: VMSettingsKey.targetLang.rawValue),
+           let lang = Language(rawValue: raw) {
+            targetLang = lang
+        }
+        if defaults.object(forKey: VMSettingsKey.ttsPlaybackMode.rawValue) != nil,
+           let mode = TTSPlaybackMode(rawValue: defaults.integer(forKey: VMSettingsKey.ttsPlaybackMode.rawValue)) {
+            ttsPlaybackMode = mode
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.ttsProvider.rawValue),
+           let provider = TTSProvider(rawValue: raw) {
+            ttsProvider = provider
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.inputMode.rawValue),
+           let mode = InputMode(rawValue: raw) {
+            inputMode = mode
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.sttProvider.rawValue),
+           let provider = STTProvider(rawValue: raw) {
+            sttProvider = provider
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.translationProvider.rawValue),
+           let provider = TranslationProvider(rawValue: raw) {
+            translationProvider = provider
+        }
+        // 經濟模式（會決定 sttProvider/ttsProvider，但在 init 中 didSet 不觸發）
+        if defaults.object(forKey: VMSettingsKey.isEconomyMode.rawValue) != nil {
+            isEconomyMode = defaults.bool(forKey: VMSettingsKey.isEconomyMode.rawValue)
+            // ⭐️ 手動同步經濟模式的提供商（因為 didSet 不觸發）
+            if isEconomyMode {
+                sttProvider = .apple
+                ttsProvider = .apple
+            }
+        }
+        if defaults.object(forKey: VMSettingsKey.vadThreshold.rawValue) != nil {
+            vadThreshold = defaults.float(forKey: VMSettingsKey.vadThreshold.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isLocalVADEnabled.rawValue) != nil {
+            isLocalVADEnabled = defaults.bool(forKey: VMSettingsKey.isLocalVADEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue) != nil {
+            localVADVolumeThreshold = defaults.float(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.localVADSilenceThreshold.rawValue) != nil {
+            localVADSilenceThreshold = defaults.double(forKey: VMSettingsKey.localVADSilenceThreshold.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isAudioSpeedUpEnabled.rawValue) != nil {
+            isAudioSpeedUpEnabled = defaults.bool(forKey: VMSettingsKey.isAudioSpeedUpEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.minSpeechDurationMs.rawValue) != nil {
+            minSpeechDurationMs = defaults.integer(forKey: VMSettingsKey.minSpeechDurationMs.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isSpeakerMode.rawValue) != nil {
+            isSpeakerMode = defaults.bool(forKey: VMSettingsKey.isSpeakerMode.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isAutoLanguageSwitchEnabled.rawValue) != nil {
+            isAutoLanguageSwitchEnabled = defaults.bool(forKey: VMSettingsKey.isAutoLanguageSwitchEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.autoSwitchConfidenceThreshold.rawValue) != nil {
+            autoSwitchConfidenceThreshold = defaults.float(forKey: VMSettingsKey.autoSwitchConfidenceThreshold.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isComparisonDisplayMode.rawValue) != nil {
+            isComparisonDisplayMode = defaults.bool(forKey: VMSettingsKey.isComparisonDisplayMode.rawValue)
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.sttLanguageDetectionMode.rawValue),
+           let mode = STTLanguageDetectionMode(rawValue: raw) {
+            sttLanguageDetectionMode = mode
+        }
+
+        print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName)")
+
+        // ⭐️ 設定 Combine 訂閱
+        setupSubscriptions()
+
+        // ⭐️ 手動同步設定到各服務（init 中 didSet 不觸發，必須手動同步）
+        audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
+        BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
         elevenLabsService.translationProvider = translationProvider
         appleSTTService.translationProvider = translationProvider
-        // 3. 本地 VAD 同步到 AudioManager
         audioManager.isVADEnabled = isLocalVADEnabled
+        audioManager.vadVolumeThreshold = localVADVolumeThreshold
+        audioManager.vadSilenceThreshold = localVADSilenceThreshold
+        audioManager.isSpeakerMode = isSpeakerMode
+        elevenLabsService.vadThreshold = vadThreshold
+        elevenLabsService.minSpeechDurationMs = minSpeechDurationMs
+        elevenLabsService.specifiedLanguageCode = getSpecifiedLanguageCode()
+        appleSTTService.isAutoLanguageSwitchEnabled = isAutoLanguageSwitchEnabled
+        appleSTTService.confidenceThreshold = autoSwitchConfidenceThreshold
+        appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
+
+        // ⭐️ 初始化完成，允許 didSet 正常執行
+        isInitializing = false
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
@@ -576,12 +780,25 @@ final class TranscriptionViewModel {
         }
     }
 
-    /// 清除所有轉錄記錄
+    /// 清除所有轉錄記錄（包括統計）
     func clearTranscripts() {
         transcripts.removeAll()
         interimTranscript = nil
         transcriptCount = 0
         wordCount = 0
+    }
+
+    /// ⭐️ 只清除對話內容（保留統計數據）
+    func clearTranscriptsOnly() {
+        transcripts.removeAll()
+        interimTranscript = nil
+        print("🗑️ [ViewModel] 對話已清除（保留統計）")
+    }
+
+    /// ⭐️ 刪除單則對話
+    func deleteTranscript(id: UUID) {
+        transcripts.removeAll { $0.id == id }
+        print("🗑️ [ViewModel] 已刪除對話 \(id)")
     }
 
     // MARK: - Private Methods

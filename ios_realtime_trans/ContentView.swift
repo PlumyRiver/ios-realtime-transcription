@@ -50,7 +50,10 @@ struct ContentView: View {
                                         // ⭐️ 停止當前播放，繼續播放下一個
                                         viewModel.skipCurrentTTS()
                                     },
-                                    currentPlayingText: viewModel.currentPlayingTTSText
+                                    currentPlayingText: viewModel.currentPlayingTTSText,
+                                    onDelete: {
+                                        viewModel.deleteTranscript(id: transcript.id)
+                                    }
                                 )
                                 .id(transcript.id)
                             }
@@ -166,6 +169,17 @@ struct ContentView: View {
             .background(Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // ⭐️ 左上角垃圾桶按鈕：一鍵清除對話
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        viewModel.clearTranscriptsOnly()
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundColor(.red.opacity(0.8))
+                    }
+                    .disabled(viewModel.transcripts.isEmpty && viewModel.interimTranscript == nil)
+                }
+
                 ToolbarItem(placement: .principal) {
                     CreditsToolbarView(showSettings: $showSettings, isRecording: viewModel.isRecording)
                 }
@@ -215,9 +229,9 @@ struct ConversationBubbleView: View {
     var onStopTTS: (() -> Void)?
     /// ⭐️ 當前正在播放的 TTS 文本（用於判斷是否顯示停止按鈕）
     var currentPlayingText: String?
+    /// ⭐️ 刪除這則對話
+    var onDelete: (() -> Void)?
 
-    /// 隱藏狀態
-    @State private var isHidden: Bool = false
     /// 複製反饋狀態
     @State private var showCopiedFeedback: Bool = false
 
@@ -273,7 +287,7 @@ struct ConversationBubbleView: View {
         isSourceLanguage ? .white.opacity(0.8) : .secondary
     }
 
-    /// 是否顯示控制按鈕（播放 + 隱藏）
+    /// 是否顯示控制按鈕（播放 + 複製 + 刪除）
     private var showControlButtons: Bool {
         transcript.isFinal && transcript.translation != nil
     }
@@ -291,12 +305,7 @@ struct ConversationBubbleView: View {
             }
 
             // 對話氣泡內容
-            if !isHidden {
-                bubbleContent
-            } else {
-                // 隱藏時顯示摺疊指示
-                collapsedIndicator
-            }
+            bubbleContent
 
             // 控制按鈕（右側，僅目標語言/左邊氣泡顯示）
             if !isSourceLanguage && showControlButtons {
@@ -360,33 +369,9 @@ struct ConversationBubbleView: View {
         .animation(nil, value: transcript.translation)
     }
 
-    /// 摺疊後的指示器
-    private var collapsedIndicator: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "ellipsis")
-                .font(.caption)
-            Text("已隱藏")
-                .font(.caption2)
-        }
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Color(.systemGray6))
-        .cornerRadius(12)
-    }
-
-    /// 控制按鈕組（複製 + 播放 + 隱藏/顯示）
+    /// 控制按鈕組（播放 + 複製 + 刪除）
     private var controlButtons: some View {
         VStack(spacing: 6) {
-            // 複製按鈕
-            Button {
-                copyAllContent()
-            } label: {
-                Image(systemName: showCopiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
-                    .font(.title3)
-                    .foregroundStyle(showCopiedFeedback ? .green : .gray)
-            }
-
             // ⭐️ 播放/停止按鈕（根據播放狀態切換）
             Button {
                 if isThisPlaying {
@@ -403,15 +388,24 @@ struct ConversationBubbleView: View {
                     .foregroundStyle(isThisPlaying ? .red : .blue)
             }
 
-            // 隱藏/顯示按鈕
+            // 複製按鈕
+            Button {
+                copyAllContent()
+            } label: {
+                Image(systemName: showCopiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
+                    .font(.title3)
+                    .foregroundStyle(showCopiedFeedback ? .green : .gray)
+            }
+
+            // 刪除按鈕
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isHidden.toggle()
+                    onDelete?()
                 }
             } label: {
-                Image(systemName: isHidden ? "eye.fill" : "xmark.circle.fill")
+                Image(systemName: "trash")
                     .font(.title3)
-                    .foregroundStyle(isHidden ? .green : .gray)
+                    .foregroundStyle(.gray)
             }
         }
     }
@@ -1610,6 +1604,20 @@ struct SettingsView: View {
     @State private var showPurchaseSheet = false
     @State private var authService = AuthService.shared
 
+    // MARK: - 語言偵測模式
+
+    /// 語言偵測模式說明文字
+    private var languageDetectionModeDescription: String {
+        switch viewModel.sttLanguageDetectionMode {
+        case .auto:
+            return "自動偵測說話的語言（可能被背景噪音干擾）"
+        case .specifySource:
+            return "只識別「\(viewModel.sourceLang.shortName)」，忽略其他語言和噪音（重新錄音生效）"
+        case .specifyTarget:
+            return "只識別「\(viewModel.targetLang.shortName)」，忽略其他語言和噪音（重新錄音生效）"
+        }
+    }
+
     // MARK: - VAD 狀態顯示
 
     /// VAD 狀態文字
@@ -2049,6 +2057,17 @@ struct SettingsView: View {
                                     .foregroundStyle(.orange)
                                 Text("$0.50/M 輸入 • $3.00/M 輸出")
                             }
+                        case .geminiFlashLite:
+                            HStack {
+                                Image(systemName: "sparkle")
+                                    .foregroundStyle(.mint)
+                                Text("Gemini 3.1 Flash Lite：超值最便宜")
+                            }
+                            HStack {
+                                Image(systemName: "dollarsign.circle")
+                                    .foregroundStyle(.green)
+                                Text("$0.075/M 輸入 • $0.30/M 輸出")
+                            }
                         case .grok:
                             HStack {
                                 Image(systemName: "star.fill")
@@ -2088,8 +2107,25 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                // ⭐️ VAD 靈敏度設定（ElevenLabs 專用）
+                // ⭐️ ElevenLabs 專用設定
                 if viewModel.sttProvider == .elevenLabs {
+
+                    // ⭐️ 語言偵測模式
+                    Section("語言偵測模式") {
+                        Picker("偵測模式", selection: $viewModel.sttLanguageDetectionMode) {
+                            Text("自動").tag(STTLanguageDetectionMode.auto)
+                            Text("來源語言").tag(STTLanguageDetectionMode.specifySource)
+                            Text("目標語言").tag(STTLanguageDetectionMode.specifyTarget)
+                        }
+                        .pickerStyle(.segmented)
+
+                        // 顯示當前模式的說明
+                        Text(languageDetectionModeDescription)
+                            .font(.caption2)
+                            .foregroundStyle(viewModel.sttLanguageDetectionMode == .auto ? Color.secondary : Color.blue)
+                            .padding(.vertical, 2)
+                    }
+
                     Section("麥克風增益") {
                         // ⭐️ 麥克風增益設定
                         VStack(alignment: .leading, spacing: 8) {
@@ -2415,6 +2451,8 @@ struct SettingsView: View {
         switch provider {
         case .gemini:
             return .purple
+        case .geminiFlashLite:
+            return .mint
         case .grok:
             return .yellow
         case .cerebras:

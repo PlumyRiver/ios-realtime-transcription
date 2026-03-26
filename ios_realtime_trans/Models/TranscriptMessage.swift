@@ -8,6 +8,48 @@
 
 import Foundation
 
+/// ⭐️ STT 語言偵測模式
+/// 控制 ElevenLabs 是否自動偵測語言或指定語言
+enum STTLanguageDetectionMode: String, CaseIterable, Identifiable {
+    case auto = "auto"               // 自動偵測（預設）
+    case specifySource = "source"    // 指定來源語言
+    case specifyTarget = "target"    // 指定目標語言
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .auto: return "自動偵測"
+        case .specifySource: return "指定來源語言"
+        case .specifyTarget: return "指定目標語言"
+        }
+    }
+
+    var shortName: String {
+        switch self {
+        case .auto: return "自動"
+        case .specifySource: return "來源"
+        case .specifyTarget: return "目標"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .auto: return "waveform.badge.magnifyingglass"
+        case .specifySource: return "character.bubble"
+        case .specifyTarget: return "person.wave.2"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .auto: return "自動偵測說話的語言（可能被背景噪音干擾）"
+        case .specifySource: return "只識別來源語言，適合單方向翻譯"
+        case .specifyTarget: return "只識別目標語言，適合單方向翻譯"
+        }
+    }
+}
+
 /// STT 提供商
 enum STTProvider: String, CaseIterable, Identifiable {
     case chirp3 = "chirp3"           // Google Cloud Chirp 3
@@ -89,16 +131,18 @@ enum STTProvider: String, CaseIterable, Identifiable {
 
 /// ⭐️ 翻譯模型提供商
 enum TranslationProvider: String, CaseIterable, Identifiable {
-    case gemini = "gemini"       // Gemini 3 Flash（預設）
-    case grok = "grok"           // Grok 4.1 Fast（高品質）
-    case cerebras = "cerebras"   // Cerebras Llama（快速）
-    case qwen = "qwen"           // Qwen 3 235B（高品質+快速）
+    case gemini = "gemini"                     // Gemini 3 Flash（預設）
+    case geminiFlashLite = "gemini-flash-lite"  // Gemini 3.1 Flash Lite（超值）
+    case grok = "grok"                         // Grok 4.1 Fast（高品質）
+    case cerebras = "cerebras"                 // Cerebras Llama（快速）
+    case qwen = "qwen"                         // Qwen 3 235B（高品質+快速）
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .gemini: return "Gemini 3 Flash"
+        case .geminiFlashLite: return "Gemini 3.1 Flash Lite"
         case .grok: return "Grok 4.1 Fast"
         case .cerebras: return "Cerebras"
         case .qwen: return "Qwen 3 235B"
@@ -108,6 +152,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var shortName: String {
         switch self {
         case .gemini: return "Gemini"
+        case .geminiFlashLite: return "FlashLite"
         case .grok: return "Grok"
         case .cerebras: return "Cerebras"
         case .qwen: return "Qwen"
@@ -117,6 +162,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var iconName: String {
         switch self {
         case .gemini: return "sparkles"
+        case .geminiFlashLite: return "sparkle"
         case .grok: return "star.fill"
         case .cerebras: return "bolt.fill"
         case .qwen: return "brain.head.profile"
@@ -127,6 +173,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var description: String {
         switch self {
         case .gemini: return "預設，平衡"
+        case .geminiFlashLite: return "超值，最便宜"
         case .grok: return "高品質翻譯"
         case .cerebras: return "極速回應"
         case .qwen: return "高品質+快速"
@@ -137,6 +184,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var latencyDescription: String {
         switch self {
         case .gemini: return "~960ms"
+        case .geminiFlashLite: return "~500ms"
         case .grok: return "~800ms"
         case .cerebras: return "~380ms"
         case .qwen: return "~460ms"
@@ -147,6 +195,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var inputPricePerMillion: Double {
         switch self {
         case .gemini: return 0.50
+        case .geminiFlashLite: return 0.075
         case .grok: return 0.20
         case .cerebras: return 0.85
         case .qwen: return 0.60
@@ -157,6 +206,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var outputPricePerMillion: Double {
         switch self {
         case .gemini: return 3.00
+        case .geminiFlashLite: return 0.30
         case .grok: return 0.50
         case .cerebras: return 1.20
         case .qwen: return 1.20
@@ -167,6 +217,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var priceLevel: String {
         switch self {
         case .gemini: return "$$"
+        case .geminiFlashLite: return "¢"
         case .grok: return "$"
         case .cerebras: return "$$"
         case .qwen: return "$"
@@ -177,6 +228,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     var qualityRating: Int {
         switch self {
         case .gemini: return 4
+        case .geminiFlashLite: return 3
         case .grok: return 5
         case .cerebras: return 3
         case .qwen: return 4
