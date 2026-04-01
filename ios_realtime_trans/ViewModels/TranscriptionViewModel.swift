@@ -344,7 +344,7 @@ final class TranscriptionViewModel {
 
     /// ⭐️ ElevenLabs VAD 閾值（0.0 ~ 1.0）
     /// 越高越嚴格，需要更大聲音才會觸發語音識別
-    var vadThreshold: Float = 0.3 {
+    var vadThreshold: Float = 0.5 {
         didSet {
             guard !isInitializing else { return }
             elevenLabsService.vadThreshold = vadThreshold
@@ -367,13 +367,13 @@ final class TranscriptionViewModel {
         }
     }
 
-    /// 本地 VAD 音量閾值（0.0 ~ 1.0，建議 0.01 ~ 0.05）
-    var localVADVolumeThreshold: Float = 0.02 {
+    /// ⭐️ Silero VAD 語音概率閾值（0.0 ~ 1.0，建議 0.3 ~ 0.7）
+    var localVADSpeechThreshold: Float = 0.5 {
         didSet {
             guard !isInitializing else { return }
-            audioManager.vadVolumeThreshold = localVADVolumeThreshold
-            saveSetting(.localVADVolumeThreshold, value: localVADVolumeThreshold)
-            print("🎚️ [本地 VAD] 音量閾值: \(localVADVolumeThreshold)")
+            audioManager.vadSpeechThreshold = localVADSpeechThreshold
+            saveSetting(.localVADVolumeThreshold, value: localVADSpeechThreshold)
+            print("🎚️ [Silero VAD] 語音閾值: \(localVADSpeechThreshold)")
         }
     }
 
@@ -660,7 +660,15 @@ final class TranscriptionViewModel {
             isLocalVADEnabled = defaults.bool(forKey: VMSettingsKey.isLocalVADEnabled.rawValue)
         }
         if defaults.object(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue) != nil {
-            localVADVolumeThreshold = defaults.float(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue)
+            let saved = defaults.float(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue)
+            // ⭐️ 遷移：舊 RMS 閾值 (0.01~0.05) → Silero 預設 0.5
+            if saved < 0.1 {
+                localVADSpeechThreshold = 0.5
+                saveSetting(.localVADVolumeThreshold, value: 0.5)
+                print("🔄 [VAD] 遷移 RMS 閾值 \(saved) → Silero 預設 0.5")
+            } else {
+                localVADSpeechThreshold = saved
+            }
         }
         if defaults.object(forKey: VMSettingsKey.localVADSilenceThreshold.rawValue) != nil {
             localVADSilenceThreshold = defaults.double(forKey: VMSettingsKey.localVADSilenceThreshold.rawValue)
@@ -699,7 +707,7 @@ final class TranscriptionViewModel {
         elevenLabsService.translationProvider = translationProvider
         appleSTTService.translationProvider = translationProvider
         audioManager.isVADEnabled = isLocalVADEnabled
-        audioManager.vadVolumeThreshold = localVADVolumeThreshold
+        audioManager.vadSpeechThreshold = localVADSpeechThreshold
         audioManager.vadSilenceThreshold = localVADSilenceThreshold
         audioManager.isSpeakerMode = isSpeakerMode
         elevenLabsService.vadThreshold = vadThreshold

@@ -1989,15 +1989,15 @@ struct SettingsView: View {
                         .tint(.green)
                     }
 
-                    // 🎙️ 本地 VAD 選項（僅非 Apple STT 顯示）
+                    // 🎙️ 本地 Silero VAD 選項（僅非 Apple STT 顯示）
                     if viewModel.shouldShowSpeedUpOption {
                         Toggle(isOn: $viewModel.isLocalVADEnabled) {
                             HStack {
-                                Image(systemName: viewModel.isLocalVADEnabled ? "waveform.circle.fill" : "waveform.circle")
+                                Image(systemName: viewModel.isLocalVADEnabled ? "brain.head.profile.fill" : "brain.head.profile")
                                     .foregroundStyle(viewModel.isLocalVADEnabled ? .blue : .secondary)
                                 VStack(alignment: .leading) {
                                     HStack {
-                                        Text("靜音偵測")
+                                        Text("智慧語音偵測")
                                         if viewModel.isLocalVADEnabled {
                                             Text(vadStateText)
                                                 .font(.caption2)
@@ -2008,13 +2008,45 @@ struct SettingsView: View {
                                                 .clipShape(Capsule())
                                         }
                                     }
-                                    Text("靜音 2 秒後暫停發送，節省 STT 費用")
+                                    Text("Silero ML 語音偵測，靜音後暫停發送節省費用")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                         }
                         .tint(.blue)
+
+                        // ⭐️ Silero VAD 閾值滑桿
+                        if viewModel.isLocalVADEnabled {
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Text("語音偵測靈敏度")
+                                        .font(.subheadline)
+                                    Spacer()
+                                    Text(String(format: "%.0f%%", viewModel.localVADSpeechThreshold * 100))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .monospacedDigit()
+                                }
+
+                                HStack {
+                                    Image(systemName: "ear")
+                                        .foregroundStyle(.green)
+                                        .font(.caption)
+
+                                    Slider(value: $viewModel.localVADSpeechThreshold, in: 0.1...0.9, step: 0.05)
+
+                                    Image(systemName: "ear.trianglebadge.exclamationmark")
+                                        .foregroundStyle(.red)
+                                        .font(.caption)
+                                }
+
+                                Text("越低越敏感（容易誤觸發），越高越嚴格（可能漏偵測）")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
                     }
                 }
 
@@ -2208,7 +2240,7 @@ struct SettingsView: View {
                                     .foregroundStyle(.green)
                                     .font(.caption)
 
-                                Slider(value: $viewModel.vadThreshold, in: 0.1...0.8, step: 0.05)
+                                Slider(value: $viewModel.vadThreshold, in: 0.1...1.0, step: 0.05)
 
                                 Image(systemName: "ear.trianglebadge.exclamationmark")
                                     .foregroundStyle(.red)

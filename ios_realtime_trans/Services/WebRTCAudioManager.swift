@@ -22,7 +22,63 @@ import Foundation
 import AVFoundation
 import AVFAudio
 import Combine
+import CoreML
 import WebRTC
+import FluidAudio
+
+// MARK: - Silero VAD Processor（線程安全的 ML 語音偵測）
+
+actor SileroVADProcessor {
+    private var vadManager: VadManager?
+    private var streamState: VadStreamState = .initial()
+    /// 累積 Int16 samples，湊滿 4096 後送入模型
+    private var sampleBuffer: [Int16] = []
+
+    func initialize() async throws {
+        vadManager = try await VadManager(config: VadConfig(
+            defaultThreshold: 0.5,
+            computeUnits: .cpuAndNeuralEngine
+        ))
+        streamState = .initial()
+        print("✅ [Silero VAD] 模型載入完成（chunk=4096, 256ms）")
+    }
+
+    var isReady: Bool { vadManager != nil }
+
+    /// 處理 Int16 音訊樣本，回傳語音概率 (0.0 ~ 1.0)
+    /// FluidAudio 每次需要 4096 samples (256ms @ 16kHz)
+    func processSamples(_ samples: [Int16]) async -> Float {
+        guard let vadManager else { return 0.0 }
+        sampleBuffer.append(contentsOf: samples)
+        var lastProbability: Float = 0.0
+        while sampleBuffer.count >= VadManager.chunkSize {
+            let chunk = Array(sampleBuffer.prefix(VadManager.chunkSize))
+            sampleBuffer.removeFirst(VadManager.chunkSize)
+            let floatChunk = chunk.map { Float($0) / 32768.0 }
+            do {
+                let result = try await vadManager.processStreamingChunk(
+                    floatChunk,
+                    state: streamState
+                )
+                lastProbability = result.probability
+                streamState = result.state
+            } catch {
+                lastProbability = 0.0
+            }
+        }
+        return lastProbability
+    }
+
+    /// 重置 LSTM 狀態（新對話時呼叫）
+    func reset() async {
+        sampleBuffer.removeAll()
+        if let vadManager {
+            streamState = await vadManager.makeStreamState()
+        } else {
+            streamState = .initial()
+        }
+    }
+}
 
 // MARK: - Recording State
 
@@ -239,9 +295,12 @@ final class WebRTCAudioManager: NSObject {
     /// VAD 當前狀態
     private(set) var vadState: VADState = .paused
 
-    /// VAD 音量閾值（RMS，0.0 ~ 1.0）
-    /// 低於此值視為靜音，建議範圍 0.01 ~ 0.05
-    var vadVolumeThreshold: Float = 0.02
+    /// ⭐️ Silero VAD 語音概率閾值（0.0 ~ 1.0）
+    /// ML 模型判定語音概率超過此值才視為說話
+    var vadSpeechThreshold: Float = 0.5
+
+    /// ⭐️ Silero VAD 處理器
+    private let sileroProcessor = SileroVADProcessor()
 
     /// VAD 靜音閾值（秒）- 靜音超過此時間暫停發送
     var vadSilenceThreshold: TimeInterval = 2.0
@@ -469,10 +528,21 @@ final class WebRTCAudioManager: NSObject {
         // ⭐️ 重置 VAD 狀態
         resetVADState()
 
+        // ⭐️ 初始化 Silero VAD（若尚未初始化）
+        Task {
+            if await !sileroProcessor.isReady {
+                do {
+                    try await sileroProcessor.initialize()
+                } catch {
+                    print("❌ [Silero VAD] 初始化失敗: \(error)，將使用直通模式")
+                }
+            }
+        }
+
         recordingState = .recording
         print("🎙️ [WebRTC] 開始錄音（AudioEngine 模式）")
         if isVADEnabled {
-            print("   VAD: 啟用（閾值: \(vadVolumeThreshold), 靜音: \(vadSilenceThreshold)s）")
+            print("   VAD: 啟用（Silero 閾值: \(vadSpeechThreshold), 靜音: \(vadSilenceThreshold)s）")
         }
     }
 
@@ -518,15 +588,31 @@ final class WebRTCAudioManager: NSObject {
             amplifyInputBuffer(buffer, gain: microphoneGain)
         }
 
-        // ⭐️ 計算並更新即時音量
+        // ⭐️ 計算並更新即時音量（保留：UI 音量顯示）
         let rms = calculateRMS(buffer)
         updateVolume(rms)
 
         guard let data = convertToWebSocketFormat(buffer) else { return }
 
-        // ⭐️ VAD 處理：根據音量判斷語音活動
+        // ⭐️ Silero VAD 處理：ML 模型判斷語音活動
         if isVADEnabled && !isManualSendingPaused {
-            updateVADState(rms: rms, audioData: data)
+            // 提取 Int16 samples 給 Silero
+            let samples = data.withUnsafeBytes { rawBuffer -> [Int16] in
+                let typedBuffer = rawBuffer.bindMemory(to: Int16.self)
+                return Array(typedBuffer)
+            }
+            let audioData = data
+            Task { [weak self] in
+                guard let self else { return }
+                let isReady = await self.sileroProcessor.isReady
+                if isReady {
+                    let probability = await self.sileroProcessor.processSamples(samples)
+                    self.updateVADState(speechProbability: probability, audioData: audioData)
+                } else {
+                    // Silero 未就緒，直通模式
+                    self.audioBufferCollector.append(audioData)
+                }
+            }
         } else {
             // VAD 未啟用，直接加入緩衝區
             audioBufferCollector.append(data)
@@ -535,12 +621,12 @@ final class WebRTCAudioManager: NSObject {
 
     // MARK: - VAD Processing
 
-    /// 更新 VAD 狀態
+    /// 更新 VAD 狀態（Silero ML 語音偵測）
     /// - Parameters:
-    ///   - rms: 當前 RMS 音量
+    ///   - speechProbability: Silero VAD 語音概率 (0.0 ~ 1.0)
     ///   - audioData: 當前音頻數據
-    private func updateVADState(rms: Float, audioData: Data) {
-        let isSpeaking = rms >= vadVolumeThreshold
+    private func updateVADState(speechProbability: Float, audioData: Data) {
+        let isSpeaking = speechProbability >= vadSpeechThreshold
         let previousState = vadState
 
         if isSpeaking {
@@ -643,6 +729,8 @@ final class WebRTCAudioManager: NSObject {
         vadState = isVADEnabled ? .paused : .speaking
         silenceStartTime = nil
         preBuffer.removeAll()
+        // ⭐️ 重置 Silero LSTM 狀態
+        Task { await sileroProcessor.reset() }
     }
 
     /// ⭐️ 放大輸入音頻緩衝區（in-place 修改）

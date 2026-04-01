@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		4C7782CD1D85A163A0B661F0 /* Pods_ios_realtime_trans.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4CE5EC2E9E3722F911DF2C62 /* Pods_ios_realtime_trans.framework */; };
 		527E806B2EFBB4B800DB7077 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 527E806A2EFBB4B800DB7077 /* StoreKit.framework */; };
+		52952D842F7D53090063B0FA /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 52952D832F7D53090063B0FA /* FluidAudio */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -46,6 +47,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4C7782CD1D85A163A0B661F0 /* Pods_ios_realtime_trans.framework in Frameworks */,
+				52952D842F7D53090063B0FA /* FluidAudio in Frameworks */,
 				527E806B2EFBB4B800DB7077 /* StoreKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -138,6 +140,9 @@
 			);
 			mainGroup = 526BD1952ED2D7FD004C76F6;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				52952D822F7D53090063B0FA /* XCRemoteSwiftPackageReference "FluidAudio" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 526BD19F2ED2D7FD004C76F6 /* Products */;
 			projectDirPath = "";
@@ -420,6 +425,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		52952D822F7D53090063B0FA /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		52952D832F7D53090063B0FA /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 52952D822F7D53090063B0FA /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 526BD1962ED2D7FD004C76F6 /* Project object */;
 }
