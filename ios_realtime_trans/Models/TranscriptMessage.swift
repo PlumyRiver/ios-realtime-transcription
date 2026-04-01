@@ -833,6 +833,8 @@ struct TranscriptMessage: Identifiable, Equatable {
     let speakerTag: Int?
     let timestamp: Date
     var translation: String?
+    /// ⭐️ 是否為語言介紹提示（TTS 播放原文而非翻譯）
+    let isIntroduction: Bool
 
     /// ⭐️ 分句翻譯結果（當有多個句子時使用）
     var translationSegments: [TranslationSegment]?
@@ -862,7 +864,8 @@ struct TranscriptMessage: Identifiable, Equatable {
         speakerTag: Int? = nil,
         timestamp: Date = Date(),
         translation: String? = nil,
-        translationSegments: [TranslationSegment]? = nil
+        translationSegments: [TranslationSegment]? = nil,
+        isIntroduction: Bool = false
     ) {
         self.id = id
         self.text = text
@@ -875,6 +878,7 @@ struct TranscriptMessage: Identifiable, Equatable {
         self.timestamp = timestamp
         self.translation = translation
         self.translationSegments = translationSegments
+        self.isIntroduction = isIntroduction
     }
 
     /// 信心度等級

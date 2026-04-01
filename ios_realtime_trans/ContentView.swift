@@ -140,23 +140,23 @@ struct ContentView: View {
                                     }
                                 }
                             } label: {
-                                HStack(spacing: 4) {
+                                HStack(spacing: 6) {
                                     Image(systemName: "chevron.down")
-                                        .font(.system(size: 10, weight: .semibold))
+                                        .font(.system(size: 14, weight: .semibold))
                                     Text("新訊息")
-                                        .font(.system(size: 11, weight: .medium))
+                                        .font(.system(size: 15, weight: .medium))
                                     Image(systemName: "chevron.down")
-                                        .font(.system(size: 10, weight: .semibold))
+                                        .font(.system(size: 14, weight: .semibold))
                                 }
-                                .foregroundStyle(.white.opacity(0.9))
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 5)
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 22)
+                                .padding(.vertical, 10)
                                 .background(
                                     Capsule()
-                                        .fill(Color.black.opacity(0.5))
+                                        .fill(Color.black.opacity(0.6))
                                 )
                             }
-                            .padding(.bottom, 8)
+                            .padding(.bottom, 12)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                             .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
                         }
@@ -252,16 +252,17 @@ struct ConversationBubbleView: View {
         return detectedBase == sourceLang.rawValue
     }
 
-    /// ⭐️ 獲取翻譯結果應該使用的 TTS 語言代碼
-    /// 邏輯：翻譯的目標語言與原文語言相反
-    /// - 原文是來源語言 → 翻譯是目標語言 → TTS 用 targetLang
-    /// - 原文是目標語言 → 翻譯是來源語言 → TTS 用 sourceLang
+    /// ⭐️ 獲取 TTS 語言代碼
+    /// 一般對話：播放翻譯（語言與原文相反）
+    /// 介紹提示：播放原文本身（語言與原文相同）
     private var ttsLanguageCode: String {
+        if transcript.isIntroduction {
+            // ⭐️ 介紹提示：播放原文語言
+            return isSourceLanguage ? sourceLang.azureLocale : targetLang.azureLocale
+        }
         if isSourceLanguage {
-            // 原文是來源語言（如中文）→ 翻譯是目標語言（如日文）
             return targetLang.azureLocale
         } else {
-            // 原文是目標語言（如日文）→ 翻譯是來源語言（如中文）
             return sourceLang.azureLocale
         }
     }
@@ -334,9 +335,10 @@ struct ConversationBubbleView: View {
                 .foregroundStyle(textColor)
                 .fixedSize(horizontal: false, vertical: true)  // ⭐️ 允許垂直擴展，水平固定
 
-            // 翻譯（較小字體）
+            // 翻譯（較小字體）— 介紹提示不顯示（translation 僅用於觸發按鈕和 TTS）
             // ⭐️ 關鍵：使用固定容器避免新舊翻譯切換時的空白閃爍
-            if let translation = transcript.translation, !translation.isEmpty {
+            if !transcript.isIntroduction,
+               let translation = transcript.translation, !translation.isEmpty {
                 Text(translation)
                     .font(.subheadline)
                     .foregroundStyle(secondaryTextColor)

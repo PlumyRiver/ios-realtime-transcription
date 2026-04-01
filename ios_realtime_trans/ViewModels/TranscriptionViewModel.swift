@@ -801,6 +801,58 @@ final class TranscriptionViewModel {
         print("🗑️ [ViewModel] 已刪除對話 \(id)")
     }
 
+    // MARK: - Language Introduction
+
+    /// ⭐️ 已顯示過介紹的語言對（切換語言才重新顯示）
+    private var shownIntroductionPair: String?
+
+    /// ⭐️ 從 Firestore 讀取語言介紹，插入對話列表最前面
+    /// 同一語言對只顯示一次，切換語言後才會再次顯示
+    @MainActor
+    private func showLanguageIntroduction() async {
+        let src = sourceLang.rawValue
+        let tgt = targetLang.rawValue
+        let pairKey = "\(src)_\(tgt)"
+
+        // ⭐️ 同一語言對不重複顯示
+        if shownIntroductionPair == pairKey {
+            print("📋 [Introduction] 已顯示過: \(pairKey)，跳過")
+            return
+        }
+
+        guard let intro = await IntroductionService.shared.fetchIntroduction(
+            sourceLang: src, targetLang: tgt
+        ) else {
+            print("⚠️ [Introduction] 無介紹文字: \(pairKey)")
+            return
+        }
+
+        // 來源語言介紹（右側藍色氣泡）
+        let sourceMessage = TranscriptMessage(
+            text: intro.sourceIntro,
+            isFinal: true,
+            confidence: 1.0,
+            language: src,
+            translation: intro.sourceIntro,
+            isIntroduction: true
+        )
+
+        // 目標語言介紹（左側灰色氣泡）
+        let targetMessage = TranscriptMessage(
+            text: intro.targetIntro,
+            isFinal: true,
+            confidence: 1.0,
+            language: tgt,
+            translation: intro.targetIntro,
+            isIntroduction: true
+        )
+
+        // 插入對話列表最前面
+        transcripts.insert(contentsOf: [sourceMessage, targetMessage], at: 0)
+        shownIntroductionPair = pairKey
+        print("📋 [Introduction] 已顯示雙語介紹: \(pairKey)")
+    }
+
     // MARK: - Private Methods
 
     /// 開始錄音
@@ -884,6 +936,11 @@ final class TranscriptionViewModel {
 
             status = .recording
             startDurationTimer()
+
+            // ⭐️ 顯示雙語介紹提示（從 Firestore 讀取）
+            Task {
+                await showLanguageIntroduction()
+            }
 
             // ⭐️ 無論是否登入，都啟動計費會話（確保 usage 被記錄）
             BillingService.shared.startSession()

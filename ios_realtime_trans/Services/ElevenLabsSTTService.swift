@@ -164,7 +164,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// ⭐️ VAD 閾值（0.0 ~ 1.0）
     /// 越高越嚴格，需要更大聲音才會觸發語音識別
     /// 0.3 = 較敏感（預設），0.5 = 中等，0.7 = 嚴格
-    var vadThreshold: Float = 0.3
+    var vadThreshold: Float = 0.5
 
     /// ⭐️ 最小語音長度（毫秒）
     /// 語音必須持續超過此時間才會被識別
