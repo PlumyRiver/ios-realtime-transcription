@@ -539,6 +539,9 @@ final class WebRTCAudioManager: NSObject {
             }
         }
 
+        // ⭐️ 預先建立 TTS 播放節點（避免第一次播放時延遲）
+        preInitTTSNodes()
+
         recordingState = .recording
         print("🎙️ [WebRTC] 開始錄音（AudioEngine 模式）")
         if isVADEnabled {
@@ -963,6 +966,30 @@ final class WebRTCAudioManager: NSObject {
     // MARK: - TTS Playback
 
     /// 播放 TTS 音頻（通過 WebRTC Engine 播放，AEC 自動處理回音）
+    /// ⭐️ 預先建立 TTS 節點並連接到 WebRTC Engine（避免第一次播放卡頓）
+    func preInitTTSNodes() {
+        guard let engine = webrtcEngine else { return }
+        guard !ttsNodesConnected else { return }
+
+        if ttsPlayerNode == nil {
+            ttsPlayerNode = AVAudioPlayerNode()
+            ttsEQNode = AVAudioUnitEQ(numberOfBands: 3)
+        }
+
+        guard let player = ttsPlayerNode, let eq = ttsEQNode else { return }
+
+        engine.attach(player)
+        engine.attach(eq)
+
+        let format = engine.mainMixerNode.outputFormat(forBus: 0)
+        engine.connect(player, to: eq, format: format)
+        engine.connect(eq, to: engine.mainMixerNode, format: format)
+
+        ttsNodesConnected = true
+        updateVolumeGain()
+        print("✅ [WebRTC] TTS 節點預先建立完成")
+    }
+
     func playTTS(audioData: Data, text: String? = nil) throws {
         stopTTS()
 

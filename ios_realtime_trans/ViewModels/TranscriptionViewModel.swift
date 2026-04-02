@@ -861,6 +861,73 @@ final class TranscriptionViewModel {
         print("📋 [Introduction] 已顯示雙語介紹: \(pairKey)")
     }
 
+    // MARK: - Hallucination Warning
+
+    /// 上次顯示幻聽警告的時間（避免短時間內重複提示）
+    private var lastHallucinationWarningTime: Date?
+
+    /// ⭐️ 顯示幻聽警告（雙語提示）
+    private func showHallucinationWarning(detectedLanguage: String) {
+        // 防止短時間內重複提示（5 秒內只提示一次）
+        if let lastTime = lastHallucinationWarningTime,
+           Date().timeIntervalSince(lastTime) < 5.0 {
+            return
+        }
+        lastHallucinationWarningTime = Date()
+
+        let sourceWarning = hallucinationText(for: sourceLang.rawValue)
+        let targetWarning = hallucinationText(for: targetLang.rawValue)
+
+        // 來源語言提示（右側）
+        let sourceMessage = TranscriptMessage(
+            text: "⚠️ \(sourceWarning)",
+            isFinal: true,
+            confidence: 0,
+            language: sourceLang.rawValue,
+            translation: "⚠️ \(sourceWarning)",
+            isIntroduction: true  // 複用：不顯示翻譯行，只顯示原文
+        )
+
+        // 目標語言提示（左側）
+        let targetMessage = TranscriptMessage(
+            text: "⚠️ \(targetWarning)",
+            isFinal: true,
+            confidence: 0,
+            language: targetLang.rawValue,
+            translation: "⚠️ \(targetWarning)",
+            isIntroduction: true
+        )
+
+        transcripts.append(contentsOf: [sourceMessage, targetMessage])
+        print("🚫 [幻聽警告] 已顯示雙語提示 (detected: \(detectedLanguage))")
+    }
+
+    /// 各語言的幻聽提示文字
+    private func hallucinationText(for langCode: String) -> String {
+        switch langCode {
+        case "zh": return "語音辨識異常，請稍候再說一次"
+        case "en": return "Speech recognition error. Please wait a moment and try again."
+        case "ja": return "音声認識に異常が発生しました。少し待ってからもう一度話してください。"
+        case "ko": return "음성 인식 오류가 발생했습니다. 잠시 후 다시 말씀해 주세요."
+        case "es": return "Error de reconocimiento de voz. Espere un momento e intente de nuevo."
+        case "fr": return "Erreur de reconnaissance vocale. Veuillez patienter et réessayer."
+        case "de": return "Spracherkennungsfehler. Bitte warten Sie einen Moment und versuchen Sie es erneut."
+        case "pt": return "Erro de reconhecimento de voz. Aguarde um momento e tente novamente."
+        case "ru": return "Ошибка распознавания речи. Подождите немного и попробуйте снова."
+        case "it": return "Errore di riconoscimento vocale. Attendere un momento e riprovare."
+        case "vi": return "Lỗi nhận dạng giọng nói. Vui lòng đợi một chút và thử lại."
+        case "th": return "เกิดข้อผิดพลาดในการรู้จำเสียง กรุณารอสักครู่แล้วลองใหม่"
+        case "ar": return "خطأ في التعرف على الصوت. يرجى الانتظار لحظة والمحاولة مرة أخرى."
+        case "hi": return "वाक् पहचान त्रुटि। कृपया एक क्षण प्रतीक्षा करें और पुनः प्रयास करें।"
+        case "id": return "Kesalahan pengenalan suara. Harap tunggu sebentar dan coba lagi."
+        case "fil": return "Error sa pagkilala ng boses. Maghintay sandali at subukan muli."
+        case "ms": return "Ralat pengecaman suara. Sila tunggu sebentar dan cuba lagi."
+        case "tr": return "Ses tanıma hatası. Lütfen bir an bekleyin ve tekrar deneyin."
+        case "nl": return "Spraakherkenningsfout. Wacht even en probeer het opnieuw."
+        default: return "Speech recognition error. Please wait and try again."
+        }
+    }
+
     // MARK: - Private Methods
 
     /// 開始錄音
@@ -948,6 +1015,13 @@ final class TranscriptionViewModel {
             // ⭐️ 顯示雙語介紹提示（從 Firestore 讀取）
             Task {
                 await showLanguageIntroduction()
+            }
+
+            // ⭐️ 預熱 TTS 引擎（避免第一次播放卡頓）
+            if ttsProvider == .apple {
+                appleTTSService.preWarm(languageCode: targetLang.azureLocale)
+            } else {
+                ttsService.preConnect()
             }
 
             // ⭐️ 無論是否登入，都啟動計費會話（確保 usage 被記錄）
@@ -1293,6 +1367,15 @@ final class TranscriptionViewModel {
                     print("⚠️ [ElevenLabs] 連接斷開，自動停止錄音")
                     self.stopRecording()
                 }
+            }
+            .store(in: &cancellables)
+
+        // ⭐️ 訂閱 ElevenLabs 幻聽通知（腳本驗證失敗）
+        elevenLabsService.hallucinationPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] detectedLang in
+                guard let self, self.sttProvider == .elevenLabs else { return }
+                self.showHallucinationWarning(detectedLanguage: detectedLang)
             }
             .store(in: &cancellables)
 

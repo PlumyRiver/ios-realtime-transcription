@@ -179,6 +179,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     /// 設定後，ElevenLabs 只會識別該語言，避免背景噪音被誤判
     var specifiedLanguageCode: String? = nil
 
+    /// ⭐️ 幻聽通知 Publisher（通知 ViewModel 顯示雙語提示）
+    private let hallucinationSubject = PassthroughSubject<String, Never>()
+
+    var hallucinationPublisher: AnyPublisher<String, Never> {
+        hallucinationSubject.eraseToAnyPublisher()
+    }
+
     // MARK: - Public Methods
 
     /// ⭐️ 預先獲取 token（可在 App 啟動或進入前台時調用）
@@ -530,6 +537,130 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         case .isLang: return "is"  // 冰島文（is 是 Swift 保留字）
         default: return lang.rawValue  // 其他語言直接使用 rawValue
         }
+    }
+
+    // MARK: - 腳本驗證（防止幻聽）
+
+    /// 文字系統分類
+    private enum ScriptFamily {
+        case latin, cjk, kana, hangul, cyrillic, arabic, thai
+        case devanagari, bengali, tamil, telugu, khmer, myanmar, lao
+        case odia, gujarati, kannada, malayalam, sinhala, georgian, armenian, hebrew, ethiopic
+        case unknown
+    }
+
+    /// 語言代碼 → 預期文字系統
+    private func expectedScript(for languageCode: String) -> ScriptFamily {
+        let base = String(languageCode.split(separator: "-").first ?? Substring(languageCode))
+        switch base {
+        // 拉丁字母
+        case "en", "fr", "es", "de", "pt", "it", "nl", "sv", "no", "da", "fi",
+             "pl", "cs", "sk", "hu", "ro", "hr", "sl", "bs", "sq", "et", "lt", "lv",
+             "ca", "gl", "eu", "ga", "cy", "vi", "id", "fil", "ms", "tr", "az",
+             "sw", "so", "mt", "is", "jv", "su", "zu": return .latin
+        // CJK
+        case "zh", "yue", "nan": return .cjk
+        // 日文（假名）
+        case "ja": return .kana
+        // 韓文
+        case "ko": return .hangul
+        // 西里爾
+        case "ru", "uk", "bg", "sr", "mk", "kk": return .cyrillic
+        // 阿拉伯
+        case "ar", "fa", "ur": return .arabic
+        // 泰文
+        case "th": return .thai
+        // 天城文
+        case "hi", "mr", "ne": return .devanagari
+        // 其他南亞
+        case "bn": return .bengali
+        case "ta": return .tamil
+        case "te": return .telugu
+        case "gu": return .gujarati
+        case "kn": return .kannada
+        case "ml": return .malayalam
+        case "pa": return .devanagari  // 旁遮普（Gurmukhi 近似）
+        // 東南亞
+        case "km": return .khmer
+        case "my": return .myanmar
+        case "lo": return .lao
+        // 其他
+        case "or": return .odia
+        case "ka": return .georgian
+        case "hy": return .armenian
+        case "he": return .hebrew
+        case "am": return .ethiopic
+        case "si": return .sinhala
+        default: return .unknown
+        }
+    }
+
+    /// 檢查文字中是否包含指定腳本的字元（至少一個）
+    private func textContainsScript(_ text: String, script: ScriptFamily) -> Bool {
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            switch script {
+            case .latin:
+                if (v >= 0x0041 && v <= 0x007A) || (v >= 0x00C0 && v <= 0x024F) { return true }
+            case .cjk:
+                if (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF) { return true }
+            case .kana:
+                if (v >= 0x3040 && v <= 0x309F) || (v >= 0x30A0 && v <= 0x30FF) ||
+                   (v >= 0x4E00 && v <= 0x9FFF) { return true }  // 日文也用漢字
+            case .hangul:
+                if (v >= 0xAC00 && v <= 0xD7AF) || (v >= 0x1100 && v <= 0x11FF) { return true }
+            case .cyrillic:
+                if v >= 0x0400 && v <= 0x04FF { return true }
+            case .arabic:
+                if v >= 0x0600 && v <= 0x06FF { return true }
+            case .thai:
+                if v >= 0x0E00 && v <= 0x0E7F { return true }
+            case .devanagari:
+                if v >= 0x0900 && v <= 0x097F { return true }
+            case .bengali:
+                if v >= 0x0980 && v <= 0x09FF { return true }
+            case .tamil:
+                if v >= 0x0B80 && v <= 0x0BFF { return true }
+            case .telugu:
+                if v >= 0x0C00 && v <= 0x0C7F { return true }
+            case .gujarati:
+                if v >= 0x0A80 && v <= 0x0AFF { return true }
+            case .kannada:
+                if v >= 0x0C80 && v <= 0x0CFF { return true }
+            case .malayalam:
+                if v >= 0x0D00 && v <= 0x0D7F { return true }
+            case .khmer:
+                if v >= 0x1780 && v <= 0x17FF { return true }
+            case .myanmar:
+                if v >= 0x1000 && v <= 0x109F { return true }
+            case .lao:
+                if v >= 0x0E80 && v <= 0x0EFF { return true }
+            case .odia:
+                if v >= 0x0B00 && v <= 0x0B7F { return true }
+            case .georgian:
+                if v >= 0x10A0 && v <= 0x10FF { return true }
+            case .armenian:
+                if v >= 0x0530 && v <= 0x058F { return true }
+            case .hebrew:
+                if v >= 0x0590 && v <= 0x05FF { return true }
+            case .ethiopic:
+                if v >= 0x1200 && v <= 0x137F { return true }
+            case .sinhala:
+                if v >= 0x0D80 && v <= 0x0DFF { return true }
+            case .unknown:
+                return true  // 未知腳本不過濾
+            }
+        }
+        return false
+    }
+
+    /// ⭐️ 驗證偵測語言與文字腳本是否一致（防止幻聽）
+    /// 允許 code-switching：只要文字中包含偵測語言的腳本字元就通過
+    private func isScriptConsistent(detectedLanguage: String?, text: String) -> Bool {
+        guard let lang = detectedLanguage, !lang.isEmpty else { return true }
+        let script = expectedScript(for: lang)
+        if script == .unknown { return true }
+        return textContainsScript(text, script: script)
     }
 
     /// ⭐️ 根據文本內容自動檢測語言
@@ -1670,6 +1801,13 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             case "partial_transcript":
                 guard let rawText = response.text, !rawText.isEmpty else { return }
 
+                // ⭐️ 腳本驗證過濾（防止幻聽亂碼語言）
+                if !isScriptConsistent(detectedLanguage: response.detectedLanguage, text: rawText) {
+                    print("🚫 [partial] 幻聽過濾: detected=\(response.detectedLanguage ?? "nil"), text=\"\(rawText.prefix(20))...\"")
+                    hallucinationSubject.send(response.detectedLanguage ?? "unknown")
+                    return
+                }
+
                 // ⭐️ 過濾純標點符號（避免單獨的句號、問號成為氣泡）
                 guard !isPunctuationOnly(rawText) else {
                     print("⋯ [partial] 跳過純標點: \"\(rawText)\"")
@@ -1752,6 +1890,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
             case "committed_transcript_with_timestamps":
                 guard let rawText = response.text, !rawText.isEmpty else { return }
+
+                // ⭐️ 腳本驗證過濾（防止幻聽亂碼語言）
+                if !isScriptConsistent(detectedLanguage: response.detectedLanguage, text: rawText) {
+                    print("🚫 [VAD Commit] 幻聽過濾: detected=\(response.detectedLanguage ?? "nil"), text=\"\(rawText.prefix(20))...\"")
+                    hallucinationSubject.send(response.detectedLanguage ?? "unknown")
+                    resetInterimState()
+                    return
+                }
 
                 // ⭐️ 防止重複：如果已經被自動提升為 final，跳過 VAD commit
                 // 場景：用戶停止說話 → 1秒後自動 final → VAD 也發送 commit

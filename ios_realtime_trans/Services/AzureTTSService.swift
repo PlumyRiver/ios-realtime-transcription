@@ -19,6 +19,9 @@ class AzureTTSService {
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
 
+    /// ⭐️ WebSocket 是否已連線
+    private var isWebSocketConnected: Bool = false
+
     // 音訊片段累積
     private var audioChunks: [Data] = []
     private var isReceiving = false
@@ -160,8 +163,18 @@ class AzureTTSService {
     }
 
 
+    /// ⭐️ 預先連接 WebSocket（在錄音開始時呼叫，預熱 Cloud Run）
+    func preConnect() {
+        guard webSocketTask == nil else { return }
+        connectWebSocket()
+        print("🔥 [TTS Stream] 預先連接 WebSocket（預熱 Cloud Run）")
+    }
+
     /// 連接 WebSocket
     private func connectWebSocket() {
+        // 斷開舊連線
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+
         guard let url = URL(string: streamURL) else {
             print("❌ [TTS Stream] Invalid URL")
             return
@@ -171,6 +184,7 @@ class AzureTTSService {
         urlSession = URLSession(configuration: configuration)
         webSocketTask = urlSession?.webSocketTask(with: url)
         webSocketTask?.resume()
+        isWebSocketConnected = true
 
         print("🔌 [TTS Stream] WebSocket connected")
 
@@ -289,11 +303,12 @@ class AzureTTSService {
         audioChunks.removeAll()
         isReceiving = true
 
-        // 連接 WebSocket
-        connectWebSocket()
-
-        // 等待連接建立（簡單延遲）
-        try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+        // 連接 WebSocket（如果尚未連線或已斷線）
+        if webSocketTask == nil || !isWebSocketConnected {
+            connectWebSocket()
+            // 等待新連接建立（僅新連線時）
+            try? await Task.sleep(nanoseconds: 200_000_000) // 0.2s
+        }
 
         // 發送合成請求
         let request: [String: Any] = [

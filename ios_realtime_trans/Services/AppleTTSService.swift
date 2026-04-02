@@ -24,6 +24,9 @@ class AppleTTSService: NSObject {
     /// 是否正在播放
     private(set) var isPlaying: Bool = false
 
+    /// 是否已預熱（載入語音模型）
+    private var isWarmedUp: Bool = false
+
     /// 當前播放的文本
     private(set) var currentText: String?
 
@@ -129,6 +132,20 @@ class AppleTTSService: NSObject {
         print("   語音: \(utterance.voice?.name ?? "預設")")
 
         synthesizer.speak(utterance)
+    }
+
+    /// ⭐️ 預熱語音引擎（強制 iOS 載入語音模型，避免第一次播放卡頓）
+    /// 在錄音開始時呼叫，靜音播放一個空格讓系統預載模型
+    func preWarm(languageCode: String = "zh-TW") {
+        guard !isWarmedUp else { return }
+        isWarmedUp = true
+
+        let appleLocale = convertToAppleLocale(languageCode)
+        let utterance = AVSpeechUtterance(string: " ")
+        utterance.voice = AVSpeechSynthesisVoice(language: appleLocale)
+        utterance.volume = 0  // 完全靜音
+        synthesizer.speak(utterance)
+        print("🔥 [Apple TTS] 預熱語音引擎: \(appleLocale)")
     }
 
     /// 停止播放
