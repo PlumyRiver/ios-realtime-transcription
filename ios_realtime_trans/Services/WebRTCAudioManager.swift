@@ -175,23 +175,6 @@ final class WebRTCAudioManager: NSObject {
         }
     }
 
-    /// 音量增益（dB）
-    static let maxVolumeDB: Float = 36.0
-    var volumeBoostDB: Float = 24.0 {
-        didSet {
-            updateVolumeGain()
-        }
-    }
-
-    /// 音量百分比
-    var volumePercent: Float {
-        get { volumeBoostDB / Self.maxVolumeDB }
-        set {
-            let clamped = min(max(newValue, 0), 1)
-            volumeBoostDB = clamped * Self.maxVolumeDB
-        }
-    }
-
     // MARK: - 麥克風增益設定
 
     /// ⭐️ 麥克風增益（1.0 = 原始音量，2.0 = 兩倍，最大 4.0）
@@ -242,9 +225,6 @@ final class WebRTCAudioManager: NSObject {
     /// TTS 播放器節點（連接到 WebRTC Engine）
     private var ttsPlayerNode: AVAudioPlayerNode?
 
-    /// TTS EQ 節點
-    private var ttsEQNode: AVAudioUnitEQ?
-
     /// TTS 音頻文件
     private var ttsAudioFile: AVAudioFile?
 
@@ -256,6 +236,29 @@ final class WebRTCAudioManager: NSObject {
 
     /// TTS 節點是否已連接
     private var ttsNodesConnected: Bool = false
+
+    // MARK: - Apple TTS Buffered Playback
+    // 用 AVSpeechSynthesizer.write 渲染出來的 PCM buffer 走這條路徑，
+    // 共用同一條 ttsPlayerNode → ttsEQNode → mainMixerNode 鏈，
+    // 因此 EQ 增益對 Apple TTS 也生效。
+
+    /// Apple TTS PCM 格式轉換器（從 synthesizer 的原生格式轉成 mixer 格式）
+    private var appleTTSConverter: AVAudioConverter?
+
+    /// Apple TTS 已排程的 buffer 數
+    private var appleTTSScheduledBufferCount: Int = 0
+
+    /// Apple TTS 已播放完的 buffer 數
+    private var appleTTSPlayedBufferCount: Int = 0
+
+    /// Apple TTS 合成器是否已送出最後一個 buffer
+    private var appleTTSSynthesisFinished: Bool = false
+
+    /// Apple TTS 播放完成的回調
+    private var appleTTSCompletionCallback: (() -> Void)?
+
+    /// 是否正在進行 Apple TTS 緩衝播放（用來判斷是否屬於 Apple 路徑）
+    private var isAppleTTSBufferedPlayback: Bool = false
 
     // MARK: - Audio Buffer
 
@@ -973,21 +976,18 @@ final class WebRTCAudioManager: NSObject {
 
         if ttsPlayerNode == nil {
             ttsPlayerNode = AVAudioPlayerNode()
-            ttsEQNode = AVAudioUnitEQ(numberOfBands: 3)
         }
 
-        guard let player = ttsPlayerNode, let eq = ttsEQNode else { return }
+        guard let player = ttsPlayerNode else { return }
 
         engine.attach(player)
-        engine.attach(eq)
-
+        // ⭐️ 直接接到 mainMixerNode，無 EQ 增益、無樣本級放大
+        // 音量完全由系統媒體音量鍵控制
         let format = engine.mainMixerNode.outputFormat(forBus: 0)
-        engine.connect(player, to: eq, format: format)
-        engine.connect(eq, to: engine.mainMixerNode, format: format)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
 
         ttsNodesConnected = true
-        updateVolumeGain()
-        print("✅ [WebRTC] TTS 節點預先建立完成")
+        print("✅ [WebRTC] TTS 節點預先建立完成（player → mainMixer，無 EQ）")
     }
 
     func playTTS(audioData: Data, text: String? = nil) throws {
@@ -1005,24 +1005,18 @@ final class WebRTCAudioManager: NSObject {
         // 創建播放節點（如果還沒有）
         if ttsPlayerNode == nil {
             ttsPlayerNode = AVAudioPlayerNode()
-            ttsEQNode = AVAudioUnitEQ(numberOfBands: 3)
         }
 
-        guard let player = ttsPlayerNode, let eq = ttsEQNode else {
+        guard let player = ttsPlayerNode else {
             throw WebRTCTTSError.playbackFailed
         }
 
         // 連接節點到 WebRTC Engine（如果還沒連接）
         if !ttsNodesConnected {
             engine.attach(player)
-            engine.attach(eq)
-
             let format = engine.mainMixerNode.outputFormat(forBus: 0)
-            engine.connect(player, to: eq, format: format)
-            engine.connect(eq, to: engine.mainMixerNode, format: format)
-
+            engine.connect(player, to: engine.mainMixerNode, format: format)
             ttsNodesConnected = true
-            updateVolumeGain()
             print("✅ [WebRTC] TTS 節點已連接到 WebRTC Engine")
         }
 
@@ -1036,9 +1030,7 @@ final class WebRTCAudioManager: NSObject {
             throw WebRTCTTSError.audioFileError
         }
 
-        print("🔊 [WebRTC] TTS 播放中（全雙工，AEC 處理回音）")
-        print("   文本: \(text?.prefix(30) ?? "unknown")...")
-        print("   增益: +\(Int(volumeBoostDB)) dB")
+        print("🔊 [WebRTC] TTS 播放中（全雙工，AEC 處理回音）: \(text?.prefix(30) ?? "unknown")...")
 
         player.scheduleFile(audioFile, at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             DispatchQueue.main.async {
@@ -1075,6 +1067,17 @@ final class WebRTCAudioManager: NSObject {
         }
         ttsAudioFile = nil
 
+        // ⭐️ 同時清掉 Apple TTS 緩衝播放的狀態（避免殘留 callback / counters）
+        if isAppleTTSBufferedPlayback {
+            isAppleTTSBufferedPlayback = false
+            appleTTSCompletionCallback = nil
+            appleTTSConverter = nil
+            appleTTSScheduledBufferCount = 0
+            appleTTSPlayedBufferCount = 0
+            appleTTSSynthesisFinished = false
+            ttsPlayerNode?.reset()
+        }
+
         isPlayingTTS = false
         currentTTSText = nil
     }
@@ -1097,29 +1100,210 @@ final class WebRTCAudioManager: NSObject {
         }
     }
 
-    /// 更新音量增益
-    private func updateVolumeGain() {
-        guard let eq = ttsEQNode else { return }
+    // MARK: - Apple TTS Buffered Playback API
+    //
+    // 設計重點：
+    // 1. Apple TTS 用 AVSpeechSynthesizer.write 把語音渲染成 PCM buffer，
+    //    一段一段送進來，但合成完成 ≠ 播放完成。
+    // 2. 因此完成判定需要兩個條件同時滿足：
+    //    (a) markAppleTTSSynthesisFinished() 已被呼叫（合成器送完最後一個 buffer）
+    //    (b) appleTTSPlayedBufferCount == appleTTSScheduledBufferCount（所有排程都播完）
+    // 3. 走 ttsPlayerNode → mainMixerNode 的播放鏈，AEC 自動處理回音。
+    // 4. AVSpeechSynthesizer 吐出的 buffer 通常是 22050Hz Float32 mono，
+    //    跟 mainMixerNode 的格式（48000Hz mono Float32）不一樣，
+    //    所以第一個 buffer 進來時懶建一個 AVAudioConverter 做轉換。
+    // 5. 不做任何 gain，音量完全交給系統媒體音量。
 
-        let perBandGain = volumeBoostDB / 3.0
+    /// 開始一個 Apple TTS 緩衝播放會話
+    /// - Parameters:
+    ///   - text: 要播放的文字（用於 UI 顯示）
+    ///   - completion: 全部 buffer 真正播完後的回調
+    func beginAppleTTSPlayback(text: String? = nil, completion: @escaping () -> Void) throws {
+        // 停止任何正在播放的 TTS（含一般 Azure TTS 和先前的 Apple buffered）
+        stopTTS()
 
-        eq.bands[0].filterType = .lowShelf
-        eq.bands[0].frequency = 250
-        eq.bands[0].gain = perBandGain
-        eq.bands[0].bypass = false
+        guard let engine = webrtcEngine else {
+            print("❌ [WebRTC] Engine 未準備好，無法開始 Apple TTS")
+            throw WebRTCTTSError.engineNotReady
+        }
 
-        eq.bands[1].filterType = .parametric
-        eq.bands[1].frequency = 1000
-        eq.bands[1].bandwidth = 1.0
-        eq.bands[1].gain = perBandGain
-        eq.bands[1].bypass = false
+        // 確保 TTS 節點已建立並連接
+        if !ttsNodesConnected {
+            preInitTTSNodes()
+        }
 
-        eq.bands[2].filterType = .highShelf
-        eq.bands[2].frequency = 4000
-        eq.bands[2].gain = perBandGain
-        eq.bands[2].bypass = false
+        // preInitTTSNodes 仍可能因為 engine.attach 失敗而沒連起來
+        guard ttsNodesConnected, let player = ttsPlayerNode else {
+            print("❌ [WebRTC] TTS 節點未就緒")
+            throw WebRTCTTSError.playbackFailed
+        }
 
-        print("🔊 [WebRTC] 音量增益: +\(Int(volumeBoostDB)) dB")
+        // 重置狀態
+        currentTTSText = text
+        isPlayingTTS = true
+        hasTriggeredCompletion = false
+        appleTTSConverter = nil
+        appleTTSScheduledBufferCount = 0
+        appleTTSPlayedBufferCount = 0
+        appleTTSSynthesisFinished = false
+        appleTTSCompletionCallback = completion
+        isAppleTTSBufferedPlayback = true
+
+        // 確保 player node 在播放中（scheduleBuffer 才會立刻消費）
+        if !player.isPlaying {
+            player.play()
+        }
+
+        // ⭐️ 緩衝模式不啟動 startPlaybackMonitor：
+        //   monitor 會在 player 暫時沒 buffer 時誤判為「播放結束」並關掉，
+        //   而緩衝模式下 player 確實會在 buffer 之間瞬間停止。
+        //   完成判定改用 (synthesisFinished && playedCount == scheduledCount)。
+
+        print("🔊 [WebRTC] Apple TTS 緩衝播放開始: \(text?.prefix(30) ?? "unknown")...")
+    }
+
+    /// 排程一個來自 AVSpeechSynthesizer.write 的 PCM buffer 到 EQ 鏈播放
+    /// - Note: 可能由 synthesizer 的內部 queue 呼叫，所有狀態變更都派回主執行緒
+    func scheduleAppleTTSBuffer(_ buffer: AVAudioBuffer) {
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduleAppleTTSBufferOnMain(buffer)
+        }
+    }
+
+    private func scheduleAppleTTSBufferOnMain(_ buffer: AVAudioBuffer) {
+        guard isAppleTTSBufferedPlayback else {
+            // 已被 stopTTS 取消
+            return
+        }
+        guard let pcmBuffer = buffer as? AVAudioPCMBuffer, pcmBuffer.frameLength > 0 else {
+            return
+        }
+        guard let player = ttsPlayerNode, let engine = webrtcEngine else {
+            return
+        }
+
+        let targetFormat = engine.mainMixerNode.outputFormat(forBus: 0)
+
+        // 第一個 buffer 進來時懶建轉換器
+        if appleTTSConverter == nil {
+            guard let conv = AVAudioConverter(from: pcmBuffer.format, to: targetFormat) else {
+                print("❌ [WebRTC] 無法建立 Apple TTS 轉換器")
+                return
+            }
+            appleTTSConverter = conv
+            print("🔄 [WebRTC] Apple TTS 轉換器: \(pcmBuffer.format.sampleRate)Hz \(pcmBuffer.format.channelCount)ch → \(targetFormat.sampleRate)Hz \(targetFormat.channelCount)ch")
+        }
+
+        guard let converter = appleTTSConverter else { return }
+
+        // 計算目標 buffer 容量（多預留一點以防取整誤差）
+        let ratio = targetFormat.sampleRate / pcmBuffer.format.sampleRate
+        let outputCapacity = AVAudioFrameCount(Double(pcmBuffer.frameLength) * ratio + 16)
+
+        guard let outputBuffer = AVAudioPCMBuffer(
+            pcmFormat: targetFormat,
+            frameCapacity: max(outputCapacity, 1)
+        ) else {
+            print("❌ [WebRTC] 無法配置輸出 buffer")
+            return
+        }
+
+        var convertError: NSError?
+        var inputProvided = false
+        let status = converter.convert(to: outputBuffer, error: &convertError) { _, outStatus in
+            if inputProvided {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            inputProvided = true
+            outStatus.pointee = .haveData
+            return pcmBuffer
+        }
+
+        if let convertError = convertError {
+            print("❌ [WebRTC] Apple TTS 轉換失敗: \(convertError.localizedDescription)")
+            return
+        }
+
+        if status == .error || outputBuffer.frameLength == 0 {
+            return
+        }
+
+        appleTTSScheduledBufferCount += 1
+
+        player.scheduleBuffer(outputBuffer, at: nil, options: []) { [weak self] in
+            DispatchQueue.main.async {
+                self?.onAppleTTSBufferPlayed()
+            }
+        }
+    }
+
+    /// 通知合成器已送出最後一個 buffer
+    func markAppleTTSSynthesisFinished() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard self.isAppleTTSBufferedPlayback else { return }
+            self.appleTTSSynthesisFinished = true
+            print("📝 [WebRTC] Apple TTS 合成完成標記，等播放收尾")
+            self.checkAppleTTSCompletion()
+        }
+    }
+
+    /// 立即停止 Apple TTS 緩衝播放（用於 stop / skip）
+    func stopAppleTTSPlayback() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard self.isAppleTTSBufferedPlayback else { return }
+
+            self.isAppleTTSBufferedPlayback = false
+            self.ttsPlayerNode?.stop()
+            self.ttsPlayerNode?.reset()
+            self.appleTTSConverter = nil
+            self.appleTTSScheduledBufferCount = 0
+            self.appleTTSPlayedBufferCount = 0
+            self.appleTTSSynthesisFinished = false
+
+            self.isPlayingTTS = false
+            self.currentTTSText = nil
+            self.playbackTimer?.invalidate()
+            self.playbackTimer = nil
+
+            // 不主動呼叫 completion，呼叫端 stopCurrentTTS/skipCurrentTTS 自己處理隊列
+            self.appleTTSCompletionCallback = nil
+
+            print("⏹️ [WebRTC] Apple TTS 緩衝播放已停止")
+        }
+    }
+
+    private func onAppleTTSBufferPlayed() {
+        guard isAppleTTSBufferedPlayback else { return }
+        appleTTSPlayedBufferCount += 1
+        checkAppleTTSCompletion()
+    }
+
+    private func checkAppleTTSCompletion() {
+        guard isAppleTTSBufferedPlayback else { return }
+        guard appleTTSSynthesisFinished else { return }
+        guard appleTTSPlayedBufferCount >= appleTTSScheduledBufferCount else { return }
+        guard !hasTriggeredCompletion else { return }
+
+        hasTriggeredCompletion = true
+        print("✅ [WebRTC] Apple TTS 緩衝播放完成（\(appleTTSPlayedBufferCount) buffers）")
+
+        isAppleTTSBufferedPlayback = false
+        isPlayingTTS = false
+        currentTTSText = nil
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+
+        let cb = appleTTSCompletionCallback
+        appleTTSCompletionCallback = nil
+        appleTTSConverter = nil
+        appleTTSScheduledBufferCount = 0
+        appleTTSPlayedBufferCount = 0
+        appleTTSSynthesisFinished = false
+
+        cb?()
     }
 
     // MARK: - Buffer Management

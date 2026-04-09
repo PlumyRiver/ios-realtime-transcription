@@ -8,6 +8,7 @@
 import Foundation
 import Combine
 import AVFoundation
+import UIKit
 
 /// 連接狀態
 enum ConnectionStatus {
@@ -148,12 +149,6 @@ final class TranscriptionViewModel {
     var autoPlayTTS: Bool {
         get { ttsPlaybackMode != .muted }
         set { ttsPlaybackMode = newValue ? .all : .muted }
-    }
-
-    /// ⭐️ TTS 音量（0.0 ~ 1.0，對應 0 ~ 36 dB 總增益，WebRTC AEC3 無 AGC 限制）
-    var ttsVolume: Float {
-        get { audioManager.volumePercent }
-        set { audioManager.volumePercent = newValue }
     }
 
     /// ⭐️ Apple TTS 播放狀態（手動追蹤，因為 AppleTTSService 不是 @Observable）
@@ -719,11 +714,126 @@ final class TranscriptionViewModel {
 
         // ⭐️ 初始化完成，允許 didSet 正常執行
         isInitializing = false
+
+        // ⭐️ 設定 App 生命週期監聽
+        setupLifecycleObservers()
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
     func prefetchElevenLabsToken() {
         elevenLabsService.prefetchToken(serverURL: serverURL)
+    }
+
+    // MARK: - App Lifecycle Management
+
+    /// 進入背景的時間（用於判斷是否超過 5 分鐘）
+    private var backgroundEntryTime: Date?
+    /// 背景超時（5 分鐘）
+    private let backgroundTimeout: TimeInterval = 5 * 60
+    /// 前台閒置超時（10 分鐘無轉錄）
+    private let foregroundIdleTimeout: TimeInterval = 10 * 60
+    /// 前台閒置計時器
+    private var idleTimer: Timer?
+    /// 是否因為進入背景而暫停音訊
+    private var isPausedForBackground: Bool = false
+
+    /// ⭐️ 設置 App 生命週期監聽（在 init 後呼叫）
+    func setupLifecycleObservers() {
+        // 進入背景：停止發送音訊，保持連線
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleEnterBackground()
+        }
+
+        // 回到前台：檢查時間，恢復或斷線
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleEnterForeground()
+        }
+
+        // 螢幕鎖定：立即斷線
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenLock()
+        }
+
+        print("✅ [Lifecycle] App 生命週期監聽已設定")
+    }
+
+    /// 進入背景：停止音訊，保持連線
+    @MainActor
+    private func handleEnterBackground() {
+        guard isRecording else { return }
+        backgroundEntryTime = Date()
+        isPausedForBackground = true
+
+        // 停止發送音訊（但不斷線）
+        audioManager.stopSending()
+        // 停止閒置計時器（背景不需要）
+        idleTimer?.invalidate()
+        idleTimer = nil
+
+        print("📱 [Lifecycle] 進入背景 → 暫停音訊發送（保持連線）")
+    }
+
+    /// 回到前台：判斷是否超時
+    @MainActor
+    private func handleEnterForeground() {
+        guard isPausedForBackground, isRecording else { return }
+        isPausedForBackground = false
+
+        if let entryTime = backgroundEntryTime {
+            let elapsed = Date().timeIntervalSince(entryTime)
+            if elapsed >= backgroundTimeout {
+                // 超過 5 分鐘 → 自動斷線
+                print("📱 [Lifecycle] 背景超過 \(Int(elapsed))s（>\(Int(backgroundTimeout))s）→ 自動斷線")
+                endCall()
+                return
+            }
+            print("📱 [Lifecycle] 回到前台（背景 \(Int(elapsed))s）→ 恢復音訊發送")
+        }
+
+        backgroundEntryTime = nil
+
+        // 恢復音訊發送
+        if inputMode == .vad {
+            audioManager.startSending()
+        }
+
+        // 重啟閒置計時器
+        startIdleTimer()
+    }
+
+    /// 螢幕鎖定：立即斷線
+    @MainActor
+    private func handleScreenLock() {
+        guard isRecording else { return }
+        print("🔒 [Lifecycle] 螢幕鎖定 → 自動斷線")
+        endCall()
+    }
+
+    /// ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
+    func startIdleTimer() {
+        idleTimer?.invalidate()
+        idleTimer = Timer.scheduledTimer(withTimeInterval: foregroundIdleTimeout, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.isRecording else { return }
+                print("⏰ [Lifecycle] 前台閒置 \(Int(self.foregroundIdleTimeout))s 無轉錄 → 自動斷線")
+                self.endCall()
+            }
+        }
+    }
+
+    /// ⭐️ 重置閒置計時器（收到轉錄時呼叫）
+    func resetIdleTimer() {
+        guard isRecording, !isPausedForBackground else { return }
+        startIdleTimer()
     }
 
     // MARK: - Public Methods
@@ -1012,6 +1122,9 @@ final class TranscriptionViewModel {
             status = .recording
             startDurationTimer()
 
+            // ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
+            startIdleTimer()
+
             // ⭐️ 顯示雙語介紹提示（從 Firestore 讀取）
             Task {
                 await showLanguageIntroduction()
@@ -1070,6 +1183,12 @@ final class TranscriptionViewModel {
         status = .disconnected
 
         stopDurationTimer()
+
+        // ⭐️ 停止閒置計時器
+        idleTimer?.invalidate()
+        idleTimer = nil
+        isPausedForBackground = false
+        backgroundEntryTime = nil
 
         // ⭐️ 停止 STT 計時
         BillingService.shared.stopSTTTimer()
@@ -1573,6 +1692,8 @@ final class TranscriptionViewModel {
     private func handleTranscript(_ transcript: TranscriptMessage) {
         // ⭐️ 記錄收到 transcript 的時間（用於 TTS 播放前檢查）
         lastTranscriptTime = Date()
+        // ⭐️ 重置閒置計時器（有活動 = 不閒置）
+        resetIdleTimer()
 
         if transcript.isFinal {
             // 最終結果：添加到列表末尾（最新的在下面）
@@ -2640,16 +2761,46 @@ final class TranscriptionViewModel {
         case .apple:
             // ⭐️ 檢查 Apple TTS 是否支援此語言
             if AppleTTSService.isLanguageSupported(item.lang) {
-                // Apple TTS：本地合成 + 直接播放（免費、離線）
-                print("🎙️ [Apple TTS] 播放中: \"\(item.text.prefix(30))...\"")
+                // Apple TTS：本地合成 → 緩衝播放（PCM 走 WebRTC EQ 鏈，支援 +36 dB 增益）
+                print("🎙️ [Apple TTS Buffered] 播放中: \"\(item.text.prefix(30))...\"")
 
-                // ⭐️ Apple TTS 不計費
-                // 注意：Apple TTS 直接播放，不經過 WebRTC
-                // AEC 仍然有效（因為共享同一個 AudioSession）
-                isAppleTTSPlaying = true  // ⭐️ 更新狀態（觸發 UI 更新）
-                appleTTSCurrentText = item.text  // ⭐️ 記錄當前播放文本
-                appleTTSService.speak(text: item.text, languageCode: item.lang)
-                currentSynthesizingText = nil
+                isAppleTTSPlaying = true
+                appleTTSCurrentText = item.text
+
+                let textForCompletion = item.text
+                do {
+                    // 1) 開啟 WebRTC 那條 player → EQ → mainMixer 鏈
+                    try audioManager.beginAppleTTSPlayback(text: item.text) { [weak self] in
+                        // 真正全部播完才會跑這
+                        guard let self = self else { return }
+                        if self.appleTTSCurrentText == textForCompletion {
+                            self.isAppleTTSPlaying = false
+                            self.appleTTSCurrentText = nil
+                        }
+                        self.processNextTTS()
+                    }
+
+                    // 2) 啟動合成，每段 buffer 直接餵給 audioManager
+                    appleTTSService.speakBuffered(
+                        text: item.text,
+                        languageCode: item.lang,
+                        bufferHandler: { [weak self] buffer in
+                            self?.audioManager.scheduleAppleTTSBuffer(buffer)
+                        },
+                        completion: { [weak self] in
+                            // 合成器送完最後一個 buffer，標記等播放收尾
+                            self?.audioManager.markAppleTTSSynthesisFinished()
+                        }
+                    )
+                    currentSynthesizingText = nil
+                } catch {
+                    print("❌❌❌ [Apple TTS Buffered] 啟動失敗: \(error.localizedDescription)")
+                    print("    ⚠️ 回退到直接播放路徑 — 此路徑無法套用音量增益！")
+                    print("    可能原因：webrtcEngine 還沒就緒（通常是 TTS 在 startRecording 前就觸發）")
+                    // ⭐️ 回退：用舊的直接播放路徑（無 EQ 增益但至少能播）
+                    appleTTSService.speak(text: item.text, languageCode: item.lang)
+                    currentSynthesizingText = nil
+                }
             } else {
                 // ⭐️ 自動降級到 Azure TTS
                 print("⚠️ [Apple TTS] 不支援 \(item.lang)，自動降級到 Azure TTS")
@@ -2686,9 +2837,10 @@ final class TranscriptionViewModel {
         case .azure:
             audioManager.stopTTS()
         case .apple:
-            appleTTSService.stop()
-            isAppleTTSPlaying = false  // ⭐️ 更新狀態
-            appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
+            appleTTSService.stop()                // 停止合成器（含 buffered 模式的 write）
+            audioManager.stopAppleTTSPlayback()   // 停止 WebRTC 那條播放鏈
+            isAppleTTSPlaying = false
+            appleTTSCurrentText = nil
         }
         ttsQueue.removeAll()
         isProcessingTTS = false
@@ -2709,8 +2861,9 @@ final class TranscriptionViewModel {
             audioManager.stopTTS()
         case .apple:
             appleTTSService.stop()
-            isAppleTTSPlaying = false  // ⭐️ 更新狀態
-            appleTTSCurrentText = nil  // ⭐️ 清除當前播放文本
+            audioManager.stopAppleTTSPlayback()   // 停止 WebRTC 那條播放鏈
+            isAppleTTSPlaying = false
+            appleTTSCurrentText = nil
         }
         // 不清空隊列，繼續播放下一個
         processNextTTS()

@@ -1602,7 +1602,6 @@ struct MainMicrophoneButton: View {
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var viewModel: TranscriptionViewModel
-    @State private var volumeValue: Float = 0.5
     @State private var showPurchaseSheet = false
     @State private var authService = AuthService.shared
 
@@ -1817,54 +1816,6 @@ struct SettingsView: View {
                             }
                         } else {
                             Text("Azure 神經語音品質高，但需要網路且會消耗額度。")
-                        }
-                    }
-                }
-
-                // ⭐️ 音量設定區塊
-                Section("TTS 音量") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Image(systemName: "speaker.wave.1")
-                                .foregroundStyle(.secondary)
-
-                            // ⭐️ 直接綁定到 viewModel，滑塊和本地狀態雙向同步
-                            Slider(value: $volumeValue, in: 0...1, step: 0.05)
-                                .onChange(of: volumeValue) { _, newValue in
-                                    viewModel.ttsVolume = newValue
-                                }
-
-                            Image(systemName: "speaker.wave.3.fill")
-                                .foregroundStyle(.secondary)
-                        }
-
-                        HStack {
-                            Text("增益: +\(Int(volumeValue * 36)) dB（3頻段EQ）")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-
-                            Spacer()
-
-                            Text("\(Int(volumeValue * 100))%")
-                                .font(.headline)
-                                .foregroundStyle(volumeColor)
-                        }
-                    }
-                    .padding(.vertical, 4)
-
-                    // 快捷按鈕
-                    HStack(spacing: 12) {
-                        VolumePresetButton(label: "小", value: 0.25, current: $volumeValue) {
-                            viewModel.ttsVolume = 0.25
-                        }
-                        VolumePresetButton(label: "中", value: 0.5, current: $volumeValue) {
-                            viewModel.ttsVolume = 0.5
-                        }
-                        VolumePresetButton(label: "大", value: 0.75, current: $volumeValue) {
-                            viewModel.ttsVolume = 0.75
-                        }
-                        VolumePresetButton(label: "最大", value: 1.0, current: $volumeValue) {
-                            viewModel.ttsVolume = 1.0
                         }
                     }
                 }
@@ -2396,7 +2347,6 @@ struct SettingsView: View {
                 PurchaseView()
             }
             .onAppear {
-                volumeValue = viewModel.ttsVolume
                 // ⭐️ 設定頁面出現時啟用音量監測
                 viewModel.isVolumeMonitoringEnabled = true
             }
@@ -2404,16 +2354,6 @@ struct SettingsView: View {
                 // ⭐️ 設定頁面消失時禁用音量監測，避免不必要的 UI 更新
                 viewModel.isVolumeMonitoringEnabled = false
             }
-        }
-    }
-
-    private var volumeColor: Color {
-        if volumeValue < 0.3 {
-            return .green
-        } else if volumeValue < 0.7 {
-            return .orange
-        } else {
-            return .red
         }
     }
 
@@ -2889,35 +2829,6 @@ struct VADVolumeMeter: View {
             }
         }
         .frame(height: 24)
-    }
-}
-
-// MARK: - 音量預設按鈕
-
-struct VolumePresetButton: View {
-    let label: String
-    let value: Float
-    @Binding var current: Float
-    let action: () -> Void
-
-    private var isSelected: Bool {
-        abs(current - value) < 0.05
-    }
-
-    var body: some View {
-        Button {
-            current = value
-            action()
-        } label: {
-            Text(label)
-                .font(.subheadline)
-                .fontWeight(isSelected ? .bold : .regular)
-                .foregroundStyle(isSelected ? .white : .primary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(isSelected ? Color.blue : Color(.systemGray5))
-                .cornerRadius(8)
-        }
     }
 }
 

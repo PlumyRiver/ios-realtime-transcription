@@ -27,6 +27,12 @@ class AppleTTSService: NSObject {
     /// 是否已預熱（載入語音模型）
     private var isWarmedUp: Bool = false
 
+    /// ⭐️ 是否正在「緩衝模式」（用 write() 渲染 PCM 由外部播放）
+    /// 緩衝模式下要忽略 synthesizer 的 didStart/didFinish/didCancel 回調，
+    /// 因為實際的播放完成是由外部（WebRTCAudioManager）通知，
+    /// 不能讓 delegate 的 didFinish 提前觸發 onPlaybackFinished。
+    private var isBufferedMode: Bool = false
+
     /// 當前播放的文本
     private(set) var currentText: String?
 
@@ -95,6 +101,77 @@ class AppleTTSService: NSObject {
 
     // MARK: - Public Methods
 
+    /// ⭐️ 緩衝模式：用 AVSpeechSynthesizer.write 把語音渲染成 PCM buffer，
+    /// 由呼叫者（WebRTCAudioManager）透過 EQ 鏈播放，藉此實現音量增益。
+    ///
+    /// 為什麼要這樣？
+    /// 直接呼叫 `speak()` 走系統音訊路徑，`utterance.volume` 上限只有 1.0，
+    /// 無法達成 UI 標示的 +36 dB 增益。改用 `write()` 把音訊拿出來自己播放，
+    /// 才能餵進 WebRTC TTS player → EQ → mainMixer 鏈，套用 3 頻段 EQ 增益。
+    ///
+    /// - Parameters:
+    ///   - text: 要合成的文字
+    ///   - languageCode: 語言代碼（Azure 格式，如 "zh-TW", "en-US"）
+    ///   - bufferHandler: 每收到一段 PCM buffer 時呼叫（可能在合成器內部 queue 上呼叫，呼叫者需自行處理執行緒）
+    ///   - completion: 合成器吐完所有 buffer 後呼叫（已切回主執行緒）
+    func speakBuffered(
+        text: String,
+        languageCode: String = "zh-TW",
+        bufferHandler: @escaping (AVAudioBuffer) -> Void,
+        completion: @escaping () -> Void
+    ) {
+        stop()
+
+        guard !text.isEmpty else {
+            print("⚠️ [Apple TTS Buffered] 文字為空，跳過")
+            DispatchQueue.main.async {
+                completion()
+            }
+            return
+        }
+
+        currentText = text
+        isPlaying = true
+        isBufferedMode = true   // ⭐️ 進入緩衝模式，delegate 回調會被忽略
+
+        let appleLocale = convertToAppleLocale(languageCode)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: appleLocale)
+        utterance.rate = rate
+        utterance.pitchMultiplier = pitchMultiplier
+        // 緩衝模式下保持原始音量，增益由 WebRTC EQ 處理
+        utterance.volume = 1.0
+
+        if utterance.voice == nil {
+            print("⚠️ [Apple TTS Buffered] 找不到 \(appleLocale) 語音，使用預設")
+            utterance.voice = AVSpeechSynthesisVoice(language: "zh-TW")
+        }
+
+        print("🎙️ [Apple TTS Buffered] 開始合成: \"\(text.prefix(30))...\"")
+        print("   語言: \(appleLocale)")
+        print("   語音: \(utterance.voice?.name ?? "預設")")
+
+        var bufferCount = 0
+
+        synthesizer.write(utterance) { [weak self] buffer in
+            guard let self = self else { return }
+
+            // ⭐️ 空 buffer = 合成完成（write API 的約定）
+            if let pcmBuffer = buffer as? AVAudioPCMBuffer, pcmBuffer.frameLength == 0 {
+                print("✅ [Apple TTS Buffered] 合成完成（共 \(bufferCount) buffers）")
+                DispatchQueue.main.async {
+                    // ⭐️ 注意：isPlaying 由實際的播放完成回調控制（透過 completion）
+                    //   而不是合成完成。合成快、播放慢，這兩個是不同事件。
+                    completion()
+                }
+                return
+            }
+
+            bufferCount += 1
+            bufferHandler(buffer)
+        }
+    }
+
     /// 合成並播放語音
     /// - Parameters:
     ///   - text: 要合成的文字
@@ -156,6 +233,7 @@ class AppleTTSService: NSObject {
         }
         isPlaying = false
         currentText = nil
+        isBufferedMode = false   // ⭐️ 離開緩衝模式
     }
 
     /// 暫停播放
@@ -268,10 +346,17 @@ class AppleTTSService: NSObject {
 extension AppleTTSService: AVSpeechSynthesizerDelegate {
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        // ⭐️ 緩衝模式下忽略：實際播放由 WebRTCAudioManager 控制
+        guard !isBufferedMode else { return }
         print("▶️ [Apple TTS] 開始播放")
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        // ⭐️ 緩衝模式下忽略：完成事件由 speakBuffered 的 completion 處理
+        guard !isBufferedMode else {
+            print("✅ [Apple TTS Buffered] 合成器 didFinish（已忽略，等播放回調）")
+            return
+        }
         print("✅ [Apple TTS] 播放完成")
         // ⭐️ 確保在主線程更新狀態和調用回調（避免 UI 更新問題）
         DispatchQueue.main.async { [weak self] in
@@ -282,6 +367,8 @@ extension AppleTTSService: AVSpeechSynthesizerDelegate {
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        // ⭐️ 緩衝模式下忽略
+        guard !isBufferedMode else { return }
         print("⏹️ [Apple TTS] 播放已取消")
         // ⭐️ 確保在主線程更新狀態
         DispatchQueue.main.async { [weak self] in
