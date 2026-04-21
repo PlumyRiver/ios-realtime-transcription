@@ -80,6 +80,9 @@ class AppleSTTService: NSObject, WebSocketServiceProtocol {
 
     /// 翻譯模型選擇
     var translationProvider: TranslationProvider = .grok
+    /// 翻譯風格
+    var translationStyle: TranslationStyle = .neutral
+    var customStylePrompt: String = ""
 
     /// 伺服器 URL（用於翻譯 API）
     private var serverURL: String = ""

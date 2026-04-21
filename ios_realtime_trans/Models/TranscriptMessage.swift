@@ -236,6 +236,68 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
     }
 }
 
+/// ⭐️ 翻譯風格
+enum TranslationStyle: String, CaseIterable, Identifiable {
+    case neutral = "neutral"       // 標準（無特定風格）
+    case formal = "formal"         // 嚴肅商業
+    case casual = "casual"         // 口語化
+    case friendly = "friendly"     // 親近
+    case cute = "cute"             // 裝可愛
+    case custom = "custom"         // 自訂
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .neutral: return "標準"
+        case .formal: return "嚴肅商業"
+        case .casual: return "口語化"
+        case .friendly: return "親近"
+        case .cute: return "裝可愛"
+        case .custom: return "自訂"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .neutral: return "text.bubble"
+        case .formal: return "briefcase.fill"
+        case .casual: return "message.fill"
+        case .friendly: return "hand.wave.fill"
+        case .cute: return "heart.fill"
+        case .custom: return "pencil.line"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .neutral: return "標準翻譯，忠實傳達原意"
+        case .formal: return "正式、專業的商務用語"
+        case .casual: return "輕鬆隨意的日常對話風格"
+        case .friendly: return "溫暖親切的語氣"
+        case .cute: return "可愛撒嬌的說話方式"
+        case .custom: return "使用自訂的風格描述"
+        }
+    }
+
+    /// 給 LLM 的英文風格指令
+    var promptInstruction: String {
+        switch self {
+        case .neutral: return ""
+        case .formal: return "Use formal, professional business language. Be polite, precise, and use industry-standard terminology."
+        case .casual: return "Use casual, colloquial language. Be relaxed and natural, like chatting with a friend."
+        case .friendly: return "Use warm, friendly, and approachable tone. Be kind and caring in word choices."
+        case .cute: return "Use cute, playful, and adorable language. Add endearing expressions and soft tone where appropriate."
+        case .custom: return ""  // 由 customStylePrompt 提供
+        }
+    }
+
+    /// 預設選項（不含 custom）
+    static var presets: [TranslationStyle] {
+        allCases.filter { $0 != .custom }
+    }
+}
+
 /// ⭐️ TTS 服務商
 enum TTSProvider: String, CaseIterable, Identifiable {
     case azure = "azure"     // Azure 神經語音（高品質，付費）
@@ -824,7 +886,7 @@ struct TranslationSegment: Identifiable, Equatable {
 /// 轉錄訊息
 struct TranscriptMessage: Identifiable, Equatable {
     let id: UUID
-    let text: String
+    var text: String
     let isFinal: Bool
     let confidence: Double
     let language: String?

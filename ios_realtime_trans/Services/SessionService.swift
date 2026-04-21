@@ -316,4 +316,385 @@ final class SessionService {
     var hasActiveSession: Bool {
         return currentSessionId != nil
     }
+
+    // MARK: - Session History（過往對話紀錄）
+
+    /// 是否已確認 documentID 索引可用
+    private var useDocumentIdOrder: Bool?
+
+    /// ⭐️ 記憶體快取：避免每次開歷史都重新讀全部
+    private var cachedSessions: [SessionSummary] = []
+    private var cacheUid: String?
+    private var cacheFullyLoaded: Bool = false
+
+    /// 取得全部歷史（快取優先 + 差量同步）
+    ///
+    /// 策略：
+    /// 1. 如果記憶體快取有資料且 uid 一致 → 立刻回傳快取（0 次 Firestore 讀取）
+    /// 2. 同時在背景抓「比快取中最新 session 更新的」文件（差量同步）
+    /// 3. 第一次開（快取空）→ 從 Firestore 全量載入
+    ///
+    /// - Parameters:
+    ///   - uid: 用戶 ID
+    ///   - onBatchLoaded: 每載入一批就回調（用於 UI 即時更新）
+    func loadAllSessions(
+        uid: String,
+        onBatchLoaded: @escaping ([SessionSummary], _ isComplete: Bool) -> Void
+    ) async {
+        // ⭐️ 1) 記憶體快取命中
+        if cacheUid == uid && !cachedSessions.isEmpty {
+            print("⚡️ [Session] 記憶體快取命中: \(cachedSessions.count) 筆（0 次 Firestore 讀取）")
+            onBatchLoaded(cachedSessions, cacheFullyLoaded)
+            await deltaSync(uid: uid, onBatchLoaded: onBatchLoaded)
+            return
+        }
+
+        // ⭐️ 2) 磁碟快取命中
+        if let diskSessions = loadFromDisk(uid: uid) {
+            cachedSessions = diskSessions
+            cacheUid = uid
+            cacheFullyLoaded = true  // 磁碟快取是上次全量載入的完整結果
+            onBatchLoaded(cachedSessions, true)
+            await deltaSync(uid: uid, onBatchLoaded: onBatchLoaded)
+            return
+        }
+
+        // ⭐️ 3) 完全未命中：全量載入
+        print("📥 [Session] 無快取，全量載入...")
+        cacheUid = uid
+        cachedSessions = []
+        cacheFullyLoaded = false
+
+        var lastDocument: DocumentSnapshot?
+        var hasMore = true
+        let pageSize = 100
+        var retryCount = 0
+
+        while hasMore {
+            do {
+                let result = try await fetchSessions(uid: uid, limit: pageSize, lastDocument: lastDocument)
+                cachedSessions.append(contentsOf: result.sessions)
+                lastDocument = result.lastDocument
+                hasMore = result.lastDocument != nil
+                retryCount = 0
+
+                // 每批回調 UI
+                onBatchLoaded(cachedSessions, !hasMore)
+            } catch {
+                retryCount += 1
+                print("❌ [Session] 載入失敗 (第 \(retryCount) 次, 已載入 \(cachedSessions.count) 筆): \(error.localizedDescription)")
+                if retryCount >= 3 { break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+
+        cacheFullyLoaded = !hasMore
+        // ⭐️ 全量載入完成後存到磁碟
+        saveToDisk(uid: uid)
+        print("✅ [Session] 全量載入完成: \(cachedSessions.count) 筆，Firestore 讀取 \(cachedSessions.count) 次")
+    }
+
+    /// 差量同步：只抓比快取最新 session 更新的文件
+    private func deltaSync(
+        uid: String,
+        onBatchLoaded: @escaping ([SessionSummary], Bool) -> Void
+    ) async {
+        guard let newestId = cachedSessions.first?.id else { return }
+        do {
+            let newSessions = try await fetchSessionsNewerThan(uid: uid, sessionId: newestId)
+            if !newSessions.isEmpty {
+                cachedSessions.insert(contentsOf: newSessions, at: 0)
+                saveToDisk(uid: uid)
+                print("🔄 [Session] 差量同步: +\(newSessions.count) 筆新 session")
+                onBatchLoaded(cachedSessions, cacheFullyLoaded)
+            }
+        } catch {
+            print("⚠️ [Session] 差量同步失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// 當 endSession 被呼叫後，讓下次開歷史時能看到新 session
+    func invalidateHistoryCache() {
+        cacheFullyLoaded = false
+    }
+
+    // MARK: - Disk Cache（持久化快取，app 重啟也不用重新讀取全部）
+
+    /// 磁碟快取檔案路徑（Application Support — 永久保存，不會被系統清除）
+    private func diskCachePath(uid: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        // Application Support 目錄可能不存在，確保建立
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("session_history_\(uid).json")
+    }
+
+    /// 儲存到磁碟（只存 metadata，不存對話內容）
+    private func saveToDisk(uid: String) {
+        let entries = cachedSessions.map { CachedSession(from: $0) }
+        let wrapper = CachedSessionFile(uid: uid, sessions: entries)
+        do {
+            let data = try JSONEncoder().encode(wrapper)
+            try data.write(to: diskCachePath(uid: uid), options: .atomic)
+            print("💾 [Session] 磁碟快取已儲存: \(entries.count) 筆 (\(data.count / 1024) KB)")
+        } catch {
+            print("⚠️ [Session] 磁碟快取儲存失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// 從磁碟讀取快取
+    private func loadFromDisk(uid: String) -> [SessionSummary]? {
+        let path = diskCachePath(uid: uid)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: path)
+            let wrapper = try JSONDecoder().decode(CachedSessionFile.self, from: data)
+            guard wrapper.uid == uid else { return nil }
+            let sessions = wrapper.sessions.map { SessionSummary(fromCache: $0) }
+            print("⚡️ [Session] 磁碟快取載入: \(sessions.count) 筆 (\(data.count / 1024) KB)")
+            return sessions
+        } catch {
+            print("⚠️ [Session] 磁碟快取讀取失敗: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 按需抓取單個 session 的對話內容（展開日期時呼叫）
+    func fetchConversations(uid: String, sessionId: String) async throws -> [ConversationItem] {
+        let docRef = db.collection("users").document(uid).collection("sessions").document(sessionId)
+        let doc = try await docRef.getDocument()
+        guard let data = doc.data(),
+              let convArray = data["conversations"] as? [[String: Any]] else {
+            return []
+        }
+        return convArray.map { dict in
+            ConversationItem(
+                original: dict["original"] as? String ?? "",
+                translated: dict["translated"] as? String ?? "",
+                timestamp: dict["timestamp"] as? String ?? "",
+                position: dict["position"] as? String ?? "right"
+            )
+        }
+    }
+
+    // MARK: - Private Fetch Methods
+
+    /// 抓比指定 sessionId 更新的 session（用於差量同步）
+    private func fetchSessionsNewerThan(uid: String, sessionId: String) async throws -> [SessionSummary] {
+        let collectionRef = db.collection("users").document(uid).collection("sessions")
+        await ensureOrderStrategy(collectionRef: collectionRef)
+
+        var query: Query
+        if useDocumentIdOrder == true {
+            query = collectionRef
+                .order(by: FieldPath.documentID(), descending: true)
+                .end(before: [sessionId])
+        } else {
+            // startTime 排序下無法精確用 ID 做差量，改用時間
+            query = collectionRef
+                .order(by: "startTime", descending: true)
+                .limit(to: 50)
+        }
+
+        let snapshot = try await query.getDocuments()
+        let newSessions = snapshot.documents.compactMap { SessionSummary(document: $0) }
+
+        if useDocumentIdOrder != true {
+            // 用 startTime 排序時需要手動去重
+            let existingIds = Set(cachedSessions.prefix(50).map { $0.id })
+            return newSessions.filter { !existingIds.contains($0.id) }
+        }
+
+        print("📋 [Session] 差量查詢: \(newSessions.count) 筆新 session")
+        return newSessions
+    }
+
+    /// 確保已偵測排序策略
+    private func ensureOrderStrategy(collectionRef: CollectionReference) async {
+        guard useDocumentIdOrder == nil else { return }
+        do {
+            let testQuery = collectionRef
+                .order(by: FieldPath.documentID(), descending: true)
+                .limit(to: 1)
+            _ = try await testQuery.getDocuments()
+            useDocumentIdOrder = true
+            print("✅ [Session] documentID 索引可用")
+        } catch {
+            useDocumentIdOrder = false
+            print("⚠️ [Session] documentID 索引不可用，退回 startTime")
+        }
+    }
+
+    /// 分頁抓取（內部使用）
+    private func fetchSessions(
+        uid: String,
+        limit: Int = 100,
+        lastDocument: DocumentSnapshot? = nil
+    ) async throws -> (sessions: [SessionSummary], lastDocument: DocumentSnapshot?) {
+
+        let collectionRef = db.collection("users").document(uid).collection("sessions")
+        await ensureOrderStrategy(collectionRef: collectionRef)
+
+        var query: Query
+        if useDocumentIdOrder == true {
+            query = collectionRef.order(by: FieldPath.documentID(), descending: true).limit(to: limit)
+        } else {
+            query = collectionRef.order(by: "startTime", descending: true).limit(to: limit)
+        }
+
+        if let lastDoc = lastDocument {
+            query = query.start(afterDocument: lastDoc)
+        }
+
+        let snapshot = try await query.getDocuments()
+        let sessions = snapshot.documents.compactMap { SessionSummary(document: $0) }
+        let lastDoc = snapshot.documents.count < limit ? nil : snapshot.documents.last
+        return (sessions, lastDoc)
+    }
+}
+
+// MARK: - Session Summary Model（歷史列表用）
+
+struct SessionSummary: Identifiable {
+    let id: String              // sessionId
+    let startTime: Date
+    let sourceLang: String
+    let targetLang: String
+    let conversationCount: Int
+    let durationMs: Int         // lastDuration（毫秒）
+    let status: String
+
+    // ⭐️ 對話內容延遲解析：列表只需要 metadata，展開時才呼叫 parseConversations()
+    private let rawConversations: [[String: Any]]
+
+    /// 解析對話內容（僅在展開時呼叫，避免首次載入時解析成千上萬的物件）
+    func parseConversations() -> [ConversationItem] {
+        rawConversations.map { dict in
+            ConversationItem(
+                original: dict["original"] as? String ?? "",
+                translated: dict["translated"] as? String ?? "",
+                timestamp: dict["timestamp"] as? String ?? "",
+                position: dict["position"] as? String ?? "right"
+            )
+        }
+    }
+
+    // ⭐️ 靜態 DateFormatter 快取（避免每個 session 都重新配置）
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy/MM/dd"; return f
+    }()
+    private static let docIdFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd_HHmmss"; return f
+    }()
+    private static let isoFormatter = ISO8601DateFormatter()
+
+    /// 從 Firestore document 解析（只解析 metadata，不解析 conversations）
+    init?(document: DocumentSnapshot) {
+        guard let data = document.data() else { return nil }
+
+        self.id = data["sessionId"] as? String ?? document.documentID
+
+        // startTime 多重 fallback
+        if let ts = data["startTime"] as? Timestamp {
+            self.startTime = ts.dateValue()
+        } else if let local = data["startTimeLocal"] as? String,
+                  let date = Self.isoFormatter.date(from: local) {
+            self.startTime = date
+        } else {
+            let dateStr = String(document.documentID.prefix(15))
+            self.startTime = Self.docIdFormatter.date(from: dateStr) ?? Date()
+        }
+
+        self.sourceLang = data["sourceLang"] as? String ?? "?"
+        self.targetLang = data["targetLang"] as? String ?? "?"
+        self.conversationCount = data["conversationCount"] as? Int ?? 0
+        self.durationMs = data["lastDuration"] as? Int ?? 0
+        self.status = data["status"] as? String ?? "unknown"
+
+        // ⭐️ 只存原始字典，不解析 — 展開時才呼叫 parseConversations()
+        self.rawConversations = data["conversations"] as? [[String: Any]] ?? []
+    }
+
+    var formattedDuration: String {
+        let seconds = durationMs / 1000
+        if seconds < 60 { return "\(seconds)秒" }
+        let minutes = seconds / 60
+        let secs = seconds % 60
+        return secs > 0 ? "\(minutes)分\(secs)秒" : "\(minutes)分鐘"
+    }
+
+    var formattedTime: String { Self.timeFormatter.string(from: startTime) }
+
+    var formattedDate: String { Self.dateFormatter.string(from: startTime) }
+
+    var languagePair: String {
+        let src = Language(rawValue: sourceLang)?.shortName ?? sourceLang
+        let tgt = Language(rawValue: targetLang)?.shortName ?? targetLang
+        return "\(src) → \(tgt)"
+    }
+
+    var sessionDividerText: String {
+        var parts: [String] = []
+        if durationMs > 0 { parts.append(formattedDuration) }
+        parts.append("\(conversationCount)則訊息")
+        return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: - Disk Cache Models
+
+/// 磁碟快取用的輕量 session（只有 metadata，不含對話內容）
+struct CachedSession: Codable {
+    let id: String
+    let startTime: Date
+    let sourceLang: String
+    let targetLang: String
+    let conversationCount: Int
+    let durationMs: Int
+    let status: String
+
+    init(from summary: SessionSummary) {
+        self.id = summary.id
+        self.startTime = summary.startTime
+        self.sourceLang = summary.sourceLang
+        self.targetLang = summary.targetLang
+        self.conversationCount = summary.conversationCount
+        self.durationMs = summary.durationMs
+        self.status = summary.status
+    }
+}
+
+/// 磁碟快取檔案結構
+struct CachedSessionFile: Codable {
+    let uid: String
+    let sessions: [CachedSession]
+}
+
+// MARK: - SessionSummary 從快取初始化
+
+extension SessionSummary {
+    /// 從磁碟快取初始化（沒有對話內容，展開時按需從 Firestore 抓）
+    init(fromCache cached: CachedSession) {
+        self.id = cached.id
+        self.startTime = cached.startTime
+        self.sourceLang = cached.sourceLang
+        self.targetLang = cached.targetLang
+        self.conversationCount = cached.conversationCount
+        self.durationMs = cached.durationMs
+        self.status = cached.status
+        self.rawConversations = []  // 空的，展開時按需載入
+    }
+}
+
+// MARK: - ConversationItem 擴充初始化（從字典）
+
+extension ConversationItem {
+    init(original: String, translated: String, timestamp: String, position: String) {
+        self.original = original
+        self.translated = translated
+        self.timestamp = timestamp
+        self.position = position
+    }
 }

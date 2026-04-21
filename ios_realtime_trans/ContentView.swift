@@ -19,6 +19,7 @@ struct ScrollOffsetPreferenceKey: PreferenceKey {
 struct ContentView: View {
     @State private var viewModel = TranscriptionViewModel()
     @State private var showSettings = false
+    @State private var showHistory = false
 
     /// ⭐️ 獲取登入用戶資訊
     @State private var authService = AuthService.shared
@@ -28,6 +29,11 @@ struct ContentView: View {
 
     /// ⭐️ 是否已經預取過 token（防止重複預取）
     @State private var hasPreFetchedToken = false
+
+    /// ⭐️ 編輯對話狀態（提升到 ContentView 層級避免 LazyVStack 回收問題）
+    @State private var showEditSheet = false
+    @State private var editingTranscriptId: UUID?
+    @State private var editingInitialText: String = ""
 
     var body: some View {
         NavigationStack {
@@ -53,6 +59,11 @@ struct ContentView: View {
                                     currentPlayingText: viewModel.currentPlayingTTSText,
                                     onDelete: {
                                         viewModel.deleteTranscript(id: transcript.id)
+                                    },
+                                    onEditTapped: {
+                                        editingTranscriptId = transcript.id
+                                        editingInitialText = transcript.text
+                                        showEditSheet = true
                                     }
                                 )
                                 .id(transcript.id)
@@ -169,21 +180,32 @@ struct ContentView: View {
             .background(Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                // ⭐️ 左上角垃圾桶按鈕：一鍵清除對話
+                // 左：垃圾桶（獨立）
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         viewModel.clearTranscriptsOnly()
                     } label: {
                         Image(systemName: "trash")
-                            .foregroundColor(.red.opacity(0.8))
+                            .foregroundStyle(.red.opacity(0.8))
                     }
                     .disabled(viewModel.transcripts.isEmpty && viewModel.interimTranscript == nil)
                 }
 
+                // 中：歷史 + 額度
                 ToolbarItem(placement: .principal) {
-                    CreditsToolbarView(showSettings: $showSettings, isRecording: viewModel.isRecording)
+                    HStack(spacing: 12) {
+                        Button {
+                            showHistory = true
+                        } label: {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .font(.system(size: 16))
+                        }
+
+                        CreditsToolbarView(showSettings: $showSettings, isRecording: viewModel.isRecording)
+                    }
                 }
 
+                // 右：設定（獨立）
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showSettings = true
@@ -194,6 +216,14 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(viewModel: viewModel)
+            }
+            .sheet(isPresented: $showHistory) {
+                if let uid = authService.currentUser?.uid {
+                    SessionHistoryView(uid: uid)
+                } else {
+                    Text("請先登入以查看對話紀錄")
+                        .foregroundStyle(.secondary)
+                }
             }
             // ⭐️ 額度不足對話框
             .alert("額度已使用完畢", isPresented: $viewModel.showCreditsExhaustedAlert) {
@@ -213,6 +243,22 @@ struct ContentView: View {
                 // Debug: 顯示當前用戶額度
                 print("💰 [ContentView] currentUser = \(authService.currentUser?.email ?? "nil"), slowCredits = \(authService.currentUser?.slowCredits ?? -1)")
             }
+            // ⭐️ 編輯對話 Sheet（使用穩定的 @State Bool，避免 computed Binding 造成重複渲染）
+            .sheet(isPresented: $showEditSheet) {
+                EditTranscriptSheet(
+                    initialText: editingInitialText,
+                    onConfirm: { newText in
+                        if let id = editingTranscriptId {
+                            viewModel.editTranscriptAndRetranslate(id: id, newText: newText)
+                        }
+                        showEditSheet = false
+                    },
+                    onCancel: {
+                        showEditSheet = false
+                    }
+                )
+                .presentationDetents([.medium, .large])
+            }
         }
     }
 }
@@ -231,9 +277,8 @@ struct ConversationBubbleView: View {
     var currentPlayingText: String?
     /// ⭐️ 刪除這則對話
     var onDelete: (() -> Void)?
-
-    /// 複製反饋狀態
-    @State private var showCopiedFeedback: Bool = false
+    /// ⭐️ 點擊編輯按鈕（由父層處理 sheet 顯示）
+    var onEditTapped: (() -> Void)?
 
     /// ⭐️ 判斷這句話是否正在播放
     private var isThisPlaying: Bool {
@@ -289,8 +334,14 @@ struct ConversationBubbleView: View {
     }
 
     /// 是否顯示控制按鈕（播放 + 複製 + 刪除）
+    /// ⭐️ 修復：所有 final 都顯示按鈕（至少可以刪除和複製）
     private var showControlButtons: Bool {
-        transcript.isFinal && transcript.translation != nil
+        transcript.isFinal
+    }
+
+    /// ⭐️ 是否有可播放的翻譯
+    private var hasPlayableTranslation: Bool {
+        transcript.translation != nil && !transcript.translation!.isEmpty
     }
 
     var body: some View {
@@ -374,29 +425,31 @@ struct ConversationBubbleView: View {
     /// 控制按鈕組（播放 + 複製 + 刪除）
     private var controlButtons: some View {
         VStack(spacing: 6) {
-            // ⭐️ 播放/停止按鈕（根據播放狀態切換）
-            Button {
-                if isThisPlaying {
-                    // 正在播放這句 → 停止並播放下一個
-                    onStopTTS?()
-                } else {
-                    // 沒在播放 → 開始播放
-                    // ⭐️ 使用 ttsLanguageCode 根據原文語言動態決定 TTS 語言
-                    onPlayTTS?(transcript.translation!, ttsLanguageCode)
+            // ⭐️ 播放/停止按鈕（僅在有翻譯時顯示）
+            if hasPlayableTranslation {
+                Button {
+                    if isThisPlaying {
+                        // 正在播放這句 → 停止並播放下一個
+                        onStopTTS?()
+                    } else {
+                        // 沒在播放 → 開始播放
+                        // ⭐️ 使用 ttsLanguageCode 根據原文語言動態決定 TTS 語言
+                        onPlayTTS?(transcript.translation!, ttsLanguageCode)
+                    }
+                } label: {
+                    Image(systemName: isThisPlaying ? "stop.circle.fill" : "play.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(isThisPlaying ? .red : .blue)
                 }
-            } label: {
-                Image(systemName: isThisPlaying ? "stop.circle.fill" : "play.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(isThisPlaying ? .red : .blue)
             }
 
-            // 複製按鈕
+            // 編輯按鈕
             Button {
-                copyAllContent()
+                onEditTapped?()
             } label: {
-                Image(systemName: showCopiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
+                Image(systemName: "pencil")
                     .font(.title3)
-                    .foregroundStyle(showCopiedFeedback ? .green : .gray)
+                    .foregroundStyle(.gray)
             }
 
             // 刪除按鈕
@@ -408,26 +461,6 @@ struct ConversationBubbleView: View {
                 Image(systemName: "trash")
                     .font(.title3)
                     .foregroundStyle(.gray)
-            }
-        }
-    }
-
-    /// 複製原文和翻譯到剪貼簿
-    private func copyAllContent() {
-        var content = transcript.text
-        if let translation = transcript.translation {
-            content += "\n\n" + translation
-        }
-
-        UIPasteboard.general.string = content
-
-        withAnimation(.easeInOut(duration: 0.2)) {
-            showCopiedFeedback = true
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                showCopiedFeedback = false
             }
         }
     }
@@ -453,6 +486,62 @@ struct ConversationBubbleView: View {
         return names[base] ?? code
     }
 
+}
+
+// MARK: - 編輯對話 Sheet
+
+struct EditTranscriptSheet: View {
+    /// ⭐️ 只接收初始值（plain String），不用 @Binding 連回父層
+    /// 這樣 TextField 輸入不會觸發 ContentView 重新渲染整個對話列表
+    let initialText: String
+    var onConfirm: (String) -> Void
+    var onCancel: () -> Void
+
+    @State private var text: String = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 頂部按鈕列
+            HStack {
+                Button("取消") { onCancel() }
+                    .foregroundStyle(.blue)
+                Spacer()
+                Text("編輯對話")
+                    .font(.headline)
+                Spacer()
+                Button("確認翻譯") { onConfirm(text) }
+                    .bold()
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal)
+            .padding(.top, 20)
+            .padding(.bottom, 8)
+
+            Text("編輯文字後將重新翻譯")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 12)
+
+            TextField("輸入文字", text: $text, axis: .vertical)
+                .lineLimit(3...10)
+                .textFieldStyle(.plain)
+                .font(.body)
+                .padding(12)
+                .background(Color(.systemGray6))
+                .cornerRadius(12)
+                .focused($isFocused)
+                .padding(.horizontal)
+
+            Spacer()
+        }
+        .onAppear {
+            text = initialText
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                isFocused = true
+            }
+        }
+    }
 }
 
 // MARK: - Bubble Tail Shape (氣泡尖角)
@@ -2090,6 +2179,58 @@ struct SettingsView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+
+                // ⭐️ 翻譯風格設定
+                Section("翻譯風格") {
+                    Picker(selection: $viewModel.translationStyle) {
+                        ForEach(TranslationStyle.allCases) { style in
+                            HStack {
+                                Image(systemName: style.iconName)
+                                VStack(alignment: .leading) {
+                                    Text(style.displayName)
+                                    Text(style.description)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .tag(style)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: viewModel.translationStyle.iconName)
+                                .foregroundStyle(.purple)
+                            Text("風格")
+                        }
+                    }
+
+                    // 自訂風格輸入框（僅在選擇「自訂」時顯示）
+                    if viewModel.translationStyle == .custom {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("風格描述")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            TextField("例如：用東北話翻譯、像海盜一樣說話...", text: $viewModel.customStylePrompt, axis: .vertical)
+                                .textFieldStyle(.roundedBorder)
+                                .lineLimit(2...4)
+                                .font(.subheadline)
+                        }
+                    }
+
+                    // 當前風格說明
+                    if viewModel.translationStyle != .neutral {
+                        HStack {
+                            Image(systemName: "info.circle")
+                                .foregroundStyle(.blue)
+                            if viewModel.translationStyle == .custom {
+                                Text(viewModel.customStylePrompt.isEmpty ? "請輸入風格描述" : "使用自訂風格")
+                            } else {
+                                Text("翻譯將使用「\(viewModel.translationStyle.displayName)」風格")
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                 }
 
                 // ⭐️ ElevenLabs 專用設定

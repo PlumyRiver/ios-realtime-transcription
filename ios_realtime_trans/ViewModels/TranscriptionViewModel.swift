@@ -72,6 +72,8 @@ private enum VMSettingsKey: String {
     case autoSwitchConfidenceThreshold
     case isComparisonDisplayMode
     case sttLanguageDetectionMode
+    case translationStyle
+    case customStylePrompt
 }
 
 @Observable
@@ -295,6 +297,33 @@ final class TranscriptionViewModel {
                 appleSTTService.translationProvider = translationProvider
             }
             saveSetting(.translationProvider, value: translationProvider.rawValue)
+        }
+    }
+
+    // MARK: - ⭐️ 翻譯風格
+
+    /// 翻譯風格（預設標準）
+    var translationStyle: TranslationStyle = .neutral {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.translationStyle, value: translationStyle.rawValue)
+            elevenLabsService.translationStyle = translationStyle
+            elevenLabsService.customStylePrompt = translationStyle == .custom ? customStylePrompt : ""
+            appleSTTService.translationStyle = translationStyle
+            appleSTTService.customStylePrompt = translationStyle == .custom ? customStylePrompt : ""
+            print("🎨 [翻譯風格] 切換: \(translationStyle.displayName)")
+        }
+    }
+
+    /// 自訂風格描述（僅在 translationStyle == .custom 時使用）
+    var customStylePrompt: String = "" {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.customStylePrompt, value: customStylePrompt)
+            if translationStyle == .custom {
+                elevenLabsService.customStylePrompt = customStylePrompt
+                appleSTTService.customStylePrompt = customStylePrompt
+            }
         }
     }
 
@@ -690,8 +719,15 @@ final class TranscriptionViewModel {
            let mode = STTLanguageDetectionMode(rawValue: raw) {
             sttLanguageDetectionMode = mode
         }
+        if let raw = defaults.string(forKey: VMSettingsKey.translationStyle.rawValue),
+           let style = TranslationStyle(rawValue: raw) {
+            translationStyle = style
+        }
+        if let saved = defaults.string(forKey: VMSettingsKey.customStylePrompt.rawValue) {
+            customStylePrompt = saved
+        }
 
-        print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName)")
+        print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName)")
 
         // ⭐️ 設定 Combine 訂閱
         setupSubscriptions()
@@ -701,6 +737,10 @@ final class TranscriptionViewModel {
         BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
         elevenLabsService.translationProvider = translationProvider
         appleSTTService.translationProvider = translationProvider
+        elevenLabsService.translationStyle = translationStyle
+        elevenLabsService.customStylePrompt = translationStyle == .custom ? customStylePrompt : ""
+        appleSTTService.translationStyle = translationStyle
+        appleSTTService.customStylePrompt = translationStyle == .custom ? customStylePrompt : ""
         audioManager.isVADEnabled = isLocalVADEnabled
         audioManager.vadSpeechThreshold = localVADSpeechThreshold
         audioManager.vadSilenceThreshold = localVADSilenceThreshold
@@ -715,7 +755,16 @@ final class TranscriptionViewModel {
         // ⭐️ 初始化完成，允許 didSet 正常執行
         isInitializing = false
 
-        // ⭐️ 設定 App 生命週期監聽
+        // ⭐️ 預熱 Apple TTS — 延遲 3 秒，避免阻塞 app 啟動
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self else { return }
+            self.appleTTSService.preWarmLanguages([
+                self.sourceLang.azureLocale,
+                self.targetLang.azureLocale
+            ])
+        }
+
+        // ⭐️ 設定 App 生命週期監聯
         setupLifecycleObservers()
     }
 
@@ -917,6 +966,29 @@ final class TranscriptionViewModel {
     func deleteTranscript(id: UUID) {
         transcripts.removeAll { $0.id == id }
         print("🗑️ [ViewModel] 已刪除對話 \(id)")
+    }
+
+    /// ⭐️ 編輯對話文字並重新翻譯
+    func editTranscriptAndRetranslate(id: UUID, newText: String) {
+        guard let index = transcripts.firstIndex(where: { $0.id == id }) else {
+            print("⚠️ [編輯] 找不到對話 \(id)")
+            return
+        }
+        let oldText = transcripts[index].text
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != oldText else { return }
+
+        // 更新文字並清除舊翻譯
+        transcripts[index].text = trimmed
+        transcripts[index].translation = nil
+        transcripts[index].translationSegments = nil
+        print("✏️ [編輯] \"\(oldText.prefix(30))\" → \"\(trimmed.prefix(30))\"")
+
+        // 觸發重新翻譯
+        let textToTranslate = trimmed
+        Task {
+            await elevenLabsService.retranslateText(textToTranslate)
+        }
     }
 
     // MARK: - Language Introduction
@@ -1132,7 +1204,11 @@ final class TranscriptionViewModel {
 
             // ⭐️ 預熱 TTS 引擎（避免第一次播放卡頓）
             if ttsProvider == .apple {
-                appleTTSService.preWarm(languageCode: targetLang.azureLocale)
+                // 預熱來源和目標語言（preWarm 內部會跳過已預熱的語言）
+                appleTTSService.preWarmLanguages([
+                    sourceLang.azureLocale,
+                    targetLang.azureLocale
+                ])
             } else {
                 ttsService.preConnect()
             }
@@ -1229,6 +1305,7 @@ final class TranscriptionViewModel {
         Task {
             // 結束 Session 並獲取用量統計（僅用於記錄）
             let usage = await sessionService.endSession()
+            sessionService.invalidateHistoryCache()
             print("✅ [ViewModel] 結束 Session")
 
             // ⭐️ 即時扣款模式：不在這裡扣款，僅記錄總用量
@@ -1620,9 +1697,13 @@ final class TranscriptionViewModel {
             }
             .store(in: &cancellables)
 
-        // ⭐️ 訂閱本地 VAD 狀態變化
+        // ⭐️ 訂閱本地 VAD 狀態變化，並通知 STT 服務（防幻聽過濾）
         audioManager.onVADStateChanged = { [weak self] state in
-            self?.localVADState = state
+            guard let self else { return }
+            self.localVADState = state
+            // 通知 ElevenLabs 服務 VAD 是否已暫停（靜音 ≥ 2s，停止發送音訊）
+            // 只有 paused 狀態會觸發幻聽過濾，silent 短暫停頓不會過濾
+            self.elevenLabsService.updateClientVADPaused(state == .paused)
         }
 
         // ⭐️ 訂閱額度耗盡回調（自動停止錄音）
@@ -1658,8 +1739,17 @@ final class TranscriptionViewModel {
         let newTextLower = newText.lowercased()
         let lastTextLower = lastText.lowercased()
 
+        // ⭐️ 0. 完全相同的文本（自動提升 + VAD commit 可能發送相同文本）
+        if newTextLower == lastTextLower {
+            return true
+        }
         // 1. 新句子包含舊句子（完全包含）
         if newTextLower.contains(lastTextLower) && newText.count > lastText.count {
+            return true
+        }
+        // ⭐️ 1.5 舊句子包含新句子（反向包含，新文本是舊文本的子集）
+        // 例如：自動提升發送了較長文本，VAD commit 發送了較短版本
+        if lastTextLower.contains(newTextLower) && lastText.count > newText.count {
             return true
         }
         // 2. 新句子以舊句子為前綴（忽略大小寫）
@@ -1679,7 +1769,9 @@ final class TranscriptionViewModel {
                 }
             }
 
-            let overlapRatio = Float(commonPrefixLength) / Float(lastText.count)
+            // ⭐️ 用較長文本為分母計算重疊率，避免短文本輕易觸發合併
+            let maxLength = max(newText.count, lastText.count)
+            let overlapRatio = Float(commonPrefixLength) / Float(maxLength)
             if overlapRatio >= 0.5 && commonPrefixLength >= 3 {
                 return true
             }
@@ -1713,6 +1805,24 @@ final class TranscriptionViewModel {
                 let lastText = lastTranscript.text
 
                 if shouldMergeTexts(newText: newText, lastText: lastText) {
+                    // ⭐️ 防止短文本取代長文本（保留較長的版本）
+                    if newText.count < lastText.count {
+                        print("🔄 [Final 合併] 新文本較短，保留舊文本，更新翻譯")
+                        print("   保留: \"\(lastText.prefix(35))...\" (\(lastText.count)字)")
+                        print("   跳過: \"\(newText.prefix(35))...\" (\(newText.count)字)")
+                        // 只更新翻譯（如果新的更好）
+                        if let newTranslation = transcript.translation, !newTranslation.isEmpty {
+                            if lastTranscript.translation == nil || lastTranscript.translation?.isEmpty == true {
+                                transcripts[transcripts.count - 1].translation = newTranslation
+                                transcripts[transcripts.count - 1].translationSegments = transcript.translationSegments
+                                print("   ✅ 更新翻譯: \"\(newTranslation.prefix(30))...\"")
+                            }
+                        }
+                        interimTranscript = nil
+                        lastFinalText = lastText
+                        return
+                    }
+
                     print("🔄 [Final 合併] 新句子是上一句的延續")
                     print("   舊: \"\(lastText.prefix(30))...\"")
                     print("   新: \"\(newText.prefix(40))...\"")
@@ -1737,11 +1847,16 @@ final class TranscriptionViewModel {
             // 當 interim 變成 final 時，翻譯不會再發送，導致 TTS 遺漏
             // 解決：在這裡檢查並補播
 
-            // ⭐️ 修復：優先使用 interim 翻譯，其次使用被移除 transcript 的翻譯，最後使用 transcript 自帶的翻譯
+            // ⭐️ 修復：優先使用 transcript 自帶的翻譯（分句場景更準確），
+            // 其次使用 interim 翻譯，最後使用被移除 transcript 的翻譯
             let preservedTranslation: String?
             let preservedTranslationSegments: [TranslationSegment]?
 
-            if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
+            if let ownTranslation = transcript.translation, !ownTranslation.isEmpty {
+                // ⭐️ transcript 自帶翻譯（從 ElevenLabs 分句場景帶過來的）最精確
+                preservedTranslation = ownTranslation
+                preservedTranslationSegments = transcript.translationSegments
+            } else if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
                 preservedTranslation = interimTranslation
                 preservedTranslationSegments = interimTranscript?.translationSegments
             } else if let removed = removedTranslation, !removed.isEmpty {
@@ -1783,6 +1898,29 @@ final class TranscriptionViewModel {
             // ⭐️ 保存對話到 Session（判斷是否為來源語言）
             let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
             sessionService.addConversation(finalTranscript, isSource: isSource)
+
+            // ⭐️ 自動重試翻譯：如果 final 沒有翻譯或翻譯可能不完整，延遲後重試
+            // ElevenLabs 側已在 promoteInterimToFinal/VAD commit 觸發了 translateAndSendFinal
+            // 這裡是最終兜底：確保 3 秒後翻譯仍然缺失時再試一次
+            let transcriptId = finalTranscript.id
+            let transcriptText = finalTranscript.text
+            let hasTranslation = finalTranscript.translation != nil && !finalTranscript.translation!.isEmpty
+            if !hasTranslation {
+                print("⚠️ [翻譯重試] Final 無翻譯，3 秒後自動重試: \"\(transcriptText.prefix(30))...\"")
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3 秒
+                // 確認仍然沒有翻譯（或翻譯明顯不完整）
+                if let index = self.transcripts.firstIndex(where: { $0.id == transcriptId }) {
+                    let current = self.transcripts[index]
+                    let needsRetry = current.translation == nil ||
+                        current.translation?.isEmpty == true
+                    if needsRetry {
+                        print("🔄 [翻譯重試] 3 秒後仍無翻譯，觸發重新翻譯: \"\(transcriptText.prefix(30))...\"")
+                        await self.elevenLabsService.retranslateText(transcriptText)
+                    }
+                }
+            }
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
             // 注意：ElevenLabs 使用 VAD 自動 commit，不需要 Pseudo-Final 機制
@@ -1792,10 +1930,15 @@ final class TranscriptionViewModel {
             // 避免新泡泡閃現後又合併消失的問題
             if let lastTranscript = transcripts.last,
                shouldMergeTexts(newText: transcript.text, lastText: lastTranscript.text) {
+
+                // ⭐️ 使用較長的文本作為合併結果
+                let mergedText = transcript.text.count >= lastTranscript.text.count ? transcript.text : lastTranscript.text
+
                 // ⭐️ 直接更新 transcripts.last，不創建新的 interimTranscript
                 print("🔄 [Interim→合併] 直接更新上一個對話框")
                 print("   舊: \"\(lastTranscript.text.prefix(30))...\"")
                 print("   新: \"\(transcript.text.prefix(40))...\"")
+                print("   合併: \"\(mergedText.prefix(40))...\"")
 
                 // 取消舊對話的 TTS
                 cancelTTSForMergedDialog(oldText: lastTranscript.text)
@@ -1815,10 +1958,10 @@ final class TranscriptionViewModel {
                     mergedTranslationSegments = lastTranscript.translationSegments
                 }
 
-                // ⭐️ 創建新的 TranscriptMessage（保留原有 ID 和翻譯）
+                // ⭐️ 創建新的 TranscriptMessage（保留原有 ID 和翻譯，使用較長文本）
                 let updatedTranscript = TranscriptMessage(
                     id: lastTranscript.id,  // 保留原有 ID（避免 UI 閃爍）
-                    text: transcript.text,  // 使用新文本
+                    text: mergedText,  // ⭐️ 使用較長的文本
                     isFinal: lastTranscript.isFinal,  // 保持 final 狀態
                     confidence: transcript.confidence,  // 使用新的信心度
                     language: transcript.language ?? lastTranscript.language,  // 優先使用新語言
@@ -1832,7 +1975,7 @@ final class TranscriptionViewModel {
                 transcripts[transcripts.count - 1] = updatedTranscript
 
                 // ⭐️ 記錄為最後的 final 文本（這樣後續 interim 能正確判斷）
-                lastFinalText = transcript.text
+                lastFinalText = mergedText
 
                 // ⭐️ 清除 interimTranscript（避免顯示重複泡泡）
                 interimTranscript = nil
@@ -1959,41 +2102,57 @@ final class TranscriptionViewModel {
 
         // ⭐️ 先嘗試精確匹配（最可靠）
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
-            // 精確匹配到 final 結果
+            // 精確匹配到 final 結果 → 無條件更新翻譯
             detectedLanguage = transcripts[index].language
             transcripts[index].translation = translatedText
-            matchedFinal = true  // ⭐️ 匹配到 final
+            matchedFinal = true
             print("✅ [翻譯匹配] 精確匹配到 transcripts[\(index)]")
         }
-        // ⭐️ 再嘗試模糊匹配（前綴匹配，處理標點差異）
-        // ⭐️ 改進：只匹配語言相同的 transcript，防止跨語言錯配
+        // ⭐️ 模糊匹配：只在 transcript 是 sourceText 的前綴時匹配
+        // sourceText.hasPrefix(transcript.text) → sourceText 較長，翻譯可能包含多句 → 不安全，跳過
+        // transcript.text.hasPrefix(sourceText) → sourceText 較短，翻譯只覆蓋前半段
+        //   → 只在 transcript 還沒翻譯時才更新（避免用不完整翻譯覆蓋完整翻譯）
         else if let index = transcripts.firstIndex(where: { transcript in
-            let textMatch = transcript.text.hasPrefix(sourceText) || sourceText.hasPrefix(transcript.text)
+            // ⭐️ 只允許 transcript.text.hasPrefix(sourceText)（sourceText 是 transcript 的前綴）
+            let textMatch = transcript.text.hasPrefix(sourceText) && sourceText != transcript.text
             guard textMatch else { return false }
 
-            // ⭐️ 語言檢查：防止跨語言錯配
-            // 如果 transcript 有語言標記，確保與 sourceText 語言一致
             if let transcriptLang = transcript.language {
                 let transcriptLangBase = transcriptLang.split(separator: "-").first.map(String.init) ?? transcriptLang
                 let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
                 if transcriptLangBase != sourceTextLangBase {
-                    print("⚠️ [翻譯匹配] 語言不匹配，跳過: transcript=\(transcriptLangBase), source=\(sourceTextLangBase)")
                     return false
                 }
             }
             return true
         }) {
             detectedLanguage = transcripts[index].language
-            transcripts[index].translation = translatedText
-            matchedFinal = true  // ⭐️ 匹配到 final
-            print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（語言一致）")
+            // ⭐️ 模糊匹配時的覆蓋策略：
+            // - 無翻譯 → 直接填入
+            // - 有翻譯但 sourceText 覆蓋 ≥ 80% transcript → 允許覆蓋（retranslation 場景）
+            // - 有翻譯且 sourceText 覆蓋 < 80% → 跳過（避免短翻譯覆蓋完整翻譯）
+            let hasExisting = transcripts[index].translation != nil && !transcripts[index].translation!.isEmpty
+            let coverageRatio = Double(sourceText.count) / Double(max(transcripts[index].text.count, 1))
+            if !hasExisting {
+                transcripts[index].translation = translatedText
+                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（無翻譯，填入）")
+            } else if coverageRatio >= 0.8 {
+                transcripts[index].translation = translatedText
+                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（覆蓋率\(Int(coverageRatio*100))%，更新翻譯）")
+            } else {
+                print("ℹ️ [翻譯匹配] 模糊匹配到 transcripts[\(index)]，覆蓋率\(Int(coverageRatio*100))%不足，跳過")
+            }
+            matchedFinal = true
         }
         // ⭐️ 只有當 sourceText 和 interimTranscript 匹配時才更新 interim
         // ⭐️ 同樣加入語言檢查
         else if let interim = interimTranscript {
+            // ⭐️ 修復跨句污染：移除 sourceText.hasPrefix(interim.text) 檢查
+            // 舊邏輯允許「長的舊 sourceText」匹配「短的新 interim」，導致上句翻譯出現在下句
+            // 例如: sourceText="我早餐吃了兩個蛋糕" 會匹配新 interim="我早餐"
+            // 只保留: 精確匹配 + interim 是 sourceText 的延伸（正常的 interim 成長）
             let textMatch = interim.text == sourceText ||
-                           interim.text.hasPrefix(sourceText) ||
-                           sourceText.hasPrefix(interim.text)
+                           interim.text.hasPrefix(sourceText)
 
             // ⭐️ 語言檢查
             var langMatch = true
@@ -2004,10 +2163,14 @@ final class TranscriptionViewModel {
             }
 
             if textMatch && langMatch {
+                // ⭐️ 連續說話時 sourceText 幾乎一定比 interim.text 短（因為用戶持續說話），
+                // 所以不應阻擋較短 sourceText 的翻譯回調。任何有效翻譯都比空白好。
+                // 翻譯 API 是序列化的（pendingTranslateText 排隊機制），所以翻譯結果
+                // 會按時間順序到達，不會出現舊結果覆蓋新結果的情況。
                 interimTranscript?.translation = translatedText
                 detectedLanguage = interim.language
                 matchedFinal = false  // ⭐️ 匹配到 interim，不是 final
-                print("🔄 [翻譯] 更新 interim 翻譯: \"\(translatedText.prefix(30))...\"")
+                print("🔄 [翻譯] 更新 interim 翻譯: src=\(sourceText.count)字, interim=\(interim.text.count)字, 「\(translatedText.prefix(30))...」")
             } else if textMatch && !langMatch {
                 print("⚠️ [翻譯匹配] interim 語言不匹配，丟棄")
                 print("   interim 語言: \(interim.language ?? "nil")")
@@ -2107,12 +2270,11 @@ final class TranscriptionViewModel {
             transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
             print("✅ [分句翻譯] 精確匹配到 transcripts[\(index)]，\(segments.count) 段")
         }
-        // ⭐️ 模糊匹配（前綴匹配，且語言一致）
+        // ⭐️ 模糊匹配：只允許 transcript 是 sourceText 的延伸，且只在無翻譯時填入
         else if let index = transcripts.firstIndex(where: { transcript in
-            let textMatch = transcript.text.hasPrefix(sourceText) || sourceText.hasPrefix(transcript.text)
+            let textMatch = transcript.text.hasPrefix(sourceText) && sourceText != transcript.text
             guard textMatch else { return false }
 
-            // 語言檢查
             if let transcriptLang = transcript.language {
                 let transcriptLangBase = transcriptLang.split(separator: "-").first.map(String.init) ?? transcriptLang
                 let sourceTextLangBase = sourceTextLang.split(separator: "-").first.map(String.init) ?? sourceTextLang
@@ -2122,20 +2284,24 @@ final class TranscriptionViewModel {
             }
             return true
         }) {
-            let existingTranslation = transcripts[index].translation
-            if existingTranslation == nil || existingTranslation?.isEmpty == true {
-                shouldPlayTTS = true
-            }
             detectedLanguage = transcripts[index].language
-            transcripts[index].translationSegments = segments
-            transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
-            print("✅ [分句翻譯] 模糊匹配到 transcripts[\(index)]，\(segments.count) 段")
+            // ⭐️ 同 handleTranslation 的覆蓋策略
+            let hasExisting = transcripts[index].translation != nil && !transcripts[index].translation!.isEmpty
+            let coverageRatio = Double(sourceText.count) / Double(max(transcripts[index].text.count, 1))
+            if !hasExisting || coverageRatio >= 0.8 {
+                if !hasExisting { shouldPlayTTS = true }
+                transcripts[index].translationSegments = segments
+                transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
+                print("✅ [分句翻譯] 模糊匹配到 transcripts[\(index)]（覆蓋\(Int(coverageRatio*100))%）")
+            } else {
+                print("ℹ️ [分句翻譯] 模糊匹配到 transcripts[\(index)]，覆蓋率\(Int(coverageRatio*100))%不足，跳過")
+            }
         }
         // ⭐️ 匹配 interimTranscript
         else if let interim = interimTranscript {
+            // ⭐️ 同 handleTranslation：移除 sourceText.hasPrefix(interim.text) 防止跨句污染
             let textMatch = interim.text == sourceText ||
-                           interim.text.hasPrefix(sourceText) ||
-                           sourceText.hasPrefix(interim.text)
+                           interim.text.hasPrefix(sourceText)
 
             var langMatch = true
             if let interimLang = interim.language {
@@ -2145,6 +2311,7 @@ final class TranscriptionViewModel {
             }
 
             if textMatch && langMatch {
+                // ⭐️ 連續說話時一律更新翻譯
                 interimTranscript?.translationSegments = segments
                 interimTranscript?.translation = segments.map { $0.translation }.joined(separator: " ")
                 detectedLanguage = interim.language

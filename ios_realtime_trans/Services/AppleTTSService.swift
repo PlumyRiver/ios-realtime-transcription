@@ -211,18 +211,29 @@ class AppleTTSService: NSObject {
         synthesizer.speak(utterance)
     }
 
-    /// ⭐️ 預熱語音引擎（強制 iOS 載入語音模型，避免第一次播放卡頓）
-    /// 在錄音開始時呼叫，靜音播放一個空格讓系統預載模型
-    func preWarm(languageCode: String = "zh-TW") {
-        guard !isWarmedUp else { return }
-        isWarmedUp = true
+    /// ⭐️ 已預熱的語言集合（每個語言只預熱一次）
+    private var warmedUpLocales: Set<String> = []
 
+    /// ⭐️ 預熱語音引擎（在背景載入語音模型，避免第一次播放卡頓）
+    /// 只載入 AVSpeechSynthesisVoice 物件（最耗時的步驟），不呼叫 synthesizer
+    func preWarm(languageCode: String = "zh-TW") {
         let appleLocale = convertToAppleLocale(languageCode)
-        let utterance = AVSpeechUtterance(string: " ")
-        utterance.voice = AVSpeechSynthesisVoice(language: appleLocale)
-        utterance.volume = 0  // 完全靜音
-        synthesizer.speak(utterance)
-        print("🔥 [Apple TTS] 預熱語音引擎: \(appleLocale)")
+        guard !warmedUpLocales.contains(appleLocale) else { return }
+        warmedUpLocales.insert(appleLocale)
+
+        // ⭐️ 完全在背景執行，不回到主執行緒
+        DispatchQueue.global(qos: .utility).async {
+            // 載入語音模型（iOS 會快取，後續使用同語言時直接命中快取）
+            let voice = AVSpeechSynthesisVoice(language: appleLocale)
+            print("🔥 [Apple TTS] 預熱完成: \(appleLocale) (voice: \(voice?.name ?? "nil"))")
+        }
+    }
+
+    /// ⭐️ 預熱多個語言（在 app 啟動時呼叫）
+    func preWarmLanguages(_ languageCodes: [String]) {
+        for code in languageCodes {
+            preWarm(languageCode: code)
+        }
     }
 
     /// 停止播放
