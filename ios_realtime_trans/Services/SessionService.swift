@@ -806,11 +806,6 @@ extension SessionService {
         }
     }
 
-    /// 取得收藏名稱（nil = 未收藏）
-    func favoriteName(for dateKey: String) -> String? {
-        favoritesCache[dateKey]
-    }
-
     // MARK: - Favorites Disk Cache
 
     /// 磁碟快取路徑（Application Support — 不會被系統清除）

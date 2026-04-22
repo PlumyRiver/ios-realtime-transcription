@@ -1924,10 +1924,13 @@ final class TranscriptionViewModel {
             let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
             sessionService.addConversation(finalTranscript, isSource: isSource)
 
-            // ⭐️ Final 到了 → 一律對完整文字發翻譯，結果回來覆蓋 interim 的部分翻譯
-            let finalText = finalTranscript.text
-            Task {
-                await self.elevenLabsService.retranslateText(finalText)
+            // Final 到了 → 如果沒有完整翻譯，對完整文字發翻譯
+            // ElevenLabs 側已在 VAD commit 時觸發翻譯，這裡只補漏
+            if finalTranscript.translation?.isEmpty != false {
+                let finalText = finalTranscript.text
+                Task {
+                    await self.elevenLabsService.retranslateText(finalText)
+                }
             }
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
@@ -2277,7 +2280,7 @@ final class TranscriptionViewModel {
         guard isRecording else { return }
         // 只看最後一筆
         if let last = transcripts.last,
-           last.translation == nil || last.translation!.isEmpty {
+           last.translation?.isEmpty != false {
             print("🔄 [閒置檢查] 最後一句無翻譯: \"\(last.text.prefix(40))...\"")
             Task { await elevenLabsService.retranslateText(last.text) }
         }

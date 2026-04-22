@@ -231,16 +231,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         // 已有有效 token 或已在獲取中 → 跳過
         guard !isTokenValid, tokenFetchTask == nil else { return }
 
-        // 設定 token 端點
-        var tokenURL = serverURL
-        if !tokenURL.hasPrefix("http://") && !tokenURL.hasPrefix("https://") {
-            if tokenURL.contains("localhost") || tokenURL.contains("127.0.0.1") {
-                tokenURL = "http://\(tokenURL)"
-            } else {
-                tokenURL = "https://\(tokenURL)"
-            }
-        }
-        tokenEndpoint = "\(tokenURL)/elevenlabs-token"
+        tokenEndpoint = "\(normalizedURL(serverURL))/elevenlabs-token"
 
         // ⭐️ 1) 暖機 ElevenLabs WebSocket 域名的 DNS + TLS（與 token 取得並行）
         //    這樣當 token 取得後要連 WebSocket 時，DNS+TLS 已經在 OS 快取裡
@@ -304,16 +295,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         connectionState = .connecting
 
-        // 設定 token 端點（使用後端服務器）
-        var tokenURL = serverURL
-        if !tokenURL.hasPrefix("http://") && !tokenURL.hasPrefix("https://") {
-            if tokenURL.contains("localhost") || tokenURL.contains("127.0.0.1") {
-                tokenURL = "http://\(tokenURL)"
-            } else {
-                tokenURL = "https://\(tokenURL)"
-            }
-        }
-        tokenEndpoint = "\(tokenURL)/elevenlabs-token"
+        tokenEndpoint = "\(normalizedURL(serverURL))/elevenlabs-token"
 
         print("🔑 [ElevenLabs] 正在獲取 token...")
 
@@ -567,6 +549,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// 語言代碼映射
     /// ElevenLabs Scribe 使用 ISO 639-1/639-3 語言代碼
+    private func normalizedURL(_ raw: String) -> String {
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") { return raw }
+        if raw.contains("localhost") || raw.contains("127.0.0.1") { return "http://\(raw)" }
+        return "https://\(raw)"
+    }
+
     private func mapLanguageCode(_ lang: Language) -> String {
         switch lang {
         case .isLang: return "is"  // 冰島文（is 是 Swift 保留字）

@@ -21,9 +21,7 @@ class SessionHistoryState {
     let uid: String
 
     // ── 列表資料（由 SessionHistoryContent 讀取）──
-    var sessions: [SessionSummary] = [] {
-        didSet { recomputeGroups() }
-    }
+    var sessions: [SessionSummary] = []
     var isLoading = false
     var isComplete = false
     var favorites: [String: String] = [:]
@@ -120,9 +118,13 @@ class SessionHistoryState {
             self?.sessions = loaded
             self?.isComplete = complete
             self?.isLoading = !complete
+            if complete {
+                self?.recomputeGroups()
+            }
         }
         isLoading = false
         isComplete = true
+        recomputeGroups()
     }
 
     private func loadFavorites() async {
