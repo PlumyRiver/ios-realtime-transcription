@@ -105,6 +105,11 @@ final class TranscriptionViewModel {
     /// ⭐️ 額度不足對話框
     var showCreditsExhaustedAlert: Bool = false
 
+    /// ⭐️ 編輯對話狀態（放在 ViewModel 避免 ContentView @State 變更觸發全量重繪）
+    var showEditSheet: Bool = false
+    var editingTranscriptId: UUID?
+    var editingInitialText: String = ""
+
     var transcripts: [TranscriptMessage] = []
     var interimTranscript: TranscriptMessage?
 
@@ -637,7 +642,8 @@ final class TranscriptionViewModel {
     // MARK: - Initialization
 
     init() {
-        // ⭐️ 直接在 init 中載入 UserDefaults（直接賦值不觸發 didSet，避免連鎖副作用）
+        // ⭐️ 只做最小量工作：讀 UserDefaults（快速，~1ms per read）
+        // 重的服務同步、Combine 訂閱、生命週期監聽全部延遲到 deferredSetup()
         let defaults = UserDefaults.standard
 
         if let raw = defaults.string(forKey: VMSettingsKey.sourceLang.rawValue),
@@ -668,10 +674,8 @@ final class TranscriptionViewModel {
            let provider = TranslationProvider(rawValue: raw) {
             translationProvider = provider
         }
-        // 經濟模式（會決定 sttProvider/ttsProvider，但在 init 中 didSet 不觸發）
         if defaults.object(forKey: VMSettingsKey.isEconomyMode.rawValue) != nil {
             isEconomyMode = defaults.bool(forKey: VMSettingsKey.isEconomyMode.rawValue)
-            // ⭐️ 手動同步經濟模式的提供商（因為 didSet 不觸發）
             if isEconomyMode {
                 sttProvider = .apple
                 ttsProvider = .apple
@@ -685,11 +689,9 @@ final class TranscriptionViewModel {
         }
         if defaults.object(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue) != nil {
             let saved = defaults.float(forKey: VMSettingsKey.localVADVolumeThreshold.rawValue)
-            // ⭐️ 遷移：舊 RMS 閾值 (0.01~0.05) → Silero 預設 0.5
             if saved < 0.1 {
                 localVADSpeechThreshold = 0.5
                 saveSetting(.localVADVolumeThreshold, value: 0.5)
-                print("🔄 [VAD] 遷移 RMS 閾值 \(saved) → Silero 預設 0.5")
             } else {
                 localVADSpeechThreshold = saved
             }
@@ -729,10 +731,19 @@ final class TranscriptionViewModel {
 
         print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName)")
 
-        // ⭐️ 設定 Combine 訂閱
+        // ⭐️ init 到此結束 — UI 可以立刻渲染
+        // 重的工作（服務同步、Combine、生命週期）延遲到 deferredSetup()
+        // 由 ContentView.task 呼叫，保證第一幀已渲染
+    }
+
+    /// ⭐️ 延遲初始化：Combine 訂閱 + 服務同步 + 生命週期監聽
+    /// 由 ContentView.task 呼叫，確保 UI 第一幀已渲染後才執行
+    func deferredSetup() {
+        guard isInitializing else { return }  // 避免重複呼叫
+
         setupSubscriptions()
 
-        // ⭐️ 手動同步設定到各服務（init 中 didSet 不觸發，必須手動同步）
+        // 同步設定到各服務
         audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
         BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
         elevenLabsService.translationProvider = translationProvider
@@ -752,10 +763,11 @@ final class TranscriptionViewModel {
         appleSTTService.confidenceThreshold = autoSwitchConfidenceThreshold
         appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
 
-        // ⭐️ 初始化完成，允許 didSet 正常執行
         isInitializing = false
 
-        // ⭐️ 預熱 Apple TTS — 延遲 3 秒，避免阻塞 app 啟動
+        setupLifecycleObservers()
+
+        // 預熱 Apple TTS — 延遲 3 秒
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self else { return }
             self.appleTTSService.preWarmLanguages([
@@ -764,8 +776,7 @@ final class TranscriptionViewModel {
             ])
         }
 
-        // ⭐️ 設定 App 生命週期監聯
-        setupLifecycleObservers()
+        print("✅ [ViewModel] 延遲初始化完成")
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
@@ -785,6 +796,9 @@ final class TranscriptionViewModel {
     private var idleTimer: Timer?
     /// 是否因為進入背景而暫停音訊
     private var isPausedForBackground: Bool = false
+
+    /// ⭐️ 閒置翻譯檢查：STT 無新文字 5 秒後，掃描未翻譯的對話並重試
+    private var translationIdleTimer: Timer?
 
     /// ⭐️ 設置 App 生命週期監聽（在 init 後呼叫）
     func setupLifecycleObservers() {
@@ -966,6 +980,13 @@ final class TranscriptionViewModel {
     func deleteTranscript(id: UUID) {
         transcripts.removeAll { $0.id == id }
         print("🗑️ [ViewModel] 已刪除對話 \(id)")
+    }
+
+    /// ⭐️ 開始編輯某則對話（設定狀態，由 UI 觸發 sheet）
+    func startEditing(transcript: TranscriptMessage) {
+        editingTranscriptId = transcript.id
+        editingInitialText = transcript.text
+        showEditSheet = true
     }
 
     /// ⭐️ 編輯對話文字並重新翻譯
@@ -1285,6 +1306,10 @@ final class TranscriptionViewModel {
 
         // 清除 interim
         interimTranscript = nil
+
+        // ⭐️ 停止閒置翻譯檢查計時器
+        translationIdleTimer?.invalidate()
+        translationIdleTimer = nil
 
         // ⭐️ 停止錄音時，立即播放待播放的 TTS（對話框已確定結束）
         if pendingTTS != nil {
@@ -1899,27 +1924,10 @@ final class TranscriptionViewModel {
             let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
             sessionService.addConversation(finalTranscript, isSource: isSource)
 
-            // ⭐️ 自動重試翻譯：如果 final 沒有翻譯或翻譯可能不完整，延遲後重試
-            // ElevenLabs 側已在 promoteInterimToFinal/VAD commit 觸發了 translateAndSendFinal
-            // 這裡是最終兜底：確保 3 秒後翻譯仍然缺失時再試一次
-            let transcriptId = finalTranscript.id
-            let transcriptText = finalTranscript.text
-            let hasTranslation = finalTranscript.translation != nil && !finalTranscript.translation!.isEmpty
-            if !hasTranslation {
-                print("⚠️ [翻譯重試] Final 無翻譯，3 秒後自動重試: \"\(transcriptText.prefix(30))...\"")
-            }
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3 秒
-                // 確認仍然沒有翻譯（或翻譯明顯不完整）
-                if let index = self.transcripts.firstIndex(where: { $0.id == transcriptId }) {
-                    let current = self.transcripts[index]
-                    let needsRetry = current.translation == nil ||
-                        current.translation?.isEmpty == true
-                    if needsRetry {
-                        print("🔄 [翻譯重試] 3 秒後仍無翻譯，觸發重新翻譯: \"\(transcriptText.prefix(30))...\"")
-                        await self.elevenLabsService.retranslateText(transcriptText)
-                    }
-                }
+            // ⭐️ Final 到了 → 一律對完整文字發翻譯，結果回來覆蓋 interim 的部分翻譯
+            let finalText = finalTranscript.text
+            Task {
+                await self.elevenLabsService.retranslateText(finalText)
             }
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
@@ -2079,6 +2087,10 @@ final class TranscriptionViewModel {
                 interimTranscript = transcript
             }
         }
+
+        // ⭐️ 每次收到新 transcript（final 或 interim），重置閒置翻譯計時器
+        // 5 秒沒有新 STT 文字 → 掃描未翻譯的對話並重試
+        resetTranslationIdleTimer()
     }
 
     /// 處理翻譯結果
@@ -2243,6 +2255,31 @@ final class TranscriptionViewModel {
             } else {
                 print("   ⚠️ 未找到匹配的 transcript，可能已被處理")
             }
+        }
+    }
+
+    // MARK: - 閒置翻譯檢查
+
+    /// ⭐️ 重置閒置翻譯計時器（每次收到新 transcript 時呼叫）
+    /// STT 無新文字 5 秒後，掃描最近的對話，對缺翻譯的觸發重試
+    private func resetTranslationIdleTimer() {
+        translationIdleTimer?.invalidate()
+        translationIdleTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.retryMissingTranslations()
+            }
+        }
+    }
+
+    /// ⭐️ 安全網：5 秒沒新 STT → 掃描完全沒翻譯的對話
+    /// 正常情況下不需要（final 到來時已經觸發翻譯），只處理極端邊界情況
+    private func retryMissingTranslations() {
+        guard isRecording else { return }
+        // 只看最後一筆
+        if let last = transcripts.last,
+           last.translation == nil || last.translation!.isEmpty {
+            print("🔄 [閒置檢查] 最後一句無翻譯: \"\(last.text.prefix(40))...\"")
+            Task { await elevenLabsService.retranslateText(last.text) }
         }
     }
 

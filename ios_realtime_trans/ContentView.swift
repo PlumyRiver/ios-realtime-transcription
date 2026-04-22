@@ -24,155 +24,14 @@ struct ContentView: View {
     /// ⭐️ 獲取登入用戶資訊
     @State private var authService = AuthService.shared
 
-    /// ⭐️ 用戶是否正在查看舊訊息（手動往上滾動）
-    @State private var isUserScrolledUp = false
-
     /// ⭐️ 是否已經預取過 token（防止重複預取）
     @State private var hasPreFetchedToken = false
-
-    /// ⭐️ 編輯對話狀態（提升到 ContentView 層級避免 LazyVStack 回收問題）
-    @State private var showEditSheet = false
-    @State private var editingTranscriptId: UUID?
-    @State private var editingInitialText: String = ""
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // 對話區域
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            // 最終結果（從舊到新，從上到下）
-                            ForEach(viewModel.transcripts) { transcript in
-                                ConversationBubbleView(
-                                    transcript: transcript,
-                                    sourceLang: viewModel.sourceLang,
-                                    targetLang: viewModel.targetLang,
-                                    onPlayTTS: { text, langCode in
-                                        // ⭐️ 中斷當前 TTS，立即播放指定對話的翻譯
-                                        viewModel.playTTSImmediately(text: text, languageCode: langCode)
-                                    },
-                                    onStopTTS: {
-                                        // ⭐️ 停止當前播放，繼續播放下一個
-                                        viewModel.skipCurrentTTS()
-                                    },
-                                    currentPlayingText: viewModel.currentPlayingTTSText,
-                                    onDelete: {
-                                        viewModel.deleteTranscript(id: transcript.id)
-                                    },
-                                    onEditTapped: {
-                                        editingTranscriptId = transcript.id
-                                        editingInitialText = transcript.text
-                                        showEditSheet = true
-                                    }
-                                )
-                                .id(transcript.id)
-                            }
-
-                            // Interim 結果（最新的，在最下面）
-                            if let interim = viewModel.interimTranscript {
-                                ConversationBubbleView(
-                                    transcript: interim,
-                                    sourceLang: viewModel.sourceLang,
-                                    targetLang: viewModel.targetLang,
-                                    onPlayTTS: { text, langCode in
-                                        // ⭐️ 中斷當前 TTS，立即播放指定對話的翻譯
-                                        viewModel.playTTSImmediately(text: text, languageCode: langCode)
-                                    },
-                                    onStopTTS: {
-                                        viewModel.skipCurrentTTS()
-                                    },
-                                    currentPlayingText: viewModel.currentPlayingTTSText
-                                )
-                                .id("interim")
-                            }
-                            // ⭐️ 底部錨點（用於檢測滾動位置）
-                            Color.clear
-                                .frame(height: 1)
-                                .id("bottomAnchor")
-                        }
-                        .padding()
-                        // ⭐️ 使用 GeometryReader 追蹤內容位置
-                        .background(
-                            GeometryReader { geometry in
-                                Color.clear
-                                    .preference(
-                                        key: ScrollOffsetPreferenceKey.self,
-                                        value: geometry.frame(in: .named("scrollView")).maxY
-                                    )
-                            }
-                        )
-                    }
-                    .coordinateSpace(name: "scrollView")
-                    // ⭐️ 檢測手勢：用戶向下滑動表示在查看舊訊息
-                    .simultaneousGesture(
-                        DragGesture()
-                            .onChanged { value in
-                                if value.translation.height > 30 {
-                                    // 用戶向下滑動（往上看舊訊息）
-                                    if !isUserScrolledUp {
-                                        isUserScrolledUp = true
-                                        print("📜 [Scroll] 用戶開始查看舊訊息")
-                                    }
-                                }
-                            }
-                    )
-                    .onChange(of: viewModel.transcripts.count) { _, _ in
-                        // ⭐️ 只有在用戶沒有往上滾動時才自動滾動
-                        guard !isUserScrolledUp else {
-                            print("📜 [Scroll] 用戶正在查看舊訊息，不自動滾動")
-                            return
-                        }
-                        if let lastId = viewModel.transcripts.last?.id {
-                            withAnimation {
-                                proxy.scrollTo(lastId, anchor: .bottom)
-                            }
-                        }
-                    }
-                    .onChange(of: viewModel.interimTranscript) { _, _ in
-                        // ⭐️ 只有在用戶沒有往上滾動時才自動滾動
-                        guard !isUserScrolledUp else { return }
-                        withAnimation {
-                            proxy.scrollTo("interim", anchor: .bottom)
-                        }
-                    }
-                    // ⭐️ 「返回最新」指示條（細長、低調、置中）
-                    .overlay(alignment: .bottom) {
-                        if isUserScrolledUp {
-                            Button {
-                                isUserScrolledUp = false
-                                withAnimation {
-                                    if viewModel.interimTranscript != nil {
-                                        proxy.scrollTo("interim", anchor: .bottom)
-                                    } else if let lastId = viewModel.transcripts.last?.id {
-                                        proxy.scrollTo(lastId, anchor: .bottom)
-                                    } else {
-                                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                                    }
-                                }
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 14, weight: .semibold))
-                                    Text("新訊息")
-                                        .font(.system(size: 15, weight: .medium))
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 14, weight: .semibold))
-                                }
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 22)
-                                .padding(.vertical, 10)
-                                .background(
-                                    Capsule()
-                                        .fill(Color.black.opacity(0.6))
-                                )
-                            }
-                            .padding(.bottom, 12)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
-                            .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
-                        }
-                    }
-                }
+                // ⭐️ 對話區域（獨立子視圖，不受 showSettings/showHistory 等 @State 影響）
+                ConversationListView(viewModel: viewModel)
 
                 // 底部控制區（重構版 - 參考開講AI設計）
                 BottomControlBar(viewModel: viewModel)
@@ -234,30 +93,168 @@ struct ContentView: View {
             } message: {
                 Text("請購買額度以繼續使用語音翻譯服務")
             }
-            // ⭐️ App 出現時預取 ElevenLabs token（只執行一次）
-            .onAppear {
+            // ⭐️ 第一幀渲染後才執行（.task 在 onAppear 之後、第一幀之後觸發）
+            .task {
+                // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步）
+                viewModel.deferredSetup()
+
+                // 2) 背景預載（只執行一次）
                 if !hasPreFetchedToken {
                     hasPreFetchedToken = true
                     viewModel.prefetchElevenLabsToken()
+                    if let uid = authService.currentUser?.uid {
+                        Task.detached(priority: .utility) {
+                            async let f: () = SessionService.shared.loadFavorites(uid: uid)
+                            async let h: () = SessionService.shared.loadAllSessions(uid: uid) { _, _ in }
+                            _ = await (f, h)
+                            print("⚡️ [Preload] 對話歷史 + 收藏預載完成")
+                        }
+                    }
                 }
-                // Debug: 顯示當前用戶額度
                 print("💰 [ContentView] currentUser = \(authService.currentUser?.email ?? "nil"), slowCredits = \(authService.currentUser?.slowCredits ?? -1)")
             }
-            // ⭐️ 編輯對話 Sheet（使用穩定的 @State Bool，避免 computed Binding 造成重複渲染）
-            .sheet(isPresented: $showEditSheet) {
+            // ⭐️ 編輯對話 Sheet（狀態在 ViewModel 中，不觸發 ContentView 重繪）
+            .sheet(isPresented: $viewModel.showEditSheet) {
                 EditTranscriptSheet(
-                    initialText: editingInitialText,
+                    initialText: viewModel.editingInitialText,
                     onConfirm: { newText in
-                        if let id = editingTranscriptId {
+                        if let id = viewModel.editingTranscriptId {
                             viewModel.editTranscriptAndRetranslate(id: id, newText: newText)
                         }
-                        showEditSheet = false
+                        viewModel.showEditSheet = false
                     },
                     onCancel: {
-                        showEditSheet = false
+                        viewModel.showEditSheet = false
                     }
                 )
                 .presentationDetents([.medium, .large])
+            }
+        }
+    }
+}
+
+// MARK: - Conversation List View（獨立子視圖，隔離 ContentView 的 @State 重繪）
+/// ⭐️ 關鍵：這個 View 只依賴 viewModel（@Observable），不依賴 ContentView 的任何 @State。
+/// 當 showSettings/showHistory 等 ContentView @State 變化時，SwiftUI 重算 ContentView.body，
+/// 但因為 ConversationListView 的唯一輸入 viewModel（引用）沒變，SwiftUI 跳過此 View 的 body 重算。
+
+struct ConversationListView: View {
+    var viewModel: TranscriptionViewModel
+    @State private var isUserScrolledUp = false
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    ForEach(viewModel.transcripts) { transcript in
+                        ConversationBubbleView(
+                            transcript: transcript,
+                            sourceLang: viewModel.sourceLang,
+                            targetLang: viewModel.targetLang,
+                            onPlayTTS: { text, langCode in
+                                viewModel.playTTSImmediately(text: text, languageCode: langCode)
+                            },
+                            onStopTTS: {
+                                viewModel.skipCurrentTTS()
+                            },
+                            currentPlayingText: viewModel.currentPlayingTTSText,
+                            onDelete: {
+                                viewModel.deleteTranscript(id: transcript.id)
+                            },
+                            onEditTapped: {
+                                viewModel.startEditing(transcript: transcript)
+                            }
+                        )
+                        .id(transcript.id)
+                    }
+
+                    if let interim = viewModel.interimTranscript {
+                        ConversationBubbleView(
+                            transcript: interim,
+                            sourceLang: viewModel.sourceLang,
+                            targetLang: viewModel.targetLang,
+                            onPlayTTS: { text, langCode in
+                                viewModel.playTTSImmediately(text: text, languageCode: langCode)
+                            },
+                            onStopTTS: {
+                                viewModel.skipCurrentTTS()
+                            },
+                            currentPlayingText: viewModel.currentPlayingTTSText
+                        )
+                        .id("interim")
+                    }
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id("bottomAnchor")
+                }
+                .padding()
+                .background(
+                    GeometryReader { geometry in
+                        Color.clear
+                            .preference(
+                                key: ScrollOffsetPreferenceKey.self,
+                                value: geometry.frame(in: .named("scrollView")).maxY
+                            )
+                    }
+                )
+            }
+            .coordinateSpace(name: "scrollView")
+            .simultaneousGesture(
+                DragGesture()
+                    .onChanged { value in
+                        if value.translation.height > 30 {
+                            if !isUserScrolledUp {
+                                isUserScrolledUp = true
+                                print("📜 [Scroll] 用戶開始查看舊訊息")
+                            }
+                        }
+                    }
+            )
+            .onChange(of: viewModel.transcripts.count) { _, _ in
+                guard !isUserScrolledUp else { return }
+                if let lastId = viewModel.transcripts.last?.id {
+                    withAnimation { proxy.scrollTo(lastId, anchor: .bottom) }
+                }
+            }
+            .onChange(of: viewModel.interimTranscript) { _, _ in
+                guard !isUserScrolledUp else { return }
+                withAnimation { proxy.scrollTo("interim", anchor: .bottom) }
+            }
+            .overlay(alignment: .bottom) {
+                if isUserScrolledUp {
+                    Button {
+                        isUserScrolledUp = false
+                        withAnimation {
+                            if viewModel.interimTranscript != nil {
+                                proxy.scrollTo("interim", anchor: .bottom)
+                            } else if let lastId = viewModel.transcripts.last?.id {
+                                proxy.scrollTo(lastId, anchor: .bottom)
+                            } else {
+                                proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 14, weight: .semibold))
+                            Text("新訊息")
+                                .font(.system(size: 15, weight: .medium))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 14, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 10)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.6))
+                        )
+                    }
+                    .padding(.bottom, 12)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
+                }
             }
         }
     }

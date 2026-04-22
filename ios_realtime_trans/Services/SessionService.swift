@@ -66,6 +66,11 @@ final class SessionService {
     /// Session 開始時間
     private var sessionStartTime: Date?
 
+    /// ⭐️ 收藏快取：dateKey("yyyy/MM/dd") → 名稱
+    private(set) var favoritesCache: [String: String] = [:]
+    private var favoritesCacheUid: String?
+    private var favoritesCacheLoaded = false
+
     // MARK: - Initialization
 
     private init() {
@@ -697,4 +702,155 @@ extension ConversationItem {
         self.timestamp = timestamp
         self.position = position
     }
+}
+
+// MARK: - Favorites (收藏)
+
+extension SessionService {
+
+    /// ⭐️ 載入收藏（三層快取：記憶體 → 磁碟 → Firestore）
+    ///
+    /// 策略：
+    /// 1. 記憶體快取命中 → 0 次 Firestore 讀取，背景同步
+    /// 2. 磁碟快取命中 → 0 次 Firestore 讀取，背景同步
+    /// 3. 都沒有 → 從 Firestore 全量載入，存磁碟
+    func loadFavorites(uid: String) async {
+        // 1) 記憶體快取命中
+        if favoritesCacheUid == uid && favoritesCacheLoaded {
+            print("⚡️ [Favorites] 記憶體快取命中: \(favoritesCache.count) 個（0 次 Firestore 讀取）")
+            // 背景同步確保跨裝置更新
+            Task { await syncFavoritesFromFirestore(uid: uid) }
+            return
+        }
+
+        // 2) 磁碟快取命中
+        if let diskData = loadFavoritesFromDisk(uid: uid) {
+            favoritesCache = diskData
+            favoritesCacheUid = uid
+            favoritesCacheLoaded = true
+            print("⚡️ [Favorites] 磁碟快取命中: \(diskData.count) 個（0 次 Firestore 讀取）")
+            // 背景同步
+            Task { await syncFavoritesFromFirestore(uid: uid) }
+            return
+        }
+
+        // 3) 完全無快取 → Firestore 全量載入
+        await syncFavoritesFromFirestore(uid: uid)
+    }
+
+    /// 從 Firestore 同步收藏（全量讀取 → 更新記憶體 + 磁碟）
+    private func syncFavoritesFromFirestore(uid: String) async {
+        do {
+            let snapshot = try await db.collection("users").document(uid)
+                .collection("favorites").getDocuments()
+            var loaded: [String: String] = [:]
+            for doc in snapshot.documents {
+                let data = doc.data()
+                if let name = data["name"] as? String {
+                    let dateKey = data["dateKey"] as? String
+                        ?? doc.documentID.replacingOccurrences(of: "-", with: "/")
+                    loaded[dateKey] = name
+                }
+            }
+            // 只在有差異時更新
+            if loaded != favoritesCache {
+                favoritesCache = loaded
+                saveFavoritesToDisk(uid: uid)
+                print("🔄 [Favorites] Firestore 同步: \(loaded.count) 個（已更新磁碟快取）")
+            } else {
+                print("⭐️ [Favorites] Firestore 同步: 無變化")
+            }
+            favoritesCacheUid = uid
+            favoritesCacheLoaded = true
+        } catch {
+            print("❌ [Favorites] Firestore 同步失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// ⭐️ 儲存收藏（命名 = 收藏，寫入 Firestore 跨裝置同步）
+    func saveFavorite(uid: String, dateKey: String, name: String) async {
+        // 先更新本地（樂觀更新）
+        favoritesCache[dateKey] = name
+        saveFavoritesToDisk(uid: uid)
+
+        let docId = dateKey.replacingOccurrences(of: "/", with: "-")
+        let docRef = db.collection("users").document(uid)
+            .collection("favorites").document(docId)
+        do {
+            try await docRef.setData([
+                "name": name,
+                "dateKey": dateKey,
+                "createdAt": FieldValue.serverTimestamp(),
+                "updatedAt": FieldValue.serverTimestamp()
+            ], merge: true)
+            print("⭐️ [Favorites] 已收藏: \(dateKey) → \(name)")
+        } catch {
+            print("❌ [Favorites] 儲存失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// ⭐️ 移除收藏
+    func removeFavorite(uid: String, dateKey: String) async {
+        // 先更新本地（樂觀更新）
+        favoritesCache.removeValue(forKey: dateKey)
+        saveFavoritesToDisk(uid: uid)
+
+        let docId = dateKey.replacingOccurrences(of: "/", with: "-")
+        let docRef = db.collection("users").document(uid)
+            .collection("favorites").document(docId)
+        do {
+            try await docRef.delete()
+            print("⭐️ [Favorites] 已移除收藏: \(dateKey)")
+        } catch {
+            print("❌ [Favorites] 移除失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// 取得收藏名稱（nil = 未收藏）
+    func favoriteName(for dateKey: String) -> String? {
+        favoritesCache[dateKey]
+    }
+
+    // MARK: - Favorites Disk Cache
+
+    /// 磁碟快取路徑（Application Support — 不會被系統清除）
+    private func favoritesDiskPath(uid: String) -> URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("favorites_\(uid).json")
+    }
+
+    /// 儲存到磁碟
+    private func saveFavoritesToDisk(uid: String) {
+        do {
+            let wrapper = CachedFavoritesFile(uid: uid, favorites: favoritesCache)
+            let data = try JSONEncoder().encode(wrapper)
+            try data.write(to: favoritesDiskPath(uid: uid), options: .atomic)
+            print("💾 [Favorites] 磁碟快取已儲存: \(favoritesCache.count) 個")
+        } catch {
+            print("⚠️ [Favorites] 磁碟快取儲存失敗: \(error.localizedDescription)")
+        }
+    }
+
+    /// 從磁碟讀取
+    private func loadFavoritesFromDisk(uid: String) -> [String: String]? {
+        let path = favoritesDiskPath(uid: uid)
+        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: path)
+            let wrapper = try JSONDecoder().decode(CachedFavoritesFile.self, from: data)
+            guard wrapper.uid == uid else { return nil }
+            print("⚡️ [Favorites] 磁碟快取讀取: \(wrapper.favorites.count) 個")
+            return wrapper.favorites
+        } catch {
+            print("⚠️ [Favorites] 磁碟快取讀取失敗: \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
+
+/// 收藏磁碟快取結構
+struct CachedFavoritesFile: Codable {
+    let uid: String
+    let favorites: [String: String]  // dateKey → name
 }

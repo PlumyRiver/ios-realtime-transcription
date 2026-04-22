@@ -180,12 +180,12 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     /// ⭐️ 快取的 token（避免每次連接都重新獲取）
     private var cachedToken: String?
-    /// ⭐️ Token 過期時間（ElevenLabs single-use token 有效期約 5 分鐘，我們保守用 3 分鐘）
+    /// ⭐️ Token 過期時間（ElevenLabs single-use token 有效期約 5 分鐘，用 4.5 分鐘最大化利用）
     private var tokenExpireTime: Date?
     /// Token 有效期（秒）
-    private let tokenValidDuration: TimeInterval = 180  // 3 分鐘
-    /// ⭐️ 是否正在預取 token（防止重複預取）
-    private var isPrefetchingToken: Bool = false
+    private let tokenValidDuration: TimeInterval = 270  // 4.5 分鐘（接近 5 分鐘上限）
+    /// ⭐️ 共享的 token 請求 Task（預取和連接共用，避免重複請求）
+    private var tokenFetchTask: Task<String, Error>?
 
     /// 檢查 token 是否有效
     private var isTokenValid: Bool {
@@ -224,24 +224,14 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
     // MARK: - Public Methods
 
-    /// ⭐️ 預先獲取 token（可在 App 啟動或進入前台時調用）
-    /// 這樣用戶點擊錄音時可以跳過 token 獲取步驟
-    /// 完全不阻塞主線程
+    /// ⭐️ 預先獲取 token（App 啟動或進入前台時調用）
+    /// 使用共享 Task：如果預取正在進行，connect() 會等待它而不是開第二個請求
+    /// ⭐️ 同時暖機 ElevenLabs DNS+TLS（iOS 首次 DNS 解析 + TLS 可能需 5-10 秒）
     func prefetchToken(serverURL: String) {
-        // ⭐️ 防止重複預取（同步檢查，快速返回）
-        guard !isPrefetchingToken else {
-            return  // 靜默跳過，不打印日誌避免刷屏
-        }
+        // 已有有效 token 或已在獲取中 → 跳過
+        guard !isTokenValid, tokenFetchTask == nil else { return }
 
-        // 如果 token 還有效，不需要預取
-        guard !isTokenValid else {
-            return  // 靜默跳過
-        }
-
-        // ⭐️ 標記正在預取
-        isPrefetchingToken = true
-
-        // 設定 token 端點（同步操作，很快）
+        // 設定 token 端點
         var tokenURL = serverURL
         if !tokenURL.hasPrefix("http://") && !tokenURL.hasPrefix("https://") {
             if tokenURL.contains("localhost") || tokenURL.contains("127.0.0.1") {
@@ -250,37 +240,34 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                 tokenURL = "https://\(tokenURL)"
             }
         }
-        let endpoint = "\(tokenURL)/elevenlabs-token"
+        tokenEndpoint = "\(tokenURL)/elevenlabs-token"
 
-        // ⭐️ 使用 Task.detached 確保完全在背景線程執行，不阻塞 UI
-        Task.detached(priority: .background) { [weak self] in
-            guard let self = self else { return }
+        // ⭐️ 1) 暖機 ElevenLabs WebSocket 域名的 DNS + TLS（與 token 取得並行）
+        //    這樣當 token 取得後要連 WebSocket 時，DNS+TLS 已經在 OS 快取裡
+        Task.detached(priority: .userInitiated) {
+            let warmupStart = Date()
+            var req = URLRequest(url: URL(string: "https://api.elevenlabs.io/")!)
+            req.httpMethod = "HEAD"
+            req.timeoutInterval = 15
+            let _ = try? await URLSession.shared.data(for: req)
+            let elapsed = Date().timeIntervalSince(warmupStart)
+            print("⚡️ [ElevenLabs] WS 域名 DNS+TLS 暖機完成（\(String(format: "%.2f", elapsed))秒）")
+        }
 
-            // 在背景線程設置 endpoint
+        // ⭐️ 2) 取得 token（同時暖機 Cloud Run 域名的 DNS+TLS）
+        tokenFetchTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { throw ElevenLabsError.invalidURL }
+            print("🔄 [ElevenLabs] 背景預取 token...")
+            let startTime = Date()
+            let token = try await self.fetchToken()
+            let elapsed = Date().timeIntervalSince(startTime)
             await MainActor.run {
-                self.tokenEndpoint = endpoint
+                self.cachedToken = token
+                self.tokenExpireTime = Date().addingTimeInterval(self.tokenValidDuration)
+                self.tokenFetchTask = nil
             }
-
-            do {
-                print("🔄 [ElevenLabs] 背景預取 token...")
-                let startTime = Date()
-                let token = try await self.fetchToken()
-                let elapsed = Date().timeIntervalSince(startTime)
-
-                // ⭐️ 在主線程更新快取和標記
-                await MainActor.run {
-                    self.cachedToken = token
-                    self.tokenExpireTime = Date().addingTimeInterval(self.tokenValidDuration)
-                    self.isPrefetchingToken = false
-                }
-                print("✅ [ElevenLabs] Token 預取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
-            } catch {
-                // ⭐️ 失敗時也要重置標記
-                await MainActor.run {
-                    self.isPrefetchingToken = false
-                }
-                print("⚠️ [ElevenLabs] Token 預取失敗: \(error.localizedDescription)")
-            }
+            print("✅ [ElevenLabs] Token 預取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
+            return token
         }
     }
 
@@ -372,6 +359,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         // ⭐️ 清除 token 快取（single-use token 只能用一次，斷線後必須重新獲取）
         cachedToken = nil
         tokenExpireTime = nil
+        tokenFetchTask = nil
     }
 
     /// 發送結束語句信號（PTT 放開時調用）
@@ -466,27 +454,34 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         do {
             let token: String
 
-            // ⭐️ 優先使用快取的 token
+            // ⭐️ 1) 快取命中 → 瞬間使用
             if isTokenValid, let cached = cachedToken {
                 print("⚡️ [ElevenLabs] 使用快取 token（剩餘 \(Int(tokenExpireTime!.timeIntervalSinceNow))秒）")
                 token = cached
-            } else {
-                // 需要獲取新 token
+            }
+            // ⭐️ 2) 預取正在進行 → 等待它完成（不開第二個請求）
+            else if let pendingTask = tokenFetchTask {
+                print("⏳ [ElevenLabs] 等待背景預取 token 完成...")
+                let startTime = Date()
+                token = try await pendingTask.value
+                let elapsed = Date().timeIntervalSince(startTime)
+                print("⚡️ [ElevenLabs] 預取 token 到達（等待 \(String(format: "%.2f", elapsed))秒）")
+            }
+            // ⭐️ 3) 完全沒有 → 新請求
+            else {
                 let startTime = Date()
                 token = try await fetchToken()
                 let elapsed = Date().timeIntervalSince(startTime)
                 print("🔑 [ElevenLabs] Token 獲取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
-
-                // 快取 token
                 cachedToken = token
                 tokenExpireTime = Date().addingTimeInterval(tokenValidDuration)
             }
 
             await connectWithToken(token, sourceLang: sourceLang)
         } catch {
-            // ⭐️ Token 失敗時清除快取
             cachedToken = nil
             tokenExpireTime = nil
+            tokenFetchTask = nil
 
             await MainActor.run {
                 print("❌ [ElevenLabs] 獲取 token 失敗: \(error.localizedDescription)")
