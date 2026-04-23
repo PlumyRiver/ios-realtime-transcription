@@ -95,8 +95,8 @@ struct ContentView: View {
             }
             // ⭐️ 第一幀渲染後才執行（.task 在 onAppear 之後、第一幀之後觸發）
             .task {
-                // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步）
-                viewModel.deferredSetup()
+                // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步，分段 yield 不阻塞 UI）
+                await viewModel.deferredSetup()
 
                 // 2) 背景預載（只執行一次）
                 if !hasPreFetchedToken {

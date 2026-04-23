@@ -751,12 +751,14 @@ final class TranscriptionViewModel {
 
     /// ⭐️ 延遲初始化：Combine 訂閱 + 服務同步 + 生命週期監聽
     /// 由 ContentView.task 呼叫，確保 UI 第一幀已渲染後才執行
-    func deferredSetup() {
-        guard isInitializing else { return }  // 避免重複呼叫
+    func deferredSetup() async {
+        guard isInitializing else { return }
 
+        // ⭐️ 分段執行 + yield，讓 UI 在每段之間有機會更新
         setupSubscriptions()
+        await Task.yield()  // 讓 UI 呼吸
 
-        // 同步設定到各服務
+        // 同步設定到各服務（快速，只是屬性賦值）
         audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
         BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
         elevenLabsService.translationProvider = translationProvider
@@ -777,6 +779,7 @@ final class TranscriptionViewModel {
         appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
 
         isInitializing = false
+        await Task.yield()  // 讓 UI 呼吸
 
         setupLifecycleObservers()
 

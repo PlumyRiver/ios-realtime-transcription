@@ -58,31 +58,18 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            switch authService.authState {
-            case .unknown, .signedOut:
-                if userDidLogout {
-                    // ⭐️ 用戶主動登出：顯示登入頁面
-                    LoginView()
-                } else {
-                    // ⭐️ 直接顯示主畫面，背景自動登入
-                    ContentView()
-                        .task {
-                            await autoSignInIfNeeded()
-                        }
-                }
-
-            case .emailNotVerified:
-                // 郵件未驗證：顯示驗證提示
+            if authService.authState == .emailNotVerified {
                 EmailVerificationView()
-
-            case .signedIn:
-                // 已登入：顯示主畫面
+            } else if userDidLogout && authService.authState != .signedIn {
+                LoginView()
+            } else {
+                // ⭐️ ContentView 只建立一次，auth 狀態變化不會銷毀重建
                 ContentView()
+                    .task { await autoSignInIfNeeded() }
             }
         }
         .animation(.easeInOut(duration: 0.3), value: authService.authState)
         .onChange(of: authService.authState) { oldValue, newValue in
-            // 當用戶從已登入變成登出時，標記為主動登出
             if oldValue == .signedIn && newValue == .signedOut {
                 print("🔄 [App] 用戶主動登出")
                 userDidLogout = true
