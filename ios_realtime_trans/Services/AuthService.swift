@@ -285,6 +285,35 @@ final class AuthService {
     /// 錯誤訊息
     private(set) var errorMessage: String?
 
+    // MARK: - Initial Load Signal
+
+    /// Firebase 首次載入是否完成（含 Firestore 讀取或確認無登入）
+    private var hasCompletedInitialLoad = false
+    private var initialLoadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// ⭐️ 等 Firebase 首次載入結束（auth 驗證 + Firestore 讀取）
+    /// 用來讓啟動後的預熱工作等「啟動風暴」真的結束再跑
+    /// - Parameter timeout: 最長等待時間，避免 Firebase 卡死永遠不返回
+    func waitForInitialLoad(timeout: TimeInterval = 15) async {
+        if hasCompletedInitialLoad { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            initialLoadWaiters.append(cont)
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.completeInitialLoad(reason: "timeout")
+            }
+        }
+    }
+
+    /// 標記首次載入完成，喚醒所有等待者
+    private func completeInitialLoad(reason: String) {
+        guard !hasCompletedInitialLoad else { return }
+        hasCompletedInitialLoad = true
+        let waiters = initialLoadWaiters
+        initialLoadWaiters.removeAll()
+        print("✅ [Auth] 首次載入完成 (\(reason))，喚醒 \(waiters.count) 個等待者")
+        waiters.forEach { $0.resume() }
+    }
+
     // MARK: - Private Properties
 
     private let auth = Auth.auth()
@@ -372,18 +401,22 @@ final class AuthService {
                         // ⭐️ Task.detached 完全脫離 MainActor，不阻塞 UI
                         Task.detached(priority: .utility) { [weak self] in
                             await self?.loadOrCreateUserData(firebaseUser: user)
+                            // Firestore 載入結束（成功或失敗），啟動風暴結束
+                            await MainActor.run {
+                                self?.completeInitialLoad(reason: "loadOrCreateUserData 完成")
+                            }
                         }
                     } else {
-                        // Email 未驗證
                         print("🔐 [Auth] 設定 authState = .emailNotVerified")
                         self.authState = .emailNotVerified
                         self.currentUser = nil
+                        self.completeInitialLoad(reason: "email 未驗證")
                     }
                 } else {
-                    // 用戶已登出
                     print("🔐 [Auth] 設定 authState = .signedOut")
                     self.authState = .signedOut
                     self.currentUser = nil
+                    self.completeInitialLoad(reason: "未登入")
                 }
             }
         }

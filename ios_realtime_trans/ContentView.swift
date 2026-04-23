@@ -105,22 +105,26 @@ struct ContentView: View {
                 // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步，分段 yield 不阻塞 UI）
                 await viewModel.deferredSetup()
 
-                // 2) 背景工作鏈（依序執行，每一步完成才跑下一步，避免競爭）
+                // 2) 背景工作鏈（等真實信號，不用猜秒數）
                 if !hasPreFetchedToken {
                     hasPreFetchedToken = true
                     let uid = authService.currentUser?.uid
                     Task.detached(priority: .utility) { [viewModel] in
-                        // Step A: 歷史+收藏預載（如果有登入）
-                        if let uid = uid {
-                            async let f: () = SessionService.shared.loadFavorites(uid: uid)
-                            async let h: () = SessionService.shared.loadAllSessions(uid: uid) { _, _ in }
-                            _ = await (f, h)
-                            print("⚡️ [Preload] 對話歷史 + 收藏預載完成")
-                        }
+                        // Step A: 歷史+收藏預載（有登入）+ 等 Firebase 首次載入完成
+                        // 兩個並行，都完成才繼續
+                        async let preload: () = {
+                            if let uid = uid {
+                                async let f: () = SessionService.shared.loadFavorites(uid: uid)
+                                async let h: () = SessionService.shared.loadAllSessions(uid: uid) { _, _ in }
+                                _ = await (f, h)
+                                print("⚡️ [Preload] 對話歷史 + 收藏預載完成")
+                            }
+                        }()
+                        async let authReady: () = AuthService.shared.waitForInitialLoad()
 
-                        // Step B: TTS 預熱（Step A 完成後，啟動風暴過了）
-                        // 再等 1 秒讓 auth/Firestore 收尾
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        _ = await (preload, authReady)
+
+                        // Step B: 啟動風暴真的結束 → 預熱 TTS + 鍵盤
                         await viewModel.warmUpTTSIfNeeded()
                     }
                 }
