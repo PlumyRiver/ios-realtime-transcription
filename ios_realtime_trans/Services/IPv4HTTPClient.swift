@@ -58,12 +58,12 @@ final class IPv4HTTPClient {
         for (k, v) in headers {
             reqStr += "\(k): \(v)\r\n"
         }
-        if let body = body {
-            reqStr += "Content-Length: \(body.count)\r\n"
-        }
+        // POST 必須帶 Content-Length（即使為 0），否則 Cloud Run 會關連線
+        reqStr += "Content-Length: \(body?.count ?? 0)\r\n"
         reqStr += "\r\n"
         var reqData = Data(reqStr.utf8)
         if let body = body { reqData.append(body) }
+        print("🌐 [IPv4HTTP] 請求 (\(reqData.count) bytes):\n\(reqStr)")
 
         // 3) TLS + SNI 連接 IPv4 位址
         let tlsOptions = NWProtocolTLS.Options()
