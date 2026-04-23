@@ -75,6 +75,8 @@ private enum VMSettingsKey: String {
     case sttLanguageDetectionMode
     case translationStyle
     case customStylePrompt
+    case isBackgroundRecordingEnabled
+    case isLockScreenAutoEnd
 }
 
 @Observable
@@ -134,6 +136,22 @@ final class TranscriptionViewModel {
             guard !isInitializing else { return }
             audioManager.isSpeakerMode = isSpeakerMode
             saveSetting(.isSpeakerMode, value: isSpeakerMode)
+        }
+    }
+
+    /// 背景持續錄音（切 App / 鎖屏不中斷）
+    var isBackgroundRecordingEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isBackgroundRecordingEnabled, value: isBackgroundRecordingEnabled)
+        }
+    }
+
+    /// 鎖定螢幕自動結束通話
+    var isLockScreenAutoEnd: Bool = false {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isLockScreenAutoEnd, value: isLockScreenAutoEnd)
         }
     }
 
@@ -729,6 +747,12 @@ final class TranscriptionViewModel {
         if let saved = defaults.string(forKey: VMSettingsKey.customStylePrompt.rawValue) {
             customStylePrompt = saved
         }
+        if defaults.object(forKey: VMSettingsKey.isBackgroundRecordingEnabled.rawValue) != nil {
+            isBackgroundRecordingEnabled = defaults.bool(forKey: VMSettingsKey.isBackgroundRecordingEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue) != nil {
+            isLockScreenAutoEnd = defaults.bool(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue)
+        }
 
         print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName)")
 
@@ -835,11 +859,17 @@ final class TranscriptionViewModel {
     private func handleEnterBackground() {
         guard isRecording else { return }
         backgroundEntryTime = Date()
-        // ⭐️ 不暫停音訊 — 背景持續錄音+轉錄+翻譯（Info.plist 已宣告 audio background mode）
-        // 只停閒置計時器（背景不需要檢查閒置）
         idleTimer?.invalidate()
         idleTimer = nil
-        print("📱 [Lifecycle] 進入背景 → 持續錄音（background audio mode）")
+
+        if isBackgroundRecordingEnabled {
+            print("📱 [Lifecycle] 進入背景 → 持續錄音（background audio mode）")
+        } else {
+            // 背景錄音關閉 → 暫停音訊
+            isPausedForBackground = true
+            audioManager.stopSending()
+            print("📱 [Lifecycle] 進入背景 → 暫停音訊（背景錄音已關閉）")
+        }
     }
 
     /// 回到前台
@@ -854,24 +884,33 @@ final class TranscriptionViewModel {
                 endCall()
                 return
             }
-            print("📱 [Lifecycle] 回到前台（背景 \(Int(elapsed))s，持續錄音中）")
+            print("📱 [Lifecycle] 回到前台（背景 \(Int(elapsed))s）")
         }
 
         backgroundEntryTime = nil
-
-        // ⭐️ 確保音訊引擎仍在運作（以防 iOS 在背景中斷過）
         audioManager.recoverAudioEngine()
 
-        // 重啟閒置計時器
+        // 如果之前暫停了（背景錄音關閉），恢復發送
+        if isPausedForBackground {
+            isPausedForBackground = false
+            if inputMode == .vad {
+                audioManager.startSending()
+            }
+        }
+
         startIdleTimer()
     }
 
-    /// 螢幕鎖定：持續錄音（background audio mode 支援）
+    /// 螢幕鎖定
     @MainActor
     private func handleScreenLock() {
         guard isRecording else { return }
-        print("🔒 [Lifecycle] 螢幕鎖定 → 持續錄音（background audio mode）")
-        // 不再自動斷線，讓用戶在鎖屏時也能持續翻譯
+        if isLockScreenAutoEnd {
+            print("🔒 [Lifecycle] 螢幕鎖定 → 自動結束通話（設定啟用）")
+            endCall()
+        } else {
+            print("🔒 [Lifecycle] 螢幕鎖定 → 持續錄音")
+        }
     }
 
     /// ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
