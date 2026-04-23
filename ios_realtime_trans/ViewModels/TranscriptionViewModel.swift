@@ -864,6 +864,9 @@ final class TranscriptionViewModel {
 
         backgroundEntryTime = nil
 
+        // ⭐️ 恢復音訊引擎（背景期間可能被 iOS 停用）
+        audioManager.recoverAudioEngine()
+
         // 恢復音訊發送
         if inputMode == .vad {
             audioManager.startSending()

@@ -364,11 +364,87 @@ final class WebRTCAudioManager: NSObject {
 
     private override init() {
         super.init()
-        // ⭐️ 不在 init 中同步初始化，改為延遲初始化
-        // 在背景線程初始化，避免阻塞主線程
         Task.detached(priority: .userInitiated) { [weak self] in
             self?.setupWebRTC()
         }
+        // ⭐️ 監聽音訊會話中斷（電話、鬧鐘、Siri 等）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioInterruption),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+        // ⭐️ 監聯音訊路由變更（拔耳機等）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+    }
+
+    /// ⭐️ 音訊會話中斷處理（電話、鬧鐘、Siri 等會觸發）
+    @objc private func handleAudioInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+
+        switch type {
+        case .began:
+            print("⚠️ [Audio] 音訊中斷開始（電話/鬧鐘/Siri）")
+            // 引擎會被 iOS 強制停止，tap 失效
+        case .ended:
+            print("✅ [Audio] 音訊中斷結束，嘗試恢復")
+            // 延遲 0.5 秒等 iOS 完成音訊系統恢復
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.recoverAudioEngine()
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// ⭐️ 音訊路由變更處理（拔耳機等）
+    @objc private func handleRouteChange(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+
+        if reason == .oldDeviceUnavailable {
+            print("⚠️ [Audio] 音訊設備斷開（耳機拔出等），嘗試恢復")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.recoverAudioEngine()
+            }
+        }
+        updateOutputRoute()
+    }
+
+    /// ⭐️ 恢復音訊引擎（中斷結束或設備變更後呼叫）
+    func recoverAudioEngine() {
+        guard recordingState == .recording else { return }
+
+        // 重新啟動音訊會話
+        let rtcAudioSession = RTCAudioSession.sharedInstance()
+        rtcAudioSession.lockForConfiguration()
+        do {
+            try rtcAudioSession.setActive(true)
+        } catch {
+            print("❌ [Audio] 恢復音訊會話失敗: \(error)")
+        }
+        rtcAudioSession.unlockForConfiguration()
+
+        // 重新啟動錄音（WebRTC audioDeviceModule 會重建引擎和 tap）
+        let stopResult = audioDeviceModule.stopRecording()
+        print("🔄 [Audio] 停止舊錄音: \(stopResult)")
+
+        let initResult = audioDeviceModule.initRecording()
+        print("🔄 [Audio] 重新初始化錄音: \(initResult)")
+
+        let startResult = audioDeviceModule.startRecording()
+        print("🔄 [Audio] 重新啟動錄音: \(startResult)")
+
+        resetVADState()
+        print("✅ [Audio] 音訊引擎恢復完成")
     }
 
     // MARK: - WebRTC Setup
@@ -1412,6 +1488,8 @@ extension WebRTCAudioManager: RTCAudioDeviceModuleDelegate {
                           isPlayoutEnabled: Bool,
                           isRecordingEnabled: Bool) -> Int {
         print("⏹️ [WebRTC Delegate] Engine 已停止")
+        // ⭐️ Tap 失效，標記需要恢復
+        tapMixerNode = nil
         return 0
     }
 
@@ -1421,6 +1499,7 @@ extension WebRTCAudioManager: RTCAudioDeviceModuleDelegate {
                           isRecordingEnabled: Bool) -> Int {
         print("🔇 [WebRTC Delegate] Engine 已禁用")
         ttsNodesConnected = false
+        tapMixerNode = nil  // ⭐️ Tap 失效
         return 0
     }
 
