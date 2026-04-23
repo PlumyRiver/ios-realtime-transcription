@@ -800,10 +800,17 @@ struct InCallControlRow: View {
                     .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: wavePhase3)
                 }
                 .onAppear {
-                    pulseAnimation = true
-                    wavePhase1 = true
-                    wavePhase2 = true
-                    wavePhase3 = true
+                    // 先重置再啟動，確保切換模式後動畫重新觸發
+                    pulseAnimation = false
+                    wavePhase1 = false
+                    wavePhase2 = false
+                    wavePhase3 = false
+                    DispatchQueue.main.async {
+                        pulseAnimation = true
+                        wavePhase1 = true
+                        wavePhase2 = true
+                        wavePhase3 = true
+                    }
                 }
             } else {
                 // PTT 模式：按住說話
