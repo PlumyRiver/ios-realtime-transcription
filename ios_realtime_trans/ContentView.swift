@@ -17,6 +17,14 @@ struct ScrollOffsetPreferenceKey: PreferenceKey {
 }
 
 struct ContentView: View {
+    private static var bodyCount = 0
+    private static let launchTime = Date()
+    static func _printBodyEval() {
+        bodyCount += 1
+        let ms = Int(Date().timeIntervalSince(launchTime) * 1000)
+        print("⏱️ [ContentView.body] 第 \(bodyCount) 次 @ \(ms)ms")
+    }
+
     @State private var viewModel = TranscriptionViewModel()
     @State private var showSettings = false
     @State private var showHistory = false
@@ -28,11 +36,11 @@ struct ContentView: View {
     @State private var hasPreFetchedToken = false
 
     var body: some View {
+        let _ = Self._printBodyEval()  // ⏱️ 計時：ContentView.body 被呼叫
         NavigationStack {
             VStack(spacing: 0) {
                 ConversationListView(viewModel: viewModel).equatable()
 
-                // 底部控制區（重構版 - 參考開講AI設計）
                 BottomControlBar(viewModel: viewModel)
             }
             .background(Color(.systemGroupedBackground))
@@ -140,11 +148,13 @@ struct ConversationListView: View, Equatable {
     var viewModel: TranscriptionViewModel
     @State private var isUserScrolledUp = false
 
+    private static var bodyCount = 0
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.viewModel === rhs.viewModel
     }
 
     var body: some View {
+        let _ = { Self.bodyCount += 1; print("⏱️ [ConversationList.body] 第 \(Self.bodyCount) 次, transcripts=\(viewModel.transcripts.count)") }()
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {

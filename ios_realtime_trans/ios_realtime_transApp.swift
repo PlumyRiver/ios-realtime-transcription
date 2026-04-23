@@ -14,9 +14,9 @@ import GoogleSignIn
 class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        // 初始化 Firebase
+        let t0 = Date()
         FirebaseApp.configure()
-        print("✅ [App] Firebase 已初始化")
+        print("⏱️ [AppDelegate] FirebaseApp.configure: \(Int(Date().timeIntervalSince(t0)*1000))ms")
 
         return true
     }

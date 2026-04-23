@@ -753,10 +753,11 @@ final class TranscriptionViewModel {
     /// 由 ContentView.task 呼叫，確保 UI 第一幀已渲染後才執行
     func deferredSetup() async {
         guard isInitializing else { return }
+        let t0 = Date()
 
-        // ⭐️ 分段執行 + yield，讓 UI 在每段之間有機會更新
         setupSubscriptions()
-        await Task.yield()  // 讓 UI 呼吸
+        print("⏱️ [deferredSetup] setupSubscriptions: \(Int(Date().timeIntervalSince(t0)*1000))ms")
+        await Task.yield()
 
         // 同步設定到各服務（快速，只是屬性賦值）
         audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
@@ -778,10 +779,12 @@ final class TranscriptionViewModel {
         appleSTTService.confidenceThreshold = autoSwitchConfidenceThreshold
         appleSTTService.isComparisonDisplayMode = isComparisonDisplayMode
 
+        print("⏱️ [deferredSetup] 服務同步: \(Int(Date().timeIntervalSince(t0)*1000))ms")
         isInitializing = false
-        await Task.yield()  // 讓 UI 呼吸
+        await Task.yield()
 
         setupLifecycleObservers()
+        print("⏱️ [deferredSetup] 全部完成: \(Int(Date().timeIntervalSince(t0)*1000))ms")
 
         // 預熱 Apple TTS — 延遲 3 秒
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
@@ -1060,9 +1063,11 @@ final class TranscriptionViewModel {
 
     /// ⭐️ 開始編輯某則對話（設定狀態，由 UI 觸發 sheet）
     func startEditing(transcript: TranscriptMessage) {
+        let t0 = Date()
         editingTranscriptId = transcript.id
         editingInitialText = transcript.text
         showEditSheet = true
+        print("⏱️ [startEditing] \(Int(Date().timeIntervalSince(t0)*1000))ms")
     }
 
     /// ⭐️ 編輯對話文字並重新翻譯
