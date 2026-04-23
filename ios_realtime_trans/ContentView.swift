@@ -26,7 +26,7 @@ struct ContentView: View {
     }
 
     /// ⭐️ 從 RootView 傳入（@State 在 RootView，ContentView 重建不影響）
-    var viewModel: TranscriptionViewModel
+    @Bindable var viewModel: TranscriptionViewModel
     @State private var showSettings = false
     @State private var showHistory = false
 
