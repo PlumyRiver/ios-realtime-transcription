@@ -1464,12 +1464,14 @@ final class TranscriptionViewModel {
         print("🎙️ [ViewModel] 輸入模式切換: \(inputMode.rawValue)")
 
         if inputMode == .vad {
-            // VAD 模式：持續發送音頻
+            // VAD 模式：同步 VAD 旗標 + 開始持續監聽
+            audioManager.isVADEnabled = isLocalVADEnabled
             if isRecording {
                 audioManager.startSending()
             }
         } else {
-            // PTT 模式：停止發送，等待按住
+            // PTT 模式：關閉 VAD + 停止發送，等待按住
+            audioManager.isVADEnabled = false
             audioManager.stopSending()
         }
     }
