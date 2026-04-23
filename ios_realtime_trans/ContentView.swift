@@ -25,7 +25,8 @@ struct ContentView: View {
         print("⏱️ [ContentView.body] 第 \(bodyCount) 次 @ \(ms)ms")
     }
 
-    @State private var viewModel = TranscriptionViewModel()
+    /// ⭐️ 從 RootView 傳入（@State 在 RootView，ContentView 重建不影響）
+    var viewModel: TranscriptionViewModel
     @State private var showSettings = false
     @State private var showHistory = false
 

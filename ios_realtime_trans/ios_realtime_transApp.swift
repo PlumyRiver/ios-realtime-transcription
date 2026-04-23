@@ -50,17 +50,15 @@ struct ios_realtime_transApp: App {
 // MARK: - Root View（獨立 View 才能正確觀察 @Observable）
 
 struct RootView: View {
-    // ⭐️ 使用獨立 View 來觀察 AuthService 的狀態變化
     @State private var authService = AuthService.shared
-
-    /// 用戶是否主動登出過（用來判斷是否顯示登入頁面）
     @State private var userDidLogout = false
 
+    /// ⭐️ ViewModel 在 RootView 持有 — 不管 ContentView 怎麼重建都不會丟失
+    @State private var sharedViewModel = TranscriptionViewModel()
+
     var body: some View {
-        // ⭐️ ZStack：ContentView 永遠存在（不因 auth 變化而銷毀重建）
-        // 登入/驗證畫面疊在上面，auth 完成後消失
         ZStack {
-            ContentView()
+            ContentView(viewModel: sharedViewModel)
                 .task { await autoSignInIfNeeded() }
 
             if authService.authState == .emailNotVerified {
