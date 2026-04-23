@@ -155,11 +155,15 @@ final class IPv4HTTPClient {
                             switch result {
                             case .success(let raw):
                                 print("🌐 [IPv4HTTP] 收到 \(raw.count) bytes")
+                                let headPreview = String(data: raw.prefix(300), encoding: .utf8) ?? "non-utf8"
+                                print("🌐 [IPv4HTTP] 原始回應前 300 bytes:\n\(headPreview)")
                                 if let parsed = Self.parseHTTP(raw) {
+                                    print("🌐 [IPv4HTTP] 解析結果: status=\(parsed.1), body=\(parsed.0.count) bytes")
+                                    let bodyPreview = String(data: parsed.0.prefix(200), encoding: .utf8) ?? "non-utf8"
+                                    print("🌐 [IPv4HTTP] body 前 200 bytes: \(bodyPreview)")
                                     resumeOnce(.success(parsed))
                                 } else {
-                                    let preview = String(data: raw.prefix(200), encoding: .utf8) ?? "non-utf8"
-                                    print("❌ [IPv4HTTP] 解析失敗: \(preview)")
+                                    print("❌ [IPv4HTTP] HTTP 解析失敗")
                                     resumeOnce(.failure(IPv4HTTPError.invalidResponse))
                                 }
                             case .failure(let err):
