@@ -468,7 +468,8 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
     }
 
     /// 從後端服務器獲取 ElevenLabs token
-    private func fetchToken() async throws -> String {
+    /// - Parameter timeout: 超時（預取時用大值讓首次慢連線也能完成，填滿 OS kernel cache）
+    private func fetchToken(timeout: TimeInterval = 30) async throws -> String {
         guard let url = URL(string: tokenEndpoint) else {
             throw ElevenLabsError.invalidURL
         }
@@ -482,7 +483,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             url: url,
             headers: ["Content-Type": "application/json"],
             body: nil,
-            timeout: 10
+            timeout: timeout
         )
 
         guard status == 200 else {
