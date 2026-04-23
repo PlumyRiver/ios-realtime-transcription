@@ -246,7 +246,9 @@ final class AuthService {
     private(set) var currentFirebaseUser: User?
 
     /// 當前用戶（App Model）
-    private(set) var currentUser: AppUser?
+    private(set) var currentUser: AppUser? {
+        didSet { saveCachedAuthState() }
+    }
 
     /// 是否已登入
     var isSignedIn: Bool {
@@ -259,14 +261,23 @@ final class AuthService {
     }
 
     /// 認證狀態
-    enum AuthState: Equatable {
-        case unknown       // 初始狀態
-        case signedOut     // 已登出
-        case signedIn      // 已登入
-        case emailNotVerified  // 已註冊但未驗證郵件
+    enum AuthState: String, Equatable {
+        case unknown = "unknown"                  // 初始狀態
+        case signedOut = "signedOut"              // 已登出
+        case signedIn = "signedIn"                // 已登入
+        case emailNotVerified = "emailNotVerified" // 已註冊但未驗證郵件
     }
 
-    private(set) var authState: AuthState = .unknown
+    private(set) var authState: AuthState = .unknown {
+        didSet {
+            if authState == .signedOut || authState == .unknown {
+                // 登出或重置 → 清快取
+                if oldValue == .signedIn { clearCachedAuthState() }
+            } else {
+                saveCachedAuthState()
+            }
+        }
+    }
 
     /// 是否正在載入
     private(set) var isLoading: Bool = false
@@ -282,12 +293,51 @@ final class AuthService {
 
     // MARK: - Initialization
 
+    // ⭐️ 快取的用戶資料 key
+    private static let cachedUserKey = "AuthService.cachedUser"
+    private static let cachedAuthStateKey = "AuthService.cachedAuthState"
+
     private init() {
-        // 初始化 Firestore（使用指定的 named database）
-        // ⭐️ 使用 realtime-voice-database（與 web app 共用）
         db = Firestore.firestore(database: "realtime-voice-database")
 
+        // ⭐️ 立刻從 UserDefaults 快取載入登入狀態，UI 不需等 Firebase
+        loadCachedAuthState()
+
+        // Firebase 監聽在背景跑，完成後會更新狀態
         setupAuthStateListener()
+    }
+
+    /// ⭐️ 立刻從本地快取讀取上次的登入狀態
+    private func loadCachedAuthState() {
+        let defaults = UserDefaults.standard
+        if let stateRaw = defaults.string(forKey: Self.cachedAuthStateKey),
+           let state = AuthState(rawValue: stateRaw) {
+            authState = state
+        }
+        if let data = defaults.data(forKey: Self.cachedUserKey),
+           let user = try? JSONDecoder().decode(AppUser.self, from: data) {
+            currentUser = user
+            print("⚡️ [Auth] 立刻從快取載入: \(user.email), credits=\(user.slowCredits), state=\(authState)")
+        }
+    }
+
+    /// ⭐️ 把登入狀態存到 UserDefaults
+    private func saveCachedAuthState() {
+        let defaults = UserDefaults.standard
+        defaults.set(authState.rawValue, forKey: Self.cachedAuthStateKey)
+        if let user = currentUser,
+           let data = try? JSONEncoder().encode(user) {
+            defaults.set(data, forKey: Self.cachedUserKey)
+        } else {
+            defaults.removeObject(forKey: Self.cachedUserKey)
+        }
+    }
+
+    /// ⭐️ 清除快取（登出時呼叫）
+    private func clearCachedAuthState() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: Self.cachedUserKey)
+        defaults.removeObject(forKey: Self.cachedAuthStateKey)
     }
 
     deinit {
