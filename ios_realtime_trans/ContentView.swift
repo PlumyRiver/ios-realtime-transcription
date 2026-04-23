@@ -746,30 +746,65 @@ struct InCallControlRow: View {
         viewModel.inputMode == .vad
     }
 
+    // ⭐️ 聲波動畫相位（多條聲波各自不同速度）
+    @State private var wavePhase1: Bool = false
+    @State private var wavePhase2: Bool = false
+    @State private var wavePhase3: Bool = false
+
     private var microphoneButton: some View {
         ZStack {
             if isVADMode {
-                // VAD 模式：脈動動畫
+                // VAD 模式：聲波波紋 + 脈動
                 ZStack {
+                    // 外層擴散波紋
                     Circle()
-                        .fill(Color.green.opacity(0.15))
-                        .frame(width: buttonSize, height: buttonSize)
-                        .scaleEffect(pulseAnimation ? 1.2 : 1.0)
-                        .opacity(pulseAnimation ? 0.0 : 0.5)
-                        .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: false), value: pulseAnimation)
+                        .stroke(Color.green.opacity(0.3), lineWidth: 2)
+                        .frame(width: buttonSize + 10, height: buttonSize + 10)
+                        .scaleEffect(pulseAnimation ? 1.4 : 1.0)
+                        .opacity(pulseAnimation ? 0.0 : 0.6)
+                        .animation(.easeOut(duration: 2.0).repeatForever(autoreverses: false), value: pulseAnimation)
 
+                    Circle()
+                        .stroke(Color.green.opacity(0.2), lineWidth: 1.5)
+                        .frame(width: buttonSize + 10, height: buttonSize + 10)
+                        .scaleEffect(pulseAnimation ? 1.2 : 0.95)
+                        .opacity(pulseAnimation ? 0.0 : 0.4)
+                        .animation(.easeOut(duration: 2.0).delay(0.6).repeatForever(autoreverses: false), value: pulseAnimation)
+
+                    // 按鈕底色
                     Circle()
                         .fill(Color.green)
                         .frame(width: buttonSize - 10, height: buttonSize - 10)
-                        .shadow(color: Color.green.opacity(0.4), radius: 8)
+                        .shadow(color: Color.green.opacity(0.5), radius: 10)
 
-                    Image(systemName: "waveform")
-                        .font(.system(size: iconSize, weight: .medium))
-                        .foregroundStyle(.white)
-                        .scaleEffect(pulseAnimation ? 1.1 : 0.95)
-                        .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true), value: pulseAnimation)
+                    // 聲波條（3 條高低不同的跳動條紋）
+                    HStack(spacing: 3) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.white)
+                            .frame(width: 3, height: wavePhase1 ? 22 : 8)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.white)
+                            .frame(width: 3, height: wavePhase2 ? 16 : 24)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.white)
+                            .frame(width: 3, height: wavePhase3 ? 24 : 10)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.white)
+                            .frame(width: 3, height: wavePhase1 ? 12 : 20)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.white)
+                            .frame(width: 3, height: wavePhase2 ? 20 : 6)
+                    }
+                    .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: wavePhase1)
+                    .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: wavePhase2)
+                    .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: wavePhase3)
                 }
-                .onAppear { pulseAnimation = true }
+                .onAppear {
+                    pulseAnimation = true
+                    wavePhase1 = true
+                    wavePhase2 = true
+                    wavePhase3 = true
+                }
             } else {
                 // PTT 模式：按住說話
                 ZStack {
@@ -806,11 +841,17 @@ struct InCallControlRow: View {
             }
         }
         .overlay(alignment: .bottom) {
-            Text(isVADMode ? "監聽中" : "按住說話")
-                .font(.caption2)
-                .fontWeight(.medium)
-                .foregroundStyle(isVADMode ? .green : (isPressed ? .red : .secondary))
-                .offset(y: 28)
+            VStack(spacing: 1) {
+                Text(isVADMode ? "收音中" : (isPressed ? "錄音中" : "按住說話"))
+                    .font(.caption2)
+                    .fontWeight(.medium)
+                if isVADMode {
+                    Text("Listening")
+                        .font(.system(size: 9))
+                }
+            }
+            .foregroundStyle(isVADMode ? .green : (isPressed ? .red : .secondary))
+            .offset(y: 28)
         }
     }
 
