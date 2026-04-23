@@ -369,9 +369,9 @@ final class AuthService {
                     if isVerified || isThirdParty {
                         print("🔐 [Auth] 設定 authState = .signedIn")
                         self.authState = .signedIn
-                        // 載入或創建用戶資料
-                        Task {
-                            await self.loadOrCreateUserData(firebaseUser: user)
+                        // ⭐️ Task.detached 完全脫離 MainActor，不阻塞 UI
+                        Task.detached(priority: .utility) { [weak self] in
+                            await self?.loadOrCreateUserData(firebaseUser: user)
                         }
                     } else {
                         // Email 未驗證

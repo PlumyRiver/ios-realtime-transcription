@@ -790,14 +790,8 @@ final class TranscriptionViewModel {
         setupLifecycleObservers()
         print("⏱️ [deferredSetup] 全部完成: \(Int(Date().timeIntervalSince(t0)*1000))ms")
 
-        // 預熱 Apple TTS — 延遲 3 秒
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            guard let self else { return }
-            self.appleTTSService.preWarmLanguages([
-                self.sourceLang.azureLocale,
-                self.targetLang.azureLocale
-            ])
-        }
+        // ⭐️ 不再啟動時預熱 Apple TTS — 移到開始錄音時（那時才真的需要）
+        // 避開啟動風暴，減少 MainActor 競爭
 
         print("✅ [ViewModel] 延遲初始化完成")
     }

@@ -105,10 +105,10 @@ struct ContentView: View {
                 // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步，分段 yield 不阻塞 UI）
                 await viewModel.deferredSetup()
 
-                // 2) 背景預載（只執行一次）
+                // 2) 背景預載歷史 + 收藏（只執行一次）
+                // ⭐️ 不再預取 ElevenLabs token — 避免啟動風暴，用戶按錄音時才連線
                 if !hasPreFetchedToken {
                     hasPreFetchedToken = true
-                    viewModel.prefetchElevenLabsToken()
                     if let uid = authService.currentUser?.uid {
                         Task.detached(priority: .utility) {
                             async let f: () = SessionService.shared.loadFavorites(uid: uid)
