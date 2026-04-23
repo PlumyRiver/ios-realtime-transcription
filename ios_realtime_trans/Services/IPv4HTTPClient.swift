@@ -141,17 +141,23 @@ final class IPv4HTTPClient {
                 resumeOnce(.failure(IPv4HTTPError.timeout))
             }
 
+            let t0 = Date()
             connection.stateUpdateHandler = { state in
-                print("🌐 [IPv4HTTP] NWConnection 狀態: \(state)")
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                print("🌐 [IPv4HTTP] \(ms)ms 狀態: \(state)")
                 switch state {
                 case .ready:
+                    let sendStart = Date()
                     connection.send(content: data, completion: .contentProcessed { error in
+                        print("🌐 [IPv4HTTP] \(Int(Date().timeIntervalSince(t0)*1000))ms send 完成（\(Int(Date().timeIntervalSince(sendStart)*1000))ms）")
                         if let error = error {
                             print("❌ [IPv4HTTP] send 失敗: \(error)")
                             resumeOnce(.failure(IPv4HTTPError.connectionFailed(error.localizedDescription)))
                             return
                         }
+                        let recvStart = Date()
                         Self.receiveAll(connection: connection, buffer: Data()) { result in
+                            print("🌐 [IPv4HTTP] \(Int(Date().timeIntervalSince(t0)*1000))ms receive 完成（\(Int(Date().timeIntervalSince(recvStart)*1000))ms）")
                             switch result {
                             case .success(let raw):
                                 print("🌐 [IPv4HTTP] 收到 \(raw.count) bytes")
