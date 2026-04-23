@@ -68,15 +68,27 @@ final class IPv4HTTPClient {
         // 3) TLS + SNI 連接 IPv4 位址
         let tlsOptions = NWProtocolTLS.Options()
         sec_protocol_options_set_tls_server_name(tlsOptions.securityProtocolOptions, host)
-        let params = NWParameters(tls: tlsOptions)
-        params.requiredInterfaceType = .other  // 不限制介面
-        guard let port = NWEndpoint.Port(rawValue: portValue) else {
+        // 強制 TLS 1.2+（避開部分網路對 TLS 1.3 的 middlebox 問題）
+        sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
+
+        // TCP 設定：禁用慢啟動選項，快速失敗
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.connectionTimeout = 10
+        tcpOptions.noDelay = true  // 禁用 Nagle，立刻發送
+        tcpOptions.enableFastOpen = true  // TCP Fast Open（可能縮短握手）
+
+        let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
+        params.serviceClass = .responsiveData  // 優先級高
+        params.prohibitExpensiveNetworkAccess = false
+
+        guard let port = NWEndpoint.Port(rawValue: portValue),
+              let ipAddr = IPv4Address(ipv4) else {
             throw IPv4HTTPError.invalidURL
         }
 
+        // ⭐️ 明確用 .ipv4 類型，NWConnection 不會做 DNS 或雙棧探測
         let connection = NWConnection(
-            host: NWEndpoint.Host(ipv4),
-            port: port,
+            to: .hostPort(host: .ipv4(ipAddr), port: port),
             using: params
         )
 
