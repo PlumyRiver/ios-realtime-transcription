@@ -81,6 +81,10 @@ private enum VMSettingsKey: String {
 @Observable
 final class TranscriptionViewModel {
 
+    /// ⭐️ Singleton — 確保整個 app 只有一個 ViewModel 實例
+    /// 避免 SwiftUI @State 在某些情況下重建視圖時重新建立 ViewModel
+    static let shared = TranscriptionViewModel()
+
     // MARK: - Published Properties
 
     var sourceLang: Language = .zh {

@@ -53,8 +53,8 @@ struct RootView: View {
     @State private var authService = AuthService.shared
     @State private var userDidLogout = false
 
-    /// ⭐️ ViewModel 在 RootView 持有 — 不管 ContentView 怎麼重建都不會丟失
-    @State private var sharedViewModel = TranscriptionViewModel()
+    /// ⭐️ ViewModel 用 singleton — 徹底杜絕雙重建立
+    private let sharedViewModel = TranscriptionViewModel.shared
 
     var body: some View {
         ZStack {
