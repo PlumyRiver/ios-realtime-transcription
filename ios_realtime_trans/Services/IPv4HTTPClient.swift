@@ -78,8 +78,7 @@ final class IPv4HTTPClient {
         tcpOptions.enableFastOpen = true  // TCP Fast Open（可能縮短握手）
 
         let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
-        params.serviceClass = .responsiveData  // 優先級高
-        params.prohibitExpensiveNetworkAccess = false
+        params.serviceClass = .responsiveData
 
         guard let port = NWEndpoint.Port(rawValue: portValue),
               let ipAddr = IPv4Address(ipv4) else {
