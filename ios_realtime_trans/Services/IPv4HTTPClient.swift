@@ -31,13 +31,24 @@ final class IPv4HTTPClient {
     ) async throws -> (Data, Int) {
         guard let host = url.host,
               let portValue = UInt16(exactly: url.port ?? 443) else {
+            print("❌ [IPv4HTTP] 無效 URL: \(url)")
             throw IPv4HTTPError.invalidURL
         }
         var path = url.path.isEmpty ? "/" : url.path
         if let query = url.query { path += "?" + query }
 
+        print("🌐 [IPv4HTTP] POST \(host)\(path)")
+
         // 1) 只解析 IPv4
-        let ipv4 = try await resolveIPv4(hostname: host)
+        let t0 = Date()
+        let ipv4: String
+        do {
+            ipv4 = try await resolveIPv4(hostname: host)
+        } catch {
+            print("❌ [IPv4HTTP] DNS 失敗: \(error)")
+            throw error
+        }
+        print("🌐 [IPv4HTTP] IPv4 = \(ipv4) (DNS \(Int(Date().timeIntervalSince(t0)*1000))ms)")
 
         // 2) 建 HTTP/1.1 請求
         var reqStr = "POST \(path) HTTP/1.1\r\n"
@@ -131,31 +142,39 @@ final class IPv4HTTPClient {
             }
 
             connection.stateUpdateHandler = { state in
+                print("🌐 [IPv4HTTP] NWConnection 狀態: \(state)")
                 switch state {
                 case .ready:
-                    // 連線成功 → 送資料
                     connection.send(content: data, completion: .contentProcessed { error in
                         if let error = error {
+                            print("❌ [IPv4HTTP] send 失敗: \(error)")
                             resumeOnce(.failure(IPv4HTTPError.connectionFailed(error.localizedDescription)))
                             return
                         }
                         Self.receiveAll(connection: connection, buffer: Data()) { result in
                             switch result {
                             case .success(let raw):
+                                print("🌐 [IPv4HTTP] 收到 \(raw.count) bytes")
                                 if let parsed = Self.parseHTTP(raw) {
                                     resumeOnce(.success(parsed))
                                 } else {
+                                    let preview = String(data: raw.prefix(200), encoding: .utf8) ?? "non-utf8"
+                                    print("❌ [IPv4HTTP] 解析失敗: \(preview)")
                                     resumeOnce(.failure(IPv4HTTPError.invalidResponse))
                                 }
                             case .failure(let err):
+                                print("❌ [IPv4HTTP] 接收失敗: \(err)")
                                 resumeOnce(.failure(err))
                             }
                         }
                     })
                 case .failed(let error):
+                    print("❌ [IPv4HTTP] NWConnection failed: \(error)")
                     resumeOnce(.failure(IPv4HTTPError.connectionFailed(error.localizedDescription)))
                 case .cancelled:
                     resumeOnce(.failure(IPv4HTTPError.connectionFailed("cancelled")))
+                case .waiting(let error):
+                    print("⚠️ [IPv4HTTP] NWConnection waiting: \(error)")
                 default:
                     break
                 }

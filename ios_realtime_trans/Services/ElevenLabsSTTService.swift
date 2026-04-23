@@ -238,15 +238,21 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             guard let self = self else { throw ElevenLabsError.invalidURL }
             print("🔄 [ElevenLabs] 背景預取 token...")
             let startTime = Date()
-            let token = try await self.fetchToken()
-            let elapsed = Date().timeIntervalSince(startTime)
-            await MainActor.run {
-                self.cachedToken = token
-                self.tokenExpireTime = Date().addingTimeInterval(self.tokenValidDuration)
-                self.tokenFetchTask = nil
+            do {
+                let token = try await self.fetchToken()
+                let elapsed = Date().timeIntervalSince(startTime)
+                await MainActor.run {
+                    self.cachedToken = token
+                    self.tokenExpireTime = Date().addingTimeInterval(self.tokenValidDuration)
+                    self.tokenFetchTask = nil
+                }
+                print("✅ [ElevenLabs] Token 預取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
+                return token
+            } catch {
+                print("❌ [ElevenLabs] 預取失敗: \(error)")
+                await MainActor.run { self.tokenFetchTask = nil }
+                throw error
             }
-            print("✅ [ElevenLabs] Token 預取完成（耗時 \(String(format: "%.2f", elapsed))秒）")
-            return token
         }
     }
 
