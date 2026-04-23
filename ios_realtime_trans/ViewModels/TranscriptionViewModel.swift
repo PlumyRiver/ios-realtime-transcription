@@ -9,6 +9,7 @@ import Foundation
 import Combine
 import AVFoundation
 import UIKit
+import MediaPlayer
 
 /// 連接狀態
 enum ConnectionStatus {
@@ -891,6 +892,75 @@ final class TranscriptionViewModel {
         startIdleTimer()
     }
 
+    // MARK: - Lock Screen Controls（鎖屏通話控制）
+
+    /// 鎖屏計時器（更新 Now Playing 的播放時間）
+    private var nowPlayingTimer: Timer?
+
+    /// 設定鎖屏 Now Playing 顯示 + 遠端控制按鈕
+    private func setupNowPlaying() {
+        let center = MPNowPlayingInfoCenter.default()
+        let commandCenter = MPRemoteCommandCenter.shared()
+
+        // 顯示資訊
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: "通話中 In Call",
+            MPMediaItemPropertyArtist: "\(sourceLang.shortName) → \(targetLang.shortName)",
+            MPNowPlayingInfoPropertyPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0,
+            MPMediaItemPropertyPlaybackDuration: 0.0  // 0 = 不顯示進度條
+        ]
+        center.nowPlayingInfo = info
+        center.playbackState = .playing
+
+        // 停止按鈕 → 結束通話
+        commandCenter.stopCommand.isEnabled = true
+        commandCenter.stopCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.endCall() }
+            return .success
+        }
+
+        // 暫停按鈕 → 也結束通話
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.pauseCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.endCall() }
+            return .success
+        }
+
+        // 播放按鈕 → 禁用（通話中不需要）
+        commandCenter.playCommand.isEnabled = false
+
+        // 定時更新經過時間
+        nowPlayingTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, self.isRecording else { return }
+            var info = center.nowPlayingInfo ?? [:]
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(self.recordingDuration)
+            center.nowPlayingInfo = info
+        }
+
+        // 讓 app 成為 Now Playing 的目標
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+
+        print("🔒 [LockScreen] Now Playing 已設定")
+    }
+
+    /// 清除鎖屏 Now Playing
+    private func clearNowPlaying() {
+        nowPlayingTimer?.invalidate()
+        nowPlayingTimer = nil
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+
+        let commandCenter = MPRemoteCommandCenter.shared()
+        commandCenter.stopCommand.removeTarget(nil)
+        commandCenter.pauseCommand.removeTarget(nil)
+        commandCenter.playCommand.isEnabled = true
+
+        UIApplication.shared.endReceivingRemoteControlEvents()
+        print("🔒 [LockScreen] Now Playing 已清除")
+    }
+
     // MARK: - Public Methods
 
     /// 是否正在處理連接/斷開
@@ -1206,6 +1276,7 @@ final class TranscriptionViewModel {
 
             status = .recording
             startDurationTimer()
+            setupNowPlaying()
 
             // ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
             startIdleTimer()
@@ -1272,6 +1343,7 @@ final class TranscriptionViewModel {
         status = .disconnected
 
         stopDurationTimer()
+        clearNowPlaying()
 
         // ⭐️ 停止閒置計時器
         idleTimer?.invalidate()
