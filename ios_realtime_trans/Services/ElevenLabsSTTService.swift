@@ -467,35 +467,24 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             throw ElevenLabsError.invalidURL
         }
 
-        // ⭐️ 短超時 + 重試：IPv6 不通的網路下，第一次 5 秒超時讓 OS 學到 IPv6 不通
-        // 第二次自動走 IPv4，通常 <1 秒完成
         struct TokenResponse: Decodable {
             let token: String
         }
 
-        for attempt in 0..<2 {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = attempt == 0 ? 3 : 15  // 第一次 3 秒（IPv6 快速失敗），重試 15 秒
+        // ⭐️ 使用 IPv4-only 客戶端，繞過 Happy Eyeballs 10 秒 IPv6 超時
+        let (data, status) = try await IPv4HTTPClient.shared.post(
+            url: url,
+            headers: ["Content-Type": "application/json"],
+            body: nil,
+            timeout: 10
+        )
 
-            do {
-                let (data, response) = try await URLSession.shared.data(for: request)
-                guard let httpResponse = response as? HTTPURLResponse,
-                      httpResponse.statusCode == 200 else {
-                    throw ElevenLabsError.tokenFetchFailed
-                }
-                let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
-                return tokenResponse.token
-            } catch {
-                if attempt == 0 {
-                    print("⚠️ [ElevenLabs] Token 第一次超時（可能 IPv6），重試...")
-                    continue
-                }
-                throw error
-            }
+        guard status == 200 else {
+            throw ElevenLabsError.tokenFetchFailed
         }
-        throw ElevenLabsError.tokenFetchFailed
+
+        let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
+        return tokenResponse.token
     }
 
     /// 使用 token 連接 WebSocket
