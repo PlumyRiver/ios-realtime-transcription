@@ -792,16 +792,22 @@ final class TranscriptionViewModel {
         print("✅ [ViewModel] 延遲初始化完成")
     }
 
-    /// ⭐️ 預熱 Apple TTS（由 ContentView 在啟動風暴結束後呼叫）
-    /// 排程鏈：deferredSetup → 歷史預載 → +1秒 → warmUpTTS
+    /// ⭐️ 預熱 Apple TTS + 鍵盤（由 ContentView 在啟動風暴結束後呼叫）
+    /// 排程鏈：deferredSetup → 歷史預載 → +1秒 → warmUpTTS + warmUpKeyboard
     private var ttsWarmedUp = false
     func warmUpTTSIfNeeded() {
         guard !ttsWarmedUp else { return }
         ttsWarmedUp = true
+
         let srcLocale = sourceLang.azureLocale
         let tgtLocale = targetLang.azureLocale
         appleTTSService.preWarmLanguages([srcLocale, tgtLocale])
         print("🔥 [TTS] 啟動風暴後預熱: \(srcLocale), \(tgtLocale)")
+
+        // ⭐️ 順便預熱鍵盤（含中文輸入法），避免用戶第一次打字卡頓
+        Task { @MainActor in
+            KeyboardPrewarmer.prewarm()
+        }
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
