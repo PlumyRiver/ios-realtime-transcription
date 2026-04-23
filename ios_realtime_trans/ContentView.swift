@@ -754,53 +754,62 @@ struct InCallControlRow: View {
     private var microphoneButton: some View {
         ZStack {
             if isVADMode {
-                // VAD 模式：聲波波紋 + 脈動
+                // VAD 模式：快速擴散波紋 + 跳動聲波條
                 ZStack {
-                    // 外層擴散波紋
+                    // 三層快速擴散波紋（交錯發射）
                     Circle()
-                        .stroke(Color.green.opacity(0.3), lineWidth: 2)
+                        .stroke(Color.green.opacity(0.5), lineWidth: 2.5)
                         .frame(width: buttonSize + 10, height: buttonSize + 10)
-                        .scaleEffect(pulseAnimation ? 1.4 : 1.0)
-                        .opacity(pulseAnimation ? 0.0 : 0.6)
-                        .animation(.easeOut(duration: 2.0).repeatForever(autoreverses: false), value: pulseAnimation)
+                        .scaleEffect(pulseAnimation ? 1.6 : 1.0)
+                        .opacity(pulseAnimation ? 0.0 : 0.7)
+                        .animation(.easeOut(duration: 1.2).repeatForever(autoreverses: false), value: pulseAnimation)
 
                     Circle()
-                        .stroke(Color.green.opacity(0.2), lineWidth: 1.5)
+                        .stroke(Color.green.opacity(0.4), lineWidth: 2)
                         .frame(width: buttonSize + 10, height: buttonSize + 10)
-                        .scaleEffect(pulseAnimation ? 1.2 : 0.95)
+                        .scaleEffect(pulseAnimation ? 1.5 : 0.95)
+                        .opacity(pulseAnimation ? 0.0 : 0.5)
+                        .animation(.easeOut(duration: 1.2).delay(0.4).repeatForever(autoreverses: false), value: pulseAnimation)
+
+                    Circle()
+                        .stroke(Color.green.opacity(0.3), lineWidth: 1.5)
+                        .frame(width: buttonSize + 10, height: buttonSize + 10)
+                        .scaleEffect(pulseAnimation ? 1.4 : 0.9)
                         .opacity(pulseAnimation ? 0.0 : 0.4)
-                        .animation(.easeOut(duration: 2.0).delay(0.6).repeatForever(autoreverses: false), value: pulseAnimation)
+                        .animation(.easeOut(duration: 1.2).delay(0.8).repeatForever(autoreverses: false), value: pulseAnimation)
 
-                    // 按鈕底色
+                    // 發光底色
                     Circle()
-                        .fill(Color.green)
+                        .fill(
+                            RadialGradient(
+                                colors: [Color.green, Color.green.opacity(0.7)],
+                                center: .center,
+                                startRadius: 0,
+                                endRadius: 35
+                            )
+                        )
                         .frame(width: buttonSize - 10, height: buttonSize - 10)
-                        .shadow(color: Color.green.opacity(0.5), radius: 10)
+                        .shadow(color: Color.green.opacity(0.6), radius: 14)
+                        .shadow(color: Color.green.opacity(0.3), radius: 25)
 
-                    // 聲波條（3 條高低不同的跳動條紋）
-                    HStack(spacing: 3) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white)
-                            .frame(width: 3, height: wavePhase1 ? 22 : 8)
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white)
-                            .frame(width: 3, height: wavePhase2 ? 16 : 24)
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white)
-                            .frame(width: 3, height: wavePhase3 ? 24 : 10)
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white)
-                            .frame(width: 3, height: wavePhase1 ? 12 : 20)
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.white)
-                            .frame(width: 3, height: wavePhase2 ? 20 : 6)
+                    // 7 條快速跳動聲波條
+                    HStack(spacing: 2.5) {
+                        ForEach(0..<7, id: \.self) { i in
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(Color.white)
+                                .frame(
+                                    width: 3,
+                                    height: [wavePhase1, wavePhase2, wavePhase3, wavePhase1, wavePhase2, wavePhase3, wavePhase1][i]
+                                        ? [24, 14, 28, 10, 22, 16, 26][i]
+                                        : [8, 20, 6, 24, 10, 22, 8][i]
+                                )
+                        }
                     }
-                    .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: wavePhase1)
-                    .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: wavePhase2)
-                    .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: wavePhase3)
+                    .animation(.easeInOut(duration: 0.35).repeatForever(autoreverses: true), value: wavePhase1)
+                    .animation(.easeInOut(duration: 0.3).repeatForever(autoreverses: true), value: wavePhase2)
+                    .animation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true), value: wavePhase3)
                 }
                 .onAppear {
-                    // 先重置再啟動，確保切換模式後動畫重新觸發
                     pulseAnimation = false
                     wavePhase1 = false
                     wavePhase2 = false
