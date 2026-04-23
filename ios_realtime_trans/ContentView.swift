@@ -42,7 +42,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 ConversationListView(viewModel: viewModel).equatable()
 
-                BottomControlBar(viewModel: viewModel)
+                BottomControlBar(viewModel: viewModel).equatable()
             }
             .background(Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
@@ -140,7 +140,8 @@ struct ContentView: View {
                         viewModel.showEditSheet = false
                     }
                 )
-                .presentationDetents([.medium, .large])
+                // ⭐️ 只用 large，避免鍵盤出現時 sheet 在 medium/large 之間彈跳造成卡頓
+                .presentationDetents([.large])
             }
         }
     }
@@ -539,14 +540,15 @@ struct EditTranscriptSheet: View {
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 12)
 
-            TextField("輸入文字", text: $text, axis: .vertical)
-                .lineLimit(3...10)
-                .textFieldStyle(.plain)
+            // ⭐️ 用 TextEditor 固定高度，避免 TextField(axis:.vertical) 每字重新 layout
+            TextEditor(text: $text)
                 .font(.body)
-                .padding(12)
+                .scrollContentBackground(.hidden)
+                .padding(8)
                 .background(Color(.systemGray6))
                 .cornerRadius(12)
                 .focused($isFocused)
+                .frame(minHeight: 120, maxHeight: 200)
                 .padding(.horizontal)
 
             Spacer()
@@ -611,8 +613,12 @@ struct TypingIndicator: View {
 
 // MARK: - Bottom Control Bar (底部控制區 - 兩排架構)
 
-struct BottomControlBar: View {
+struct BottomControlBar: View, Equatable {
     @Bindable var viewModel: TranscriptionViewModel
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.viewModel === rhs.viewModel
+    }
 
     var body: some View {
         VStack(spacing: 0) {
