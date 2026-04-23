@@ -75,7 +75,6 @@ private enum VMSettingsKey: String {
     case sttLanguageDetectionMode
     case translationStyle
     case customStylePrompt
-    case isBackgroundRecordingEnabled
     case isLockScreenAutoEnd
 }
 
@@ -136,14 +135,6 @@ final class TranscriptionViewModel {
             guard !isInitializing else { return }
             audioManager.isSpeakerMode = isSpeakerMode
             saveSetting(.isSpeakerMode, value: isSpeakerMode)
-        }
-    }
-
-    /// 背景持續錄音（切 App / 鎖屏不中斷）
-    var isBackgroundRecordingEnabled: Bool = true {
-        didSet {
-            guard !isInitializing else { return }
-            saveSetting(.isBackgroundRecordingEnabled, value: isBackgroundRecordingEnabled)
         }
     }
 
@@ -747,9 +738,6 @@ final class TranscriptionViewModel {
         if let saved = defaults.string(forKey: VMSettingsKey.customStylePrompt.rawValue) {
             customStylePrompt = saved
         }
-        if defaults.object(forKey: VMSettingsKey.isBackgroundRecordingEnabled.rawValue) != nil {
-            isBackgroundRecordingEnabled = defaults.bool(forKey: VMSettingsKey.isBackgroundRecordingEnabled.rawValue)
-        }
         if defaults.object(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue) != nil {
             isLockScreenAutoEnd = defaults.bool(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue)
         }
@@ -861,15 +849,8 @@ final class TranscriptionViewModel {
         backgroundEntryTime = Date()
         idleTimer?.invalidate()
         idleTimer = nil
-
-        if isBackgroundRecordingEnabled {
-            print("📱 [Lifecycle] 進入背景 → 持續錄音（background audio mode）")
-        } else {
-            // 背景錄音關閉 → 暫停音訊
-            isPausedForBackground = true
-            audioManager.stopSending()
-            print("📱 [Lifecycle] 進入背景 → 暫停音訊（背景錄音已關閉）")
-        }
+        // 切 App 永遠持續錄音
+        print("📱 [Lifecycle] 進入背景 → 持續錄音")
     }
 
     /// 回到前台
@@ -889,15 +870,6 @@ final class TranscriptionViewModel {
 
         backgroundEntryTime = nil
         audioManager.recoverAudioEngine()
-
-        // 如果之前暫停了（背景錄音關閉），恢復發送
-        if isPausedForBackground {
-            isPausedForBackground = false
-            if inputMode == .vad {
-                audioManager.startSending()
-            }
-        }
-
         startIdleTimer()
     }
 

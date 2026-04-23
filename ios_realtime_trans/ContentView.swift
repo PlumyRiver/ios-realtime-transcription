@@ -2293,22 +2293,12 @@ struct SettingsView: View {
                     // 麥克風增益、VAD 靈敏度、伺服器設定已隱藏（使用程式碼預設值）
                 }
 
-                Section("背景與鎖屏") {
-                    Toggle(isOn: $viewModel.isBackgroundRecordingEnabled) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("背景持續錄音")
-                                .font(.subheadline)
-                            Text("切換 App 時繼續轉錄翻譯")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
+                Section("鎖屏設定") {
                     Toggle(isOn: $viewModel.isLockScreenAutoEnd) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("鎖定螢幕自動結束通話")
                                 .font(.subheadline)
-                            Text("關閉後，鎖屏時會持續錄音（可從鎖屏控制中斷）")
+                            Text("關閉後鎖屏持續錄音，可從鎖屏控制中斷")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
