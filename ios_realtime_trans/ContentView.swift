@@ -30,8 +30,7 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // ⭐️ 對話區域（獨立子視圖，不受 showSettings/showHistory 等 @State 影響）
-                ConversationListView(viewModel: viewModel)
+                ConversationListView(viewModel: viewModel).equatable()
 
                 // 底部控制區（重構版 - 參考開講AI設計）
                 BottomControlBar(viewModel: viewModel)
@@ -47,7 +46,6 @@ struct ContentView: View {
                         Image(systemName: "trash")
                             .foregroundStyle(.red.opacity(0.8))
                     }
-                    .disabled(viewModel.transcripts.isEmpty && viewModel.interimTranscript == nil)
                 }
 
                 // 中：歷史 + 額度
@@ -138,9 +136,13 @@ struct ContentView: View {
 /// 當 showSettings/showHistory 等 ContentView @State 變化時，SwiftUI 重算 ContentView.body，
 /// 但因為 ConversationListView 的唯一輸入 viewModel（引用）沒變，SwiftUI 跳過此 View 的 body 重算。
 
-struct ConversationListView: View {
+struct ConversationListView: View, Equatable {
     var viewModel: TranscriptionViewModel
     @State private var isUserScrolledUp = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.viewModel === rhs.viewModel
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
