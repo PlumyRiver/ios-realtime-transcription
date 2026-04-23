@@ -105,17 +105,23 @@ struct ContentView: View {
                 // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步，分段 yield 不阻塞 UI）
                 await viewModel.deferredSetup()
 
-                // 2) 背景預載歷史 + 收藏（只執行一次）
-                // ⭐️ 不再預取 ElevenLabs token — 避免啟動風暴，用戶按錄音時才連線
+                // 2) 背景工作鏈（依序執行，每一步完成才跑下一步，避免競爭）
                 if !hasPreFetchedToken {
                     hasPreFetchedToken = true
-                    if let uid = authService.currentUser?.uid {
-                        Task.detached(priority: .utility) {
+                    let uid = authService.currentUser?.uid
+                    Task.detached(priority: .utility) { [viewModel] in
+                        // Step A: 歷史+收藏預載（如果有登入）
+                        if let uid = uid {
                             async let f: () = SessionService.shared.loadFavorites(uid: uid)
                             async let h: () = SessionService.shared.loadAllSessions(uid: uid) { _, _ in }
                             _ = await (f, h)
                             print("⚡️ [Preload] 對話歷史 + 收藏預載完成")
                         }
+
+                        // Step B: TTS 預熱（Step A 完成後，啟動風暴過了）
+                        // 再等 1 秒讓 auth/Firestore 收尾
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        await viewModel.warmUpTTSIfNeeded()
                     }
                 }
                 print("💰 [ContentView] currentUser = \(authService.currentUser?.email ?? "nil"), slowCredits = \(authService.currentUser?.slowCredits ?? -1)")

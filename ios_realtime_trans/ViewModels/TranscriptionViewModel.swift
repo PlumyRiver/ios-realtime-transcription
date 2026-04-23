@@ -789,11 +789,19 @@ final class TranscriptionViewModel {
 
         setupLifecycleObservers()
         print("⏱️ [deferredSetup] 全部完成: \(Int(Date().timeIntervalSince(t0)*1000))ms")
-
-        // ⭐️ 不再啟動時預熱 Apple TTS — 移到開始錄音時（那時才真的需要）
-        // 避開啟動風暴，減少 MainActor 競爭
-
         print("✅ [ViewModel] 延遲初始化完成")
+    }
+
+    /// ⭐️ 預熱 Apple TTS（由 ContentView 在啟動風暴結束後呼叫）
+    /// 排程鏈：deferredSetup → 歷史預載 → +1秒 → warmUpTTS
+    private var ttsWarmedUp = false
+    func warmUpTTSIfNeeded() {
+        guard !ttsWarmedUp else { return }
+        ttsWarmedUp = true
+        let srcLocale = sourceLang.azureLocale
+        let tgtLocale = targetLang.azureLocale
+        appleTTSService.preWarmLanguages([srcLocale, tgtLocale])
+        print("🔥 [TTS] 啟動風暴後預熱: \(srcLocale), \(tgtLocale)")
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
