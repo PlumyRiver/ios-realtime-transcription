@@ -2952,5 +2952,5 @@ struct MicGainPresetButton: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(viewModel: TranscriptionViewModel())
 }
