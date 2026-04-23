@@ -834,54 +834,43 @@ final class TranscriptionViewModel {
     private func handleEnterBackground() {
         guard isRecording else { return }
         backgroundEntryTime = Date()
-        isPausedForBackground = true
-
-        // 停止發送音訊（但不斷線）
-        audioManager.stopSending()
-        // 停止閒置計時器（背景不需要）
+        // ⭐️ 不暫停音訊 — 背景持續錄音+轉錄+翻譯（Info.plist 已宣告 audio background mode）
+        // 只停閒置計時器（背景不需要檢查閒置）
         idleTimer?.invalidate()
         idleTimer = nil
-
-        print("📱 [Lifecycle] 進入背景 → 暫停音訊發送（保持連線）")
+        print("📱 [Lifecycle] 進入背景 → 持續錄音（background audio mode）")
     }
 
-    /// 回到前台：判斷是否超時
+    /// 回到前台
     @MainActor
     private func handleEnterForeground() {
-        guard isPausedForBackground, isRecording else { return }
-        isPausedForBackground = false
+        guard isRecording else { return }
 
         if let entryTime = backgroundEntryTime {
             let elapsed = Date().timeIntervalSince(entryTime)
             if elapsed >= backgroundTimeout {
-                // 超過 5 分鐘 → 自動斷線
                 print("📱 [Lifecycle] 背景超過 \(Int(elapsed))s（>\(Int(backgroundTimeout))s）→ 自動斷線")
                 endCall()
                 return
             }
-            print("📱 [Lifecycle] 回到前台（背景 \(Int(elapsed))s）→ 恢復音訊發送")
+            print("📱 [Lifecycle] 回到前台（背景 \(Int(elapsed))s，持續錄音中）")
         }
 
         backgroundEntryTime = nil
 
-        // ⭐️ 恢復音訊引擎（背景期間可能被 iOS 停用）
+        // ⭐️ 確保音訊引擎仍在運作（以防 iOS 在背景中斷過）
         audioManager.recoverAudioEngine()
-
-        // 恢復音訊發送
-        if inputMode == .vad {
-            audioManager.startSending()
-        }
 
         // 重啟閒置計時器
         startIdleTimer()
     }
 
-    /// 螢幕鎖定：立即斷線
+    /// 螢幕鎖定：持續錄音（background audio mode 支援）
     @MainActor
     private func handleScreenLock() {
         guard isRecording else { return }
-        print("🔒 [Lifecycle] 螢幕鎖定 → 自動斷線")
-        endCall()
+        print("🔒 [Lifecycle] 螢幕鎖定 → 持續錄音（background audio mode）")
+        // 不再自動斷線，讓用戶在鎖屏時也能持續翻譯
     }
 
     /// ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
