@@ -477,7 +477,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = attempt == 0 ? 5 : 15  // 第一次 5 秒，重試 15 秒
+            request.timeoutInterval = attempt == 0 ? 3 : 15  // 第一次 3 秒（IPv6 快速失敗），重試 15 秒
 
             do {
                 let (data, response) = try await URLSession.shared.data(for: request)
