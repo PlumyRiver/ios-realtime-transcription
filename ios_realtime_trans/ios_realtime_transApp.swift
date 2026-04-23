@@ -57,15 +57,18 @@ struct RootView: View {
     @State private var userDidLogout = false
 
     var body: some View {
-        Group {
+        // ⭐️ ZStack：ContentView 永遠存在（不因 auth 變化而銷毀重建）
+        // 登入/驗證畫面疊在上面，auth 完成後消失
+        ZStack {
+            ContentView()
+                .task { await autoSignInIfNeeded() }
+
             if authService.authState == .emailNotVerified {
                 EmailVerificationView()
+                    .transition(.opacity)
             } else if userDidLogout && authService.authState != .signedIn {
                 LoginView()
-            } else {
-                // ⭐️ ContentView 只建立一次，auth 狀態變化不會銷毀重建
-                ContentView()
-                    .task { await autoSignInIfNeeded() }
+                    .transition(.opacity)
             }
         }
         .animation(.easeInOut(duration: 0.3), value: authService.authState)
