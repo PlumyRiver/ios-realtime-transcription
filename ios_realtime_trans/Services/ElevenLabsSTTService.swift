@@ -233,19 +233,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         tokenEndpoint = "\(normalizedURL(serverURL))/elevenlabs-token"
 
-        // ⭐️ 1) 暖機 ElevenLabs WebSocket 域名的 DNS + TLS（與 token 取得並行）
-        //    這樣當 token 取得後要連 WebSocket 時，DNS+TLS 已經在 OS 快取裡
-        Task.detached(priority: .userInitiated) {
-            let warmupStart = Date()
-            var req = URLRequest(url: URL(string: "https://api.elevenlabs.io/")!)
-            req.httpMethod = "HEAD"
-            req.timeoutInterval = 15
-            let _ = try? await URLSession.shared.data(for: req)
-            let elapsed = Date().timeIntervalSince(warmupStart)
-            print("⚡️ [ElevenLabs] WS 域名 DNS+TLS 暖機完成（\(String(format: "%.2f", elapsed))秒）")
-        }
-
-        // ⭐️ 2) 取得 token（同時暖機 Cloud Run 域名的 DNS+TLS）
+        // 取得 token（暖機 DNS 延遲交給 fetchToken 的短超時+重試處理）
         tokenFetchTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { throw ElevenLabsError.invalidURL }
             print("🔄 [ElevenLabs] 背景預取 token...")
@@ -479,23 +467,35 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             throw ElevenLabsError.invalidURL
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw ElevenLabsError.tokenFetchFailed
-        }
-
+        // ⭐️ 短超時 + 重試：IPv6 不通的網路下，第一次 5 秒超時讓 OS 學到 IPv6 不通
+        // 第二次自動走 IPv4，通常 <1 秒完成
         struct TokenResponse: Decodable {
             let token: String
         }
 
-        let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
-        return tokenResponse.token
+        for attempt in 0..<2 {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.timeoutInterval = attempt == 0 ? 5 : 15  // 第一次 5 秒，重試 15 秒
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      httpResponse.statusCode == 200 else {
+                    throw ElevenLabsError.tokenFetchFailed
+                }
+                let tokenResponse = try JSONDecoder().decode(TokenResponse.self, from: data)
+                return tokenResponse.token
+            } catch {
+                if attempt == 0 {
+                    print("⚠️ [ElevenLabs] Token 第一次超時（可能 IPv6），重試...")
+                    continue
+                }
+                throw error
+            }
+        }
+        throw ElevenLabsError.tokenFetchFailed
     }
 
     /// 使用 token 連接 WebSocket
@@ -535,8 +535,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
         print("🔗 [ElevenLabs] 連接到 WebSocket: \(url)")
 
-        // 建立 URLSession
+        // 建立 URLSession（短超時避免 IPv6 卡住）
         let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10
         urlSession = URLSession(configuration: config, delegate: self, delegateQueue: .main)
 
         // 建立 WebSocket Task
