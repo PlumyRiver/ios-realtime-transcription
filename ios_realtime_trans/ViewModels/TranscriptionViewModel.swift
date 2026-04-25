@@ -545,6 +545,21 @@ final class TranscriptionViewModel {
     /// ⭐️ 最大記錄數量（避免記憶體無限增長）
     private let maxPlayedTranslationsCount = 50
 
+    // MARK: - STT Connection Health
+
+    private var sttConnectionWatchdogTimer: Timer?
+    private var sttReconnectInProgress = false
+    private var lastSTTReconnectAttempt = Date.distantPast
+    private let sttConnectionWatchdogInterval: TimeInterval = 5.0
+    private let sttReconnectCooldown: TimeInterval = 2.0
+    private enum PendingSTTEvent {
+        case audio(Data)
+        case endUtterance
+    }
+    private var pendingSTTEvents: [PendingSTTEvent] = []
+    private var pendingSTTAudioBytes = 0
+    private let maxPendingSTTAudioBytes = 2_000_000
+
     // MARK: - Streaming TTS 系統
     // ⭐️ 支援 interim 翻譯時就開始播放，避免等待 final
 
@@ -830,6 +845,8 @@ final class TranscriptionViewModel {
 
     /// ⭐️ 閒置翻譯檢查：STT 無新文字 5 秒後，掃描未翻譯的對話並重試
     private var translationIdleTimer: Timer?
+    /// ⭐️ 正在補翻完整 final 的原文，避免同一句被舊 interim 回調連續觸發多次
+    private var pendingFullRetranslationTexts: Set<String> = []
 
     /// ⭐️ 設置 App 生命週期監聽（在 init 後呼叫）
     func setupLifecycleObservers() {
@@ -888,7 +905,9 @@ final class TranscriptionViewModel {
 
         backgroundEntryTime = nil
         audioManager.recoverAudioEngine()
+        attemptSTTReconnectIfNeeded(reason: "回到前台")
         startIdleTimer()
+        startSTTConnectionWatchdog()
     }
 
     /// 螢幕鎖定
@@ -919,6 +938,189 @@ final class TranscriptionViewModel {
     func resetIdleTimer() {
         guard isRecording, !isPausedForBackground else { return }
         startIdleTimer()
+    }
+
+    /// ⭐️ 啟動 STT 連線健康檢查。
+    /// 長時間安靜、切到持續監聽或背景恢復後，WebSocket 可能已被服務端關閉；
+    /// 若 UI 仍在錄音但 STT 已斷線，音頻會被 sendAudio 丟棄，所以這裡主動重連。
+    private func startSTTConnectionWatchdog() {
+        sttConnectionWatchdogTimer?.invalidate()
+        sttConnectionWatchdogTimer = Timer.scheduledTimer(withTimeInterval: sttConnectionWatchdogInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.attemptSTTReconnectIfNeeded(reason: "連線健康檢查")
+            }
+        }
+    }
+
+    private func stopSTTConnectionWatchdog() {
+        sttConnectionWatchdogTimer?.invalidate()
+        sttConnectionWatchdogTimer = nil
+    }
+
+    @MainActor
+    private func processOutgoingAudioForSTT(_ data: Data) {
+        if isAudioSpeedUpEnabled && sttProvider != .apple {
+            if let processedData = audioTimeStretcher.process(data: data) {
+                sendOrQueueSTTAudio(processedData)
+            }
+        } else {
+            sendOrQueueSTTAudio(data)
+        }
+    }
+
+    @MainActor
+    private func sendOrQueueSTTAudio(_ data: Data) {
+        guard !data.isEmpty else { return }
+
+        switch currentSTTService.connectionState {
+        case .connected:
+            drainPendingSTTEventsIfConnected()
+            currentSTTService.sendAudio(data: data)
+        case .connecting:
+            queuePendingSTTAudio(data)
+        case .disconnected, .error:
+            queuePendingSTTAudio(data)
+            attemptSTTReconnectIfNeeded(reason: "送音前發現 STT 未連線")
+        }
+    }
+
+    @MainActor
+    private func handleEndUtterance() {
+        guard isRecording else { return }
+
+        flushAudioSpeedupForUtteranceEnd()
+
+        switch currentSTTService.connectionState {
+        case .connected:
+            drainPendingSTTEventsIfConnected()
+            currentSTTService.sendEndUtterance()
+        case .connecting:
+            queuePendingEndUtterance()
+        case .disconnected, .error:
+            queuePendingEndUtterance()
+            attemptSTTReconnectIfNeeded(reason: "結束語句前發現 STT 未連線")
+        }
+    }
+
+    @MainActor
+    private func flushAudioSpeedupForUtteranceEnd() {
+        guard isAudioSpeedUpEnabled, sttProvider != .apple else { return }
+
+        if let remainingData = audioTimeStretcher.flush(), !remainingData.isEmpty {
+            sendOrQueueSTTAudio(remainingData)
+        }
+        audioTimeStretcher.reset()
+    }
+
+    private func resetPendingSTTEvents() {
+        pendingSTTEvents.removeAll()
+        pendingSTTAudioBytes = 0
+    }
+
+    private func queuePendingSTTAudio(_ data: Data) {
+        pendingSTTEvents.append(.audio(data))
+        pendingSTTAudioBytes += data.count
+        trimPendingSTTEventsIfNeeded()
+    }
+
+    private func queuePendingEndUtterance() {
+        pendingSTTEvents.append(.endUtterance)
+        print("⏳ [STT Queue] STT 尚未連線，暫存結束語句")
+    }
+
+    private func trimPendingSTTEventsIfNeeded() {
+        guard pendingSTTAudioBytes > maxPendingSTTAudioBytes else { return }
+
+        var droppedAudioBytes = 0
+        while pendingSTTAudioBytes > maxPendingSTTAudioBytes, !pendingSTTEvents.isEmpty {
+            let removed = pendingSTTEvents.removeFirst()
+            if case .audio(let data) = removed {
+                pendingSTTAudioBytes -= data.count
+                droppedAudioBytes += data.count
+            }
+        }
+
+        if droppedAudioBytes > 0 {
+            print("⚠️ [STT Queue] 暫存音頻過大，丟棄最舊 \(droppedAudioBytes) bytes")
+        }
+    }
+
+    @MainActor
+    private func drainPendingSTTEventsIfConnected() {
+        guard currentSTTService.connectionState == .connected else { return }
+        guard !pendingSTTEvents.isEmpty else { return }
+
+        let events = pendingSTTEvents
+        let audioBytes = pendingSTTAudioBytes
+        resetPendingSTTEvents()
+
+        print("📤 [STT Queue] 補送暫存事件 \(events.count) 個（音頻 \(audioBytes) bytes）")
+        for event in events {
+            switch event {
+            case .audio(let data):
+                currentSTTService.sendAudio(data: data)
+            case .endUtterance:
+                currentSTTService.sendEndUtterance()
+            }
+        }
+    }
+
+    @MainActor
+    private func attemptSTTReconnectIfNeeded(reason: String) {
+        guard isRecording else { return }
+
+        switch currentSTTService.connectionState {
+        case .connected, .connecting:
+            return
+        case .disconnected, .error:
+            break
+        }
+
+        let now = Date()
+        guard !sttReconnectInProgress,
+              now.timeIntervalSince(lastSTTReconnectAttempt) >= sttReconnectCooldown else {
+            return
+        }
+
+        sttReconnectInProgress = true
+        lastSTTReconnectAttempt = now
+
+        let service = currentSTTService
+        let providerName = sttProvider.displayName
+        let source = sourceLang
+        let target = targetLang
+
+        print("🔄 [STT Watchdog] \(reason)：\(providerName) 已斷線，嘗試重連")
+        service.connect(serverURL: serverURL, sourceLang: source, targetLang: target)
+
+        Task { @MainActor in
+            let start = Date()
+            let timeout: TimeInterval = providerName.contains("ElevenLabs") ? 20.0 : 10.0
+
+            while Date().timeIntervalSince(start) < timeout {
+                if service.connectionState == .connected {
+                    let elapsed = Date().timeIntervalSince(start)
+                    print("✅ [STT Watchdog] \(providerName) 重連成功（\(String(format: "%.2f", elapsed))s）")
+                    self.sttReconnectInProgress = false
+                    self.drainPendingSTTEventsIfConnected()
+
+                    if self.inputMode == .vad {
+                        self.audioManager.startSending()
+                    }
+                    return
+                }
+
+                if case .error(let message) = service.connectionState {
+                    print("⚠️ [STT Watchdog] \(providerName) 重連中遇到錯誤: \(message)")
+                    break
+                }
+
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            self.sttReconnectInProgress = false
+            print("⚠️ [STT Watchdog] \(providerName) 重連尚未成功，稍後會再試")
+        }
     }
 
     // MARK: - Lock Screen Controls（鎖屏通話控制）
@@ -1256,6 +1458,9 @@ final class TranscriptionViewModel {
         }
 
         print("🔌 開始連接伺服器: \(serverURL) (使用 \(sttProvider.displayName))")
+        sttReconnectInProgress = false
+        lastSTTReconnectAttempt = .distantPast
+        resetPendingSTTEvents()
 
         // ⭐️ 根據選擇的 STT 提供商連接
         if isEconomyMode {
@@ -1311,6 +1516,7 @@ final class TranscriptionViewModel {
 
             // ⭐️ 啟動前台閒置計時器（10 分鐘無轉錄 → 自動斷線）
             startIdleTimer()
+            startSTTConnectionWatchdog()
 
             // ⭐️ 顯示雙語介紹提示（從 Firestore 讀取）
             Task {
@@ -1379,6 +1585,10 @@ final class TranscriptionViewModel {
         // ⭐️ 停止閒置計時器
         idleTimer?.invalidate()
         idleTimer = nil
+        stopSTTConnectionWatchdog()
+        sttReconnectInProgress = false
+        lastSTTReconnectAttempt = .distantPast
+        resetPendingSTTEvents()
         isPausedForBackground = false
         backgroundEntryTime = nil
 
@@ -1593,18 +1803,7 @@ final class TranscriptionViewModel {
             .sink { [weak self] data in
                 // ⭐️ 檢查是否正在錄音，避免停止後的殘留音頻被處理
                 guard let self, self.isRecording else { return }
-
-                // 🚀 音頻加速處理（1.5x，節省 33% 成本）
-                if self.isAudioSpeedUpEnabled && self.sttProvider != .apple {
-                    // 通過加速器處理（300ms 緩衝 → 200ms 輸出）
-                    if let processedData = self.audioTimeStretcher.process(data: data) {
-                        self.currentSTTService.sendAudio(data: processedData)
-                    }
-                    // 如果返回 nil，表示還在緩衝中，等待下一塊
-                } else {
-                    // 不加速，直接發送原始音頻
-                    self.currentSTTService.sendAudio(data: data)
-                }
+                self.processOutgoingAudioForSTT(data)
             }
             .store(in: &cancellables)
 
@@ -1630,11 +1829,10 @@ final class TranscriptionViewModel {
             .sink { [weak self] errorMessage in
                 guard let self, self.sttProvider == .chirp3 else { return }
                 print("❌ [Chirp3] 錯誤: \(errorMessage)")
-                self.status = .error(errorMessage)
-                // ⭐️ 連接斷開時自動停止錄音
                 if self.isRecording {
-                    print("⚠️ [Chirp3] 連接斷開，自動停止錄音")
-                    self.stopRecording()
+                    self.attemptSTTReconnectIfNeeded(reason: "Chirp3 錯誤: \(errorMessage)")
+                } else {
+                    self.status = .error(errorMessage)
                 }
             }
             .store(in: &cancellables)
@@ -1679,11 +1877,10 @@ final class TranscriptionViewModel {
             .sink { [weak self] errorMessage in
                 guard let self, self.sttProvider == .elevenLabs else { return }
                 print("❌ [ElevenLabs] 錯誤: \(errorMessage)")
-                self.status = .error(errorMessage)
-                // ⭐️ 連接斷開時自動停止錄音，避免浪費資源
                 if self.isRecording {
-                    print("⚠️ [ElevenLabs] 連接斷開，自動停止錄音")
-                    self.stopRecording()
+                    self.attemptSTTReconnectIfNeeded(reason: "ElevenLabs 錯誤: \(errorMessage)")
+                } else {
+                    self.status = .error(errorMessage)
                 }
             }
             .store(in: &cancellables)
@@ -1803,7 +2000,11 @@ final class TranscriptionViewModel {
 
         // ⭐️ PTT 結束語句回調（發送結束信號）
         audioManager.onEndUtterance = { [weak self] in
-            self?.currentSTTService.sendEndUtterance()
+            DispatchQueue.main.async {
+                Task { @MainActor in
+                    self?.handleEndUtterance()
+                }
+            }
         }
 
         // ⭐️ 訂閱即時麥克風音量（節流：只在設定頁面開啟時更新）
@@ -1902,6 +2103,55 @@ final class TranscriptionViewModel {
         return false
     }
 
+    /// 判斷某次翻譯使用的原文是否完整覆蓋目前 final 原文。
+    /// 這裡會忽略標點和空白，但保留數字與文字；例如最後的「30元」不能被 90% 覆蓋率放過。
+    private func translationSourceCoversFinalText(sourceText: String, finalText: String) -> Bool {
+        let normalizedSource = normalizeTextForComparison(sourceText)
+        let normalizedFinal = normalizeTextForComparison(finalText)
+        guard !normalizedFinal.isEmpty else { return true }
+        guard !normalizedSource.isEmpty else { return false }
+        return normalizedSource == normalizedFinal
+    }
+
+    private func translationSegmentsCoverFinalText(_ segments: [TranslationSegment]?, finalText: String) -> Bool {
+        guard let segments, !segments.isEmpty else { return false }
+        let combinedOriginal = segments.map { $0.original }.joined()
+        return translationSourceCoversFinalText(sourceText: combinedOriginal, finalText: finalText)
+    }
+
+    private func preservedTranslationCoversFinalText(
+        sourceText: String?,
+        segments: [TranslationSegment]?,
+        finalText: String
+    ) -> Bool {
+        if let segments, !segments.isEmpty {
+            return translationSegmentsCoverFinalText(segments, finalText: finalText)
+        }
+        guard let sourceText else { return false }
+        return translationSourceCoversFinalText(sourceText: sourceText, finalText: finalText)
+    }
+
+    private func requestFullRetranslationIfNeeded(for text: String, reason: String) {
+        let normalized = normalizeTextForComparison(text)
+        guard !normalized.isEmpty else { return }
+
+        if pendingFullRetranslationTexts.contains(normalized) {
+            print("⏳ [完整補翻] 已在處理中，跳過重複請求: \(reason)")
+            return
+        }
+
+        pendingFullRetranslationTexts.insert(normalized)
+        print("🔄 [完整補翻] \(reason): \"\(text.prefix(40))...\"")
+
+        Task { [weak self] in
+            guard let self else { return }
+            await self.elevenLabsService.retranslateText(text)
+            await MainActor.run {
+                _ = self.pendingFullRetranslationTexts.remove(normalized)
+            }
+        }
+    }
+
     /// 處理轉錄結果
     private func handleTranscript(_ transcript: TranscriptMessage) {
         // ⭐️ 記錄收到 transcript 的時間（用於 TTS 播放前檢查）
@@ -1916,6 +2166,7 @@ final class TranscriptionViewModel {
             // ⭐️ 修復：合併時保留被移除 transcript 的翻譯
             var removedTranslation: String? = nil
             var removedTranslationSegments: [TranslationSegment]? = nil
+            var lastTranscriptTextBeforeMerge: String? = nil
 
             // ⭐️ 檢查新句子是否是上一句的「延續」（ElevenLabs 分段問題）
             // 例如：
@@ -1955,6 +2206,7 @@ final class TranscriptionViewModel {
                     // ⭐️ 修復：在移除前保留翻譯（避免翻譯丟失）
                     removedTranslation = lastTranscript.translation
                     removedTranslationSegments = lastTranscript.translationSegments
+                    lastTranscriptTextBeforeMerge = lastTranscript.text
 
                     // ⭐️ 替換而不是刪除：更新最後一個 transcript
                     transcripts.removeLast()
@@ -1973,43 +2225,65 @@ final class TranscriptionViewModel {
             // 其次使用 interim 翻譯，最後使用被移除 transcript 的翻譯
             let preservedTranslation: String?
             let preservedTranslationSegments: [TranslationSegment]?
+            let preservedTranslationSourceText: String?
 
             if let ownTranslation = transcript.translation, !ownTranslation.isEmpty {
                 // ⭐️ transcript 自帶翻譯（從 ElevenLabs 分句場景帶過來的）最精確
                 preservedTranslation = ownTranslation
                 preservedTranslationSegments = transcript.translationSegments
+                preservedTranslationSourceText = transcript.text
             } else if let interimTranslation = interimTranscript?.translation, !interimTranslation.isEmpty {
                 preservedTranslation = interimTranslation
                 preservedTranslationSegments = interimTranscript?.translationSegments
+                preservedTranslationSourceText = interimTranscript?.text
             } else if let removed = removedTranslation, !removed.isEmpty {
                 preservedTranslation = removed
                 preservedTranslationSegments = removedTranslationSegments
+                preservedTranslationSourceText = lastTranscriptTextBeforeMerge
             } else {
                 preservedTranslation = transcript.translation
                 preservedTranslationSegments = transcript.translationSegments
+                preservedTranslationSourceText = transcript.text
             }
+
+            var finalNeedsFullRetranslation = false
 
             if let translation = preservedTranslation, !translation.isEmpty {
                 finalTranscript.translation = translation
                 finalTranscript.translationSegments = preservedTranslationSegments
                 print("✅ [Final] 保留翻譯: \"\(translation.prefix(30))...\"")
 
-                // ⭐️ TTS 保障：檢查這個翻譯是否已經在等待播放
-                let normalizedTranslation = normalizeTextForComparison(translation)
-                let isAlreadyPending = pendingTTS != nil && normalizeTextForComparison(pendingTTS!.text) == normalizedTranslation
-                let isAlreadyQueued = ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedTranslation })
-                let isAlreadyPlayed = playedTranslations.contains(normalizedTranslation)
+                if !preservedTranslationCoversFinalText(
+                    sourceText: preservedTranslationSourceText,
+                    segments: preservedTranslationSegments,
+                    finalText: finalTranscript.text
+                ) {
+                    finalNeedsFullRetranslation = true
+                    print("⚠️ [Final] 保留翻譯來源未覆蓋完整 final，稍後補翻完整句")
+                    print("   翻譯來源: \"\((preservedTranslationSourceText ?? "segments").prefix(35))...\"")
+                    print("   final: \"\(finalTranscript.text.prefix(45))...\"")
+                }
 
-                if !isAlreadyPending && !isAlreadyQueued && !isAlreadyPlayed {
-                    // ⭐️ 翻譯還沒觸發過 TTS，現在補播
-                    let detectedLanguage = interimTranscript?.language ?? finalTranscript.language
-                    if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
-                        let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
-                        print("🔧 [TTS 保障] 補播翻譯: \"\(translation.prefix(25))...\"")
-                        enqueueTTS(text: translation, languageCode: targetLangCode)
-                    }
+                if finalNeedsFullRetranslation {
+                    print("⏸️ [TTS 保障] 暫不播放舊翻譯，等待完整補翻")
                 } else {
-                    print("ℹ️ [TTS] 翻譯已在處理中: pending=\(isAlreadyPending), queued=\(isAlreadyQueued), played=\(isAlreadyPlayed)")
+                    // ⭐️ TTS 保障：檢查這個翻譯是否已經在等待播放
+                    let normalizedTranslation = normalizeTextForComparison(translation)
+                    let isAlreadyPending = pendingTTS != nil && normalizeTextForComparison(pendingTTS!.text) == normalizedTranslation
+                    let isAlreadyQueued = ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalizedTranslation })
+                    let isAlreadyPlayed = playedTranslations.contains(normalizedTranslation)
+
+                    if !isAlreadyPending && !isAlreadyQueued && !isAlreadyPlayed {
+                        // ⭐️ 翻譯還沒觸發過 TTS，現在補播
+                        let detectedLanguage = interimTranscript?.language ?? finalTranscript.language
+                        if shouldPlayTTSForMode(detectedLanguage: detectedLanguage) {
+                            let targetLangCode = getTargetLanguageCode(detectedLanguage: detectedLanguage)
+                            print("🔧 [TTS 保障] 補播翻譯: \"\(translation.prefix(25))...\"")
+                            enqueueTTS(text: translation, languageCode: targetLangCode)
+                        }
+                    } else {
+                        print("ℹ️ [TTS] 翻譯已在處理中: pending=\(isAlreadyPending), queued=\(isAlreadyQueued), played=\(isAlreadyPlayed)")
+                    }
                 }
             }
 
@@ -2025,9 +2299,9 @@ final class TranscriptionViewModel {
             // ElevenLabs 側已在 VAD commit 時觸發翻譯，這裡只補漏
             if finalTranscript.translation?.isEmpty != false {
                 let finalText = finalTranscript.text
-                Task {
-                    await self.elevenLabsService.retranslateText(finalText)
-                }
+                requestFullRetranslationIfNeeded(for: finalText, reason: "final 無翻譯")
+            } else if finalNeedsFullRetranslation {
+                requestFullRetranslationIfNeeded(for: finalTranscript.text, reason: "final 翻譯未覆蓋最後文字")
             }
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
@@ -2239,20 +2513,26 @@ final class TranscriptionViewModel {
             return true
         }) {
             detectedLanguage = transcripts[index].language
+            let finalText = transcripts[index].text
+            let coversFullFinal = translationSourceCoversFinalText(sourceText: sourceText, finalText: finalText)
+
+            guard coversFullFinal else {
+                print("⏭️ [翻譯匹配] 舊 interim 翻譯只覆蓋 final 前段，拒絕套用")
+                print("   sourceText: \"\(sourceText.prefix(40))...\"")
+                print("   finalText: \"\(finalText.prefix(50))...\"")
+                requestFullRetranslationIfNeeded(for: finalText, reason: "收到前段翻譯但 final 已變長")
+                return
+            }
+
             // ⭐️ 模糊匹配時的覆蓋策略：
-            // - 無翻譯 → 直接填入
-            // - 有翻譯但 sourceText 覆蓋 ≥ 80% transcript → 允許覆蓋（retranslation 場景）
-            // - 有翻譯且 sourceText 覆蓋 < 80% → 跳過（避免短翻譯覆蓋完整翻譯）
+            // 只允許已覆蓋完整 final 的翻譯更新，避免最後幾個字（如「30元」）被舊翻譯吃掉
             let hasExisting = transcripts[index].translation != nil && !transcripts[index].translation!.isEmpty
-            let coverageRatio = Double(sourceText.count) / Double(max(transcripts[index].text.count, 1))
             if !hasExisting {
                 transcripts[index].translation = translatedText
-                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（無翻譯，填入）")
-            } else if coverageRatio >= 0.8 {
-                transcripts[index].translation = translatedText
-                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（覆蓋率\(Int(coverageRatio*100))%，更新翻譯）")
+                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（完整覆蓋，填入）")
             } else {
-                print("ℹ️ [翻譯匹配] 模糊匹配到 transcripts[\(index)]，覆蓋率\(Int(coverageRatio*100))%不足，跳過")
+                transcripts[index].translation = translatedText
+                print("✅ [翻譯匹配] 模糊匹配到 transcripts[\(index)]（完整覆蓋，更新翻譯）")
             }
             matchedFinal = true
         }
@@ -2376,10 +2656,18 @@ final class TranscriptionViewModel {
     private func retryMissingTranslations() {
         guard isRecording else { return }
         // 只看最後一筆
-        if let last = transcripts.last,
-           last.translation?.isEmpty != false {
-            print("🔄 [閒置檢查] 最後一句無翻譯: \"\(last.text.prefix(40))...\"")
-            Task { await elevenLabsService.retranslateText(last.text) }
+        if let last = transcripts.last {
+            let missingTranslation = last.translation?.isEmpty != false
+            let incompleteSegments = last.translationSegments != nil &&
+                !translationSegmentsCoverFinalText(last.translationSegments, finalText: last.text)
+
+            guard missingTranslation || incompleteSegments else { return }
+
+            print("🔄 [閒置檢查] 最後一句需要補翻: \"\(last.text.prefix(40))...\"")
+            requestFullRetranslationIfNeeded(
+                for: last.text,
+                reason: incompleteSegments ? "閒置檢查發現分句未覆蓋完整 final" : "閒置檢查發現最後一句無翻譯"
+            )
         }
     }
 
@@ -2398,6 +2686,12 @@ final class TranscriptionViewModel {
 
         // ⭐️ 先嘗試精確匹配 transcripts
         if let index = transcripts.firstIndex(where: { $0.text == sourceText }) {
+            guard translationSegmentsCoverFinalText(segments, finalText: sourceText) else {
+                print("⏭️ [分句翻譯] 精確 sourceText 但分句原文未覆蓋完整 final，改補翻完整句")
+                requestFullRetranslationIfNeeded(for: sourceText, reason: "分句原文缺少 final 尾段")
+                return
+            }
+
             let existingTranslation = transcripts[index].translation
             if existingTranslation == nil || existingTranslation?.isEmpty == true {
                 shouldPlayTTS = true
@@ -2424,14 +2718,23 @@ final class TranscriptionViewModel {
             detectedLanguage = transcripts[index].language
             // ⭐️ 同 handleTranslation 的覆蓋策略
             let hasExisting = transcripts[index].translation != nil && !transcripts[index].translation!.isEmpty
-            let coverageRatio = Double(sourceText.count) / Double(max(transcripts[index].text.count, 1))
-            if !hasExisting || coverageRatio >= 0.8 {
+            let finalText = transcripts[index].text
+            let coversFullFinal = translationSourceCoversFinalText(sourceText: sourceText, finalText: finalText) ||
+                translationSegmentsCoverFinalText(segments, finalText: finalText)
+
+            guard coversFullFinal else {
+                print("⏭️ [分句翻譯] 舊分句只覆蓋 final 前段，拒絕套用")
+                print("   sourceText: \"\(sourceText.prefix(40))...\"")
+                print("   finalText: \"\(finalText.prefix(50))...\"")
+                requestFullRetranslationIfNeeded(for: finalText, reason: "分句翻譯未覆蓋完整 final")
+                return
+            }
+
+            if !hasExisting || coversFullFinal {
                 if !hasExisting { shouldPlayTTS = true }
                 transcripts[index].translationSegments = segments
                 transcripts[index].translation = segments.map { $0.translation }.joined(separator: " ")
-                print("✅ [分句翻譯] 模糊匹配到 transcripts[\(index)]（覆蓋\(Int(coverageRatio*100))%）")
-            } else {
-                print("ℹ️ [分句翻譯] 模糊匹配到 transcripts[\(index)]，覆蓋率\(Int(coverageRatio*100))%不足，跳過")
+                print("✅ [分句翻譯] 模糊匹配到 transcripts[\(index)]（完整覆蓋）")
             }
         }
         // ⭐️ 匹配 interimTranscript

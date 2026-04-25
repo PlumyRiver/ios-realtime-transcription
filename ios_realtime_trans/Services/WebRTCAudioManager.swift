@@ -268,6 +268,16 @@ final class WebRTCAudioManager: NSObject {
     private var sendCount = 0
     private let maxChunkSize = 25600
 
+    // MARK: - Recording Health Monitor
+
+    /// 最後一次從 WebRTC tap 收到音頻 buffer 的時間。
+    /// 錄音中即使是靜音也應該持續收到 buffer；太久沒收到代表 engine/tap 已經失效。
+    private var lastInputBufferTime: Date?
+    private var audioHealthTimer: Timer?
+    private var isRecoveringAudioEngine = false
+    private let audioHealthCheckInterval: TimeInterval = 1.0
+    private let audioInputStallThreshold: TimeInterval = 3.0
+
     // MARK: - PTT 尾音緩衝（放開按鈕後繼續發送 0.5 秒）
 
     /// ⭐️ PTT 尾音緩衝計時器
@@ -421,7 +431,22 @@ final class WebRTCAudioManager: NSObject {
 
     /// ⭐️ 恢復音訊引擎（中斷結束或設備變更後呼叫）
     func recoverAudioEngine() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.recoverAudioEngine()
+            }
+            return
+        }
         guard recordingState == .recording else { return }
+        guard !isRecoveringAudioEngine else {
+            print("ℹ️ [Audio] 已在恢復音訊引擎，略過重複請求")
+            return
+        }
+
+        isRecoveringAudioEngine = true
+        defer { isRecoveringAudioEngine = false }
+
+        let wasManualSendingPaused = isManualSendingPaused
 
         // 重新啟動音訊會話
         let rtcAudioSession = RTCAudioSession.sharedInstance()
@@ -433,6 +458,8 @@ final class WebRTCAudioManager: NSObject {
         }
         rtcAudioSession.unlockForConfiguration()
 
+        stopBufferTimer()
+
         // 重新啟動錄音（WebRTC audioDeviceModule 會重建引擎和 tap）
         let stopResult = audioDeviceModule.stopRecording()
         print("🔄 [Audio] 停止舊錄音: \(stopResult)")
@@ -443,8 +470,11 @@ final class WebRTCAudioManager: NSObject {
         let startResult = audioDeviceModule.startRecording()
         print("🔄 [Audio] 重新啟動錄音: \(startResult)")
 
+        lastInputBufferTime = Date()
+        startBufferTimer()
         resetVADState()
-        print("✅ [Audio] 音訊引擎恢復完成")
+        isManualSendingPaused = wasManualSendingPaused
+        print("✅ [Audio] 音訊引擎恢復完成（送音狀態: \(isManualSendingPaused ? "暫停" : "啟用")）")
     }
 
     // MARK: - WebRTC Setup
@@ -602,7 +632,9 @@ final class WebRTCAudioManager: NSObject {
         }
 
         // 啟動緩衝區定時器
+        lastInputBufferTime = Date()
         startBufferTimer()
+        startAudioHealthMonitor()
 
         // ⭐️ 重置 VAD 狀態
         resetVADState()
@@ -637,6 +669,8 @@ final class WebRTCAudioManager: NSObject {
         pttTrailingTimer = nil
         isTrailingBuffer = false
 
+        stopAudioHealthMonitor()
+        lastInputBufferTime = nil
         stopBufferTimer()
         flushBuffer()
 
@@ -665,6 +699,8 @@ final class WebRTCAudioManager: NSObject {
 
     /// 處理從 tap 接收的音頻數據
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        lastInputBufferTime = Date()
+
         // ⭐️ 如果有設定麥克風增益，先放大音頻
         if microphoneGain > 1.0 {
             amplifyInputBuffer(buffer, gain: microphoneGain)
@@ -1385,6 +1421,7 @@ final class WebRTCAudioManager: NSObject {
     // MARK: - Buffer Management
 
     private func startBufferTimer() {
+        stopBufferTimer()
         bufferTimer = Timer.scheduledTimer(withTimeInterval: bufferInterval, repeats: true) { [weak self] _ in
             self?.flushBuffer()
         }
@@ -1393,6 +1430,37 @@ final class WebRTCAudioManager: NSObject {
     private func stopBufferTimer() {
         bufferTimer?.invalidate()
         bufferTimer = nil
+    }
+
+    private func startAudioHealthMonitor() {
+        stopAudioHealthMonitor()
+        audioHealthTimer = Timer.scheduledTimer(withTimeInterval: audioHealthCheckInterval, repeats: true) { [weak self] _ in
+            self?.checkAudioInputHealth()
+        }
+    }
+
+    private func stopAudioHealthMonitor() {
+        audioHealthTimer?.invalidate()
+        audioHealthTimer = nil
+    }
+
+    private func checkAudioInputHealth() {
+        guard recordingState == .recording else { return }
+        guard !isRecoveringAudioEngine else { return }
+
+        let now = Date()
+        let lastBufferAge = now.timeIntervalSince(lastInputBufferTime ?? now)
+        let isTapMissing = tapMixerNode == nil
+
+        guard isTapMissing || lastBufferAge >= audioInputStallThreshold else { return }
+
+        if isTapMissing {
+            print("⚠️ [AudioHealth] 錄音中但 tap 已失效，嘗試恢復")
+        } else {
+            print("⚠️ [AudioHealth] 錄音中 \(String(format: "%.1f", lastBufferAge))s 未收到音頻 buffer，嘗試恢復")
+        }
+
+        recoverAudioEngine()
     }
 
     private func flushBuffer() {

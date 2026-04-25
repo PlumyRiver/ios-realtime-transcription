@@ -159,126 +159,166 @@ struct ContentView: View {
 struct ConversationListView: View, Equatable {
     var viewModel: TranscriptionViewModel
     @State private var isUserScrolledUp = false
+    @State private var hasUserInteractedWithScroll = false
+
+    private let bottomAnchorId = "bottomAnchor"
+    private let bottomDetectionThreshold: CGFloat = 72
 
     private static var bodyCount = 0
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.viewModel === rhs.viewModel
     }
 
+    private var scrollContentSignature: String {
+        let last = viewModel.transcripts.last
+        let lastSegmentsCount = last?.translationSegments?.count ?? 0
+        let interim = viewModel.interimTranscript
+        let interimSegmentsCount = interim?.translationSegments?.count ?? 0
+
+        var signature = "\(viewModel.transcripts.count)"
+        signature += "|\(last?.id.uuidString ?? "")"
+        signature += "|\(last?.text ?? "")"
+        signature += "|\(last?.translation ?? "")"
+        signature += "|\(lastSegmentsCount)"
+        signature += "|\(interim?.id.uuidString ?? "")"
+        signature += "|\(interim?.text ?? "")"
+        signature += "|\(interim?.translation ?? "")"
+        signature += "|\(interimSegmentsCount)"
+        return signature
+    }
+
     var body: some View {
         let _ = { Self.bodyCount += 1; print("⏱️ [ConversationList.body] 第 \(Self.bodyCount) 次, transcripts=\(viewModel.transcripts.count)") }()
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    ForEach(viewModel.transcripts) { transcript in
-                        ConversationBubbleView(
-                            transcript: transcript,
-                            sourceLang: viewModel.sourceLang,
-                            targetLang: viewModel.targetLang,
-                            onPlayTTS: { text, langCode in
-                                viewModel.playTTSImmediately(text: text, languageCode: langCode)
-                            },
-                            onStopTTS: {
-                                viewModel.skipCurrentTTS()
-                            },
-                            currentPlayingText: viewModel.currentPlayingTTSText,
-                            onDelete: {
-                                viewModel.deleteTranscript(id: transcript.id)
-                            },
-                            onEditTapped: {
-                                viewModel.startEditing(transcript: transcript)
-                            }
-                        )
-                        .id(transcript.id)
-                    }
+        GeometryReader { scrollGeometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(viewModel.transcripts) { transcript in
+                            ConversationBubbleView(
+                                transcript: transcript,
+                                sourceLang: viewModel.sourceLang,
+                                targetLang: viewModel.targetLang,
+                                onPlayTTS: { text, langCode in
+                                    viewModel.playTTSImmediately(text: text, languageCode: langCode)
+                                },
+                                onStopTTS: {
+                                    viewModel.skipCurrentTTS()
+                                },
+                                currentPlayingText: viewModel.currentPlayingTTSText,
+                                onDelete: {
+                                    viewModel.deleteTranscript(id: transcript.id)
+                                },
+                                onEditTapped: {
+                                    viewModel.startEditing(transcript: transcript)
+                                }
+                            )
+                            .id(transcript.id)
+                        }
 
-                    if let interim = viewModel.interimTranscript {
-                        ConversationBubbleView(
-                            transcript: interim,
-                            sourceLang: viewModel.sourceLang,
-                            targetLang: viewModel.targetLang,
-                            onPlayTTS: { text, langCode in
-                                viewModel.playTTSImmediately(text: text, languageCode: langCode)
-                            },
-                            onStopTTS: {
-                                viewModel.skipCurrentTTS()
-                            },
-                            currentPlayingText: viewModel.currentPlayingTTSText
-                        )
-                        .id("interim")
-                    }
+                        if let interim = viewModel.interimTranscript {
+                            ConversationBubbleView(
+                                transcript: interim,
+                                sourceLang: viewModel.sourceLang,
+                                targetLang: viewModel.targetLang,
+                                onPlayTTS: { text, langCode in
+                                    viewModel.playTTSImmediately(text: text, languageCode: langCode)
+                                },
+                                onStopTTS: {
+                                    viewModel.skipCurrentTTS()
+                                },
+                                currentPlayingText: viewModel.currentPlayingTTSText
+                            )
+                            .id("interim")
+                        }
 
-                    Color.clear
-                        .frame(height: 1)
-                        .id("bottomAnchor")
-                }
-                .padding()
-                .background(
-                    GeometryReader { geometry in
                         Color.clear
-                            .preference(
-                                key: ScrollOffsetPreferenceKey.self,
-                                value: geometry.frame(in: .named("scrollView")).maxY
+                            .frame(height: 1)
+                            .id(bottomAnchorId)
+                            .background(
+                                GeometryReader { geometry in
+                                    Color.clear
+                                        .preference(
+                                            key: ScrollOffsetPreferenceKey.self,
+                                            value: geometry.frame(in: .named("conversationScroll")).maxY
+                                        )
+                                }
                             )
                     }
+                    .padding()
+                }
+                .coordinateSpace(name: "conversationScroll")
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 4)
+                        .onChanged { _ in
+                            hasUserInteractedWithScroll = true
+                        }
                 )
-            }
-            .coordinateSpace(name: "scrollView")
-            .simultaneousGesture(
-                DragGesture()
-                    .onChanged { value in
-                        if value.translation.height > 30 {
-                            if !isUserScrolledUp {
-                                isUserScrolledUp = true
-                                print("📜 [Scroll] 用戶開始查看舊訊息")
+                .onPreferenceChange(ScrollOffsetPreferenceKey.self) { bottomMaxY in
+                    updateScrollState(bottomMaxY: bottomMaxY, viewportHeight: scrollGeometry.size.height)
+                }
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
+                }
+                .onChange(of: scrollContentSignature) { _, _ in
+                    guard !isUserScrolledUp else { return }
+                    scrollToBottom(proxy)
+                }
+                .overlay(alignment: .bottom) {
+                    if isUserScrolledUp {
+                        Button {
+                            isUserScrolledUp = false
+                            hasUserInteractedWithScroll = false
+                            scrollToBottom(proxy)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("新訊息")
+                                    .font(.system(size: 15, weight: .medium))
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 14, weight: .semibold))
                             }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 22)
+                            .padding(.vertical, 10)
+                            .background(
+                                Capsule()
+                                    .fill(Color.black.opacity(0.6))
+                            )
                         }
+                        .padding(.bottom, 12)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
                     }
-            )
-            .onChange(of: viewModel.transcripts.count) { _, _ in
-                guard !isUserScrolledUp else { return }
-                if let lastId = viewModel.transcripts.last?.id {
-                    withAnimation { proxy.scrollTo(lastId, anchor: .bottom) }
                 }
             }
-            .onChange(of: viewModel.interimTranscript) { _, _ in
-                guard !isUserScrolledUp else { return }
-                withAnimation { proxy.scrollTo("interim", anchor: .bottom) }
+        }
+    }
+
+    private func updateScrollState(bottomMaxY: CGFloat, viewportHeight: CGFloat) {
+        guard viewportHeight > 0 else { return }
+
+        let isNearBottom = bottomMaxY <= viewportHeight + bottomDetectionThreshold
+        if isNearBottom {
+            if isUserScrolledUp {
+                print("📜 [Scroll] 已回到底部")
             }
-            .overlay(alignment: .bottom) {
-                if isUserScrolledUp {
-                    Button {
-                        isUserScrolledUp = false
-                        withAnimation {
-                            if viewModel.interimTranscript != nil {
-                                proxy.scrollTo("interim", anchor: .bottom)
-                            } else if let lastId = viewModel.transcripts.last?.id {
-                                proxy.scrollTo(lastId, anchor: .bottom)
-                            } else {
-                                proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 14, weight: .semibold))
-                            Text("新訊息")
-                                .font(.system(size: 15, weight: .medium))
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 14, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule()
-                                .fill(Color.black.opacity(0.6))
-                        )
-                    }
-                    .padding(.bottom, 12)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                    .animation(.easeOut(duration: 0.2), value: isUserScrolledUp)
+            isUserScrolledUp = false
+            hasUserInteractedWithScroll = false
+        } else if hasUserInteractedWithScroll, !isUserScrolledUp {
+            isUserScrolledUp = true
+            print("📜 [Scroll] 用戶開始查看舊訊息")
+        }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.22)) {
+                    proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                 }
+            } else {
+                proxy.scrollTo(bottomAnchorId, anchor: .bottom)
             }
         }
     }

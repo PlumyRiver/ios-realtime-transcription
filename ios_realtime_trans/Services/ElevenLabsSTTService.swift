@@ -936,6 +936,17 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
         return result
     }
 
+    /// 檢查分句原文是否完整覆蓋 final 原文。
+    /// 覆蓋率門檻不能用 90%，因為最後漏掉「30元」這種短尾巴也必須補翻。
+    private func translationSegmentsCoverFinalText(_ segments: [TranslationSegment]?, finalText: String) -> Bool {
+        guard let segments, !segments.isEmpty else { return false }
+        let normalizedSegments = normalizeTextForComparison(segments.map { $0.original }.joined())
+        let normalizedFinal = normalizeTextForComparison(finalText)
+        guard !normalizedFinal.isEmpty else { return true }
+        guard !normalizedSegments.isEmpty else { return false }
+        return normalizedSegments == normalizedFinal
+    }
+
     /// 計算兩個字符串的相似度（Jaccard similarity）
     private func calculateTextSimilarity(_ s1: String, _ s2: String) -> Double {
         guard !s1.isEmpty && !s2.isEmpty else { return 0 }
@@ -1187,7 +1198,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             let combined = allSegments.map { $0.translation }.joined(separator: " ")
             if !combined.isEmpty && !isErrorPlaceholder(combined) {
                 bestTranslation = combined
-                if allSegments.count > 1 { bestSegments = allSegments }
+                bestSegments = allSegments
                 print("   🌐 [自動 Final] 使用累積翻譯(\(allSegments.count)段): \(combined.prefix(40))...")
             }
         }
@@ -1204,6 +1215,9 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             if !pendingSegments.isEmpty && normalizedPending == normalizedTranscript,
                let validTranslation = getValidTranslationFromPending() {
                 bestTranslation = validTranslation
+                bestSegments = pendingSegments.map {
+                    TranslationSegment(original: $0.original, translation: $0.translation, isComplete: true)
+                }
                 print("   🌐 [自動 Final] 使用 pending 翻譯: \(validTranslation.prefix(40))...")
             }
         }
@@ -1233,10 +1247,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             // ⭐️ 修復：檢查翻譯是否覆蓋完整文本
             // 分句翻譯通常基於舊版 interim（比如「你好怎」），但 final 文本已經是「你好怎麼樣」
             // 如果分句原文沒有完全覆蓋 final 文本，必須重新翻譯完整文本
-            let segCoverage = (bestSegments ?? []).reduce(0) { $0 + $1.original.count }
-            let coverageRatio = transcriptText.isEmpty ? 1.0 : Double(segCoverage) / Double(transcriptText.count)
-            if coverageRatio < 0.9 {
-                print("   🌐 [自動 Final] 翻譯覆蓋不完整(\(Int(coverageRatio*100))%)，重新翻譯完整文本")
+            if !translationSegmentsCoverFinalText(bestSegments, finalText: transcriptText) {
+                let coveredText = bestSegments?.map { $0.original }.joined() ?? ""
+                print("   🌐 [自動 Final] 翻譯來源未覆蓋 final，重新翻譯完整文本")
+                print("      covered: \"\(coveredText.prefix(40))...\"")
+                print("      final: \"\(transcriptText.prefix(45))...\"")
                 Task {
                     await self.translateAndSendFinal(transcriptText)
                 }
@@ -1791,6 +1806,27 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
             throw TranslationError.emptyResult
         }
 
+        let coverageSegments = response.segments.compactMap { segment -> TranslationSegment? in
+            guard let translation = segment.translation,
+                  !translation.isEmpty,
+                  !isErrorPlaceholder(translation) else {
+                return nil
+            }
+            return TranslationSegment(
+                original: segment.original,
+                translation: translation,
+                isComplete: segment.isComplete
+            )
+        }
+
+        guard translationSegmentsCoverFinalText(coverageSegments, finalText: text) else {
+            let coveredText = coverageSegments.map { $0.original }.joined()
+            print("⚠️ [Smart-Translate] 回應未覆蓋完整請求，重試")
+            print("   covered: \"\(coveredText.prefix(40))...\"")
+            print("   text: \"\(text.prefix(45))...\"")
+            throw TranslationError.emptyResult
+        }
+
         return translations.joined(separator: " ")
     }
 
@@ -2125,11 +2161,11 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
                     allSegments.map { $0.translation }.joined(separator: " ")
 
                 // ⭐️ Step 3: 檢查翻譯是否覆蓋完整文本
-                // 覆蓋率門檻設 90%：確保最後幾個字也被翻譯到
-                let segmentsCoverage = allSegments.reduce(0) { $0 + $1.original.count }
+                // 必須完整覆蓋 final 原文，避免短尾巴（如「30元」）因覆蓋率高而被略過
+                let segmentsCoverFinal = translationSegmentsCoverFinalText(allSegments, finalText: transcriptText)
                 let needsRetranslation = combinedTranslation == nil ||
                     combinedTranslation?.isEmpty == true ||
-                    segmentsCoverage < transcriptText.count * 90 / 100  // 覆蓋率 < 90% 需重翻
+                    !segmentsCoverFinal
 
                 // ⭐️ Step 4: 發送一個完整的 final transcript
                 var finalTranscript = TranscriptMessage(
@@ -2143,7 +2179,7 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
                 if let translation = combinedTranslation, !translation.isEmpty {
                     finalTranscript.translation = translation
-                    if allSegments.count > 1 {
+                    if !allSegments.isEmpty {
                         finalTranscript.translationSegments = allSegments
                     }
                 }
@@ -2163,7 +2199,10 @@ final class ElevenLabsSTTService: NSObject, WebSocketServiceProtocol {
 
                 // ⭐️ Step 5: 如果翻譯覆蓋不足或為空，觸發重新翻譯
                 if needsRetranslation {
-                    print("🔄 [VAD Commit] 翻譯覆蓋不足(覆蓋\(segmentsCoverage)/\(transcriptText.count)字)，觸發重新翻譯")
+                    let coveredText = allSegments.map { $0.original }.joined()
+                    print("🔄 [VAD Commit] 翻譯來源未覆蓋 final，觸發重新翻譯")
+                    print("   covered: \"\(coveredText.prefix(40))...\"")
+                    print("   final: \"\(transcriptText.prefix(45))...\"")
                     Task {
                         await self.translateAndSendFinal(transcriptText)
                     }
