@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UIKit
+import Combine
 
 /// ⭐️ 用於追蹤 ScrollView 滾動位置的 PreferenceKey
 struct ScrollOffsetPreferenceKey: PreferenceKey {
@@ -655,6 +656,115 @@ struct TypingIndicator: View {
     }
 }
 
+// MARK: - Live Recording Waveform
+
+struct LiveRecordingWaveformView: View {
+    let volumePublisher: AnyPublisher<Float, Never>
+    let isActive: Bool
+    let tint: Color
+
+    @State private var level: Float = 0
+
+    private let barCount = 46
+    private let barWidth: CGFloat = 2.5
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isActive ? "mic.fill" : "mic")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(isActive ? tint : .secondary)
+                .frame(width: 20)
+
+            VoiceWaveformBars(
+                level: isActive ? level : 0,
+                isActive: isActive,
+                tint: tint,
+                barCount: barCount,
+                barWidth: barWidth
+            )
+        }
+        .frame(height: 42)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(.secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(tint.opacity(isActive ? 0.22 : 0.10), lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(isActive ? "麥克風正在收音" : "麥克風待命")
+        .onReceive(
+            volumePublisher
+                .throttle(for: .milliseconds(120), scheduler: RunLoop.main, latest: true)
+        ) { volume in
+            level = isActive ? volume : 0
+        }
+        .onChange(of: isActive) { _, newValue in
+            if !newValue {
+                level = 0
+            }
+        }
+        .onDisappear {
+            level = 0
+        }
+    }
+}
+
+private struct VoiceWaveformBars: View {
+    let level: Float
+    let isActive: Bool
+    let tint: Color
+    let barCount: Int
+    let barWidth: CGFloat
+
+    private var normalizedLevel: CGFloat {
+        let clamped = min(max(CGFloat(level), 0), 1)
+        guard isActive else { return 0 }
+        return max(0.04, CGFloat(pow(Double(clamped), 0.55)))
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(), by: 1.0 / 24.0)) { timeline in
+            Canvas { context, size in
+                let centerY = size.height / 2
+                let spacing = size.width / CGFloat(max(barCount, 1))
+                let maxHeight = max(size.height - 8, 1)
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                let level = normalizedLevel
+
+                for index in 0..<barCount {
+                    let progress = CGFloat(index) / CGFloat(max(barCount - 1, 1))
+                    let envelope = 0.34 + 0.66 * sin(progress * .pi)
+                    let travel = CGFloat((sin(time * 4.2 + Double(index) * 0.48) + 1) / 2)
+                    let flicker = CGFloat((sin(time * 7.1 + Double(index) * 1.37) + 1) / 2)
+                    let movement = 0.42 + 0.38 * travel + 0.20 * flicker
+                    let quietHeight: CGFloat = isActive ? 0.08 : 0.035
+                    let response = min(1, level * 1.55)
+                    let heightRatio = min(1, quietHeight + response * envelope * movement)
+                    let height = max(3, maxHeight * heightRatio)
+                    let x = spacing * (CGFloat(index) + 0.5)
+                    let rect = CGRect(
+                        x: x - barWidth / 2,
+                        y: centerY - height / 2,
+                        width: barWidth,
+                        height: height
+                    )
+
+                    var path = Path()
+                    path.addRoundedRect(
+                        in: rect,
+                        cornerSize: CGSize(width: barWidth, height: barWidth),
+                        style: .continuous
+                    )
+                    context.fill(path, with: .color(tint.opacity(isActive ? 0.86 : 0.28)))
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Bottom Control Bar (底部控制區 - 兩排架構)
 
 struct BottomControlBar: View, Equatable {
@@ -664,11 +774,24 @@ struct BottomControlBar: View, Equatable {
         lhs.viewModel === rhs.viewModel
     }
 
+    private var waveformTint: Color {
+        viewModel.isVADMode ? .green : .orange
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Divider()
 
-            VStack(spacing: 16) {
+            VStack(spacing: 12) {
+                if viewModel.shouldShowRecordingWaveform {
+                    LiveRecordingWaveformView(
+                        volumePublisher: viewModel.micVolumePublisher,
+                        isActive: viewModel.isRecordingWaveformActive,
+                        tint: waveformTint
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
                 // === 第一行：語言選擇器 + 模式切換 ===
                 LanguageSelectorRow(viewModel: viewModel)
 
@@ -683,6 +806,7 @@ struct BottomControlBar: View, Equatable {
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
+            .animation(.easeOut(duration: 0.18), value: viewModel.shouldShowRecordingWaveform)
             // ⭐️ 底部不加 padding，讓按鈕標籤貼近螢幕最下方
             .background(Color(.systemBackground))
         }

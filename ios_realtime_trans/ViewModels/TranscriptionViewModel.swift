@@ -479,11 +479,38 @@ final class TranscriptionViewModel {
     }
 
     /// ⭐️ 即時麥克風音量（0.0 ~ 1.0）
-    /// 注意：此變數更新頻繁，僅在設定頁面顯示時啟用更新
+    /// 注意：此變數更新頻繁，僅在設定頁面或通話中聲波顯示時啟用更新
     var currentMicVolume: Float = 0.0
 
     /// ⭐️ 是否啟用音量監測更新（設定頁面開啟時才啟用）
     var isVolumeMonitoringEnabled: Bool = false
+
+    /// 手動按住錄音狀態，僅用於 UI 顯示聲波活躍狀態
+    var isManualInputActive: Bool = false
+
+    /// 給聲波元件直接訂閱，避免音量高頻更新整個 ViewModel
+    var micVolumePublisher: AnyPublisher<Float, Never> {
+        audioManager.volumePublisher
+    }
+
+    /// 通話中是否顯示即時聲波列
+    var shouldShowRecordingWaveform: Bool {
+        if case .recording = status {
+            return true
+        }
+        return false
+    }
+
+    /// 聲波是否代表正在送出/監聽麥克風音訊
+    var isRecordingWaveformActive: Bool {
+        guard case .recording = status else { return false }
+
+        if !isEconomyMode && inputMode == .vad {
+            return true
+        }
+
+        return isManualInputActive || audioManager.isTrailingBuffer
+    }
 
     // MARK: - Private Properties
 
@@ -1206,6 +1233,8 @@ final class TranscriptionViewModel {
         }
         // 立即設置狀態，UI 會立即切換
         status = .connecting
+        currentMicVolume = 0
+        isManualInputActive = false
     }
 
     /// ⭐️ 結束通話（同步方法，立即更新 UI）
@@ -1433,6 +1462,8 @@ final class TranscriptionViewModel {
     private func startRecording() async {
         // ⭐️ 立即設置連接狀態，讓 UI 先切換（順暢體驗）
         status = .connecting
+        currentMicVolume = 0
+        isManualInputActive = false
 
         // ⭐️ 讓出主線程，讓 UI 有機會更新
         await Task.yield()
@@ -1578,6 +1609,8 @@ final class TranscriptionViewModel {
     private func stopRecording() {
         // ⭐️ 立即設置狀態，讓 UI 先切換（順暢體驗）
         status = .disconnected
+        currentMicVolume = 0
+        isManualInputActive = false
 
         stopDurationTimer()
         clearNowPlaying()
@@ -1704,6 +1737,7 @@ final class TranscriptionViewModel {
         }
 
         print("🎙️ [經濟模式] 開始錄音...")
+        isManualInputActive = true
 
         // 清空音頻緩衝區，準備接收新的錄音
         appleSTTService.clearAudioBuffer()
@@ -1720,6 +1754,7 @@ final class TranscriptionViewModel {
         }
 
         print("🛑 [經濟模式] 停止錄音，開始雙語言比較...")
+        isManualInputActive = false
 
         // 停止發送音頻
         audioManager.stopSending()
@@ -1767,12 +1802,14 @@ final class TranscriptionViewModel {
 
         if inputMode == .vad {
             // VAD 模式：同步 VAD 旗標 + 開始持續監聽
+            isManualInputActive = false
             audioManager.isVADEnabled = isLocalVADEnabled
             if isRecording {
                 audioManager.startSending()
             }
         } else {
             // PTT 模式：關閉 VAD + 停止發送，等待按住
+            isManualInputActive = false
             audioManager.isVADEnabled = false
             audioManager.stopSending()
         }
@@ -1784,12 +1821,14 @@ final class TranscriptionViewModel {
     func startTalking() {
         guard isRecording else { return }
         guard inputMode == .ptt else { return }  // VAD 模式不需要手動控制
+        isManualInputActive = true
         audioManager.startSending()
     }
 
     /// 停止說話（放開按鈕時調用，僅 PTT 模式有效）
     func stopTalking() {
         guard inputMode == .ptt else { return }  // VAD 模式不需要手動控制
+        isManualInputActive = false
         audioManager.stopSending()
     }
 
@@ -2007,13 +2046,13 @@ final class TranscriptionViewModel {
             }
         }
 
-        // ⭐️ 訂閱即時麥克風音量（節流：只在設定頁面開啟時更新）
+        // ⭐️ 訂閱即時麥克風音量（只給設定頁音量條；通話聲波在獨立 View 內訂閱）
         audioManager.volumePublisher
-            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)  // 節流：最多每 100ms 更新一次
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] volume in
                 guard let self = self else { return }
-                // ⭐️ 只在設定頁面開啟時才更新 UI 變數，避免不必要的重繪
+                // ⭐️ 只在設定頁面開啟時才更新 UI 變數，避免影響通話中的 STT 送音
                 if self.isVolumeMonitoringEnabled {
                     self.currentMicVolume = volume
                 }
