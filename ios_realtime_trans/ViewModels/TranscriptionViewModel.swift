@@ -534,6 +534,9 @@ final class TranscriptionViewModel {
     /// ⭐️ Session 服務（對話記錄儲存到 Firestore）
     private let sessionService = SessionService.shared
 
+    /// ⭐️ Google ADK 對話協調 Agent
+    private let dialogueAgentService = DialogueAgentService()
+
     /// TTS 服務（Azure）
     private let ttsService = AzureTTSService()
 
@@ -586,6 +589,13 @@ final class TranscriptionViewModel {
     private var pendingSTTEvents: [PendingSTTEvent] = []
     private var pendingSTTAudioBytes = 0
     private let maxPendingSTTAudioBytes = 2_000_000
+
+    // MARK: - Dialogue Agent
+
+    private let agentAudioReplayBuffer = AudioRingBuffer(capacitySeconds: 8.0, sampleRate: 16000)
+    private var dialogueAgentTasks: [String: Task<Void, Never>] = [:]
+    private var lastDialogueAgentResetAt = Date.distantPast
+    private let dialogueAgentResetCooldown: TimeInterval = 3.0
 
     // MARK: - Streaming TTS 系統
     // ⭐️ 支援 interim 翻譯時就開始播放，避免等待 final
@@ -1000,6 +1010,7 @@ final class TranscriptionViewModel {
     @MainActor
     private func sendOrQueueSTTAudio(_ data: Data) {
         guard !data.isEmpty else { return }
+        agentAudioReplayBuffer.write(data)
 
         switch currentSTTService.connectionState {
         case .connected:
@@ -1150,6 +1161,274 @@ final class TranscriptionViewModel {
             self.sttReconnectInProgress = false
             print("⚠️ [STT Watchdog] \(providerName) 重連尚未成功，稍後會再試")
         }
+    }
+
+    // MARK: - Dialogue Agent Integration
+
+    @MainActor
+    private func scheduleDialogueAgentProcessing(for transcript: TranscriptMessage) {
+        scheduleDialogueAgent(for: transcript, mode: .realtime, delay: 0)
+
+        if transcripts.filter({ $0.isFinal }).count >= 2 {
+            scheduleDialogueAgent(for: transcript, mode: .consolidate, delay: 0.8)
+        }
+    }
+
+    @MainActor
+    private func scheduleDialogueAgent(for transcript: TranscriptMessage, mode: DialogueAgentMode, delay: TimeInterval) {
+        let request = makeDialogueAgentRequest(for: transcript, mode: mode)
+        let key = "\(transcript.id.uuidString)-\(mode.rawValue)"
+        let service = dialogueAgentService
+        let serverURL = serverURL
+
+        dialogueAgentTasks[key]?.cancel()
+        dialogueAgentTasks[key] = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !Task.isCancelled else { return }
+
+            do {
+                let response = try await service.createPlan(
+                    serverURL: serverURL,
+                    request: request,
+                    timeout: mode == .consolidate ? 35 : 15
+                )
+
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self else { return }
+                    self.dialogueAgentTasks[key] = nil
+                    self.applyDialogueAgentPlan(response, anchorTranscriptID: transcript.id, mode: mode)
+                }
+            } catch {
+                await MainActor.run {
+                    self?.dialogueAgentTasks[key] = nil
+                    print("⚠️ [Dialogue Agent] \(mode.rawValue) 失敗: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func makeDialogueAgentRequest(for transcript: TranscriptMessage, mode: DialogueAgentMode) -> DialogueAgentRequest {
+        let previousTurns = transcripts
+            .filter { $0.id != transcript.id && $0.isFinal }
+            .suffix(6)
+            .map {
+                DialogueAgentPreviousTurn(
+                    id: $0.id.uuidString,
+                    original: $0.text,
+                    translation: $0.translation
+                )
+            }
+        let playedTTS = Array(playedTranslations)
+            .suffix(8)
+            .map { DialogueAgentPlayedTTS(text: $0) }
+        let isLikelyNoise = looksLikeAgentNoise(text: transcript.text) ||
+            (transcript.confidence > 0 && transcript.confidence < 0.35)
+
+        return DialogueAgentRequest(
+            agentMode: mode,
+            sourceLang: sourceLang.rawValue,
+            targetLang: targetLang.rawValue,
+            fragments: [
+                DialogueAgentFragment(
+                    id: transcript.id.uuidString,
+                    text: transcript.text,
+                    isFinal: transcript.isFinal,
+                    timestampMs: Int(transcript.timestamp.timeIntervalSince1970 * 1000),
+                    confidence: transcript.confidence > 0 ? transcript.confidence : nil
+                )
+            ],
+            previousTurns: Array(previousTurns),
+            playedTTS: Array(playedTTS),
+            audioHealth: DialogueAgentAudioHealth(
+                repeatedNoiseCount: isLikelyNoise ? 4 : nil,
+                noValidSpeechMs: isLikelyNoise ? 9000 : nil
+            )
+        )
+    }
+
+    @MainActor
+    private func applyDialogueAgentPlan(
+        _ response: DialogueAgentResponse,
+        anchorTranscriptID: UUID,
+        mode: DialogueAgentMode
+    ) {
+        if response.audioRecovery.shouldReset {
+            dropNoisyTranscriptsIfNeeded(response: response, anchorTranscriptID: anchorTranscriptID)
+            resetSTTStreamFromDialogueAgent(recovery: response.audioRecovery)
+        }
+
+        let usableTurns = response.normalizedTurns.filter { turn in
+            turn.status != "drop" && !turn.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !usableTurns.isEmpty else { return }
+
+        let sourceIDs = Set(usableTurns.flatMap(\.sourceFragmentIds))
+        var affectedIndices: [Int] = transcripts.enumerated().compactMap { index, transcript in
+            sourceIDs.contains(transcript.id.uuidString) ? index : nil
+        }
+
+        if mode == .realtime {
+            affectedIndices = transcripts.enumerated().compactMap { index, transcript in
+                transcript.id == anchorTranscriptID ? index : nil
+            }
+        }
+
+        guard let insertIndex = affectedIndices.min() else { return }
+        let sortedIndices = Array(Set(affectedIndices)).sorted()
+        let fallbackTranscript = transcripts[insertIndex]
+        let shouldReplaceShape = usableTurns.count != sortedIndices.count || sortedIndices.count > 1
+        let shouldApplyTranslation = usableTurns.contains { !$0.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard shouldReplaceShape || shouldApplyTranslation else { return }
+
+        if shouldReplaceShape {
+            cancelTTSForMergedDialog(oldText: fallbackTranscript.text)
+        }
+
+        let replacements = usableTurns.enumerated().map { offset, turn in
+            makeTranscriptMessage(
+                from: turn,
+                fallback: fallbackTranscript,
+                preserveID: offset == 0 ? fallbackTranscript.id : nil,
+                confidence: response.confidence
+            )
+        }
+
+        for index in sortedIndices.reversed() {
+            transcripts.remove(at: index)
+        }
+        transcripts.insert(contentsOf: replacements, at: insertIndex)
+
+        lastFinalText = transcripts.last?.text ?? ""
+        updateStats()
+        playDialogueAgentTTSPlan(response, turns: usableTurns)
+
+        print("🧠 [Dialogue Agent] 套用 \(mode.rawValue): turns=\(usableTurns.count), actions=\(response.actions.map(\.type).joined(separator: ","))")
+    }
+
+    private func makeTranscriptMessage(
+        from turn: DialogueAgentTurn,
+        fallback: TranscriptMessage,
+        preserveID: UUID?,
+        confidence: Double
+    ) -> TranscriptMessage {
+        TranscriptMessage(
+            id: preserveID ?? UUID(),
+            text: turn.original,
+            isFinal: true,
+            confidence: confidence,
+            language: turn.detectedLang,
+            converted: fallback.converted,
+            originalText: fallback.originalText,
+            speakerTag: fallback.speakerTag,
+            timestamp: fallback.timestamp,
+            translation: turn.translation.isEmpty ? fallback.translation : turn.translation,
+            translationSegments: nil,
+            isIntroduction: fallback.isIntroduction
+        )
+    }
+
+    @MainActor
+    private func playDialogueAgentTTSPlan(_ response: DialogueAgentResponse, turns: [DialogueAgentTurn]) {
+        let turnById = Dictionary(uniqueKeysWithValues: turns.map { ($0.id, $0) })
+
+        for item in response.ttsPlan {
+            let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            guard item.playPolicy == "play_now" ||
+                    item.playPolicy == "wait_for_stability" ||
+                    item.playPolicy == "replace_previous" else {
+                continue
+            }
+
+            let detectedLanguage = turnById[item.sourceTurnId]?.detectedLang
+            guard shouldPlayTTSForMode(detectedLanguage: detectedLanguage) else { continue }
+
+            if item.playPolicy == "replace_previous" {
+                cancelTTSForMergedDialog(oldText: text)
+            }
+            enqueueDialogueAgentTTS(text: text, languageCode: item.languageCode, playNow: item.playPolicy == "play_now")
+        }
+    }
+
+    @MainActor
+    private func enqueueDialogueAgentTTS(text: String, languageCode: String, playNow: Bool) {
+        let normalized = normalizeTextForComparison(text)
+        guard !normalized.isEmpty else { return }
+        guard !playedTranslations.contains(normalized) else { return }
+        guard pendingTTS == nil || normalizeTextForComparison(pendingTTS!.text) != normalized else { return }
+        guard !ttsQueue.contains(where: { normalizeTextForComparison($0.text) == normalized }) else { return }
+
+        if playNow {
+            directEnqueueTTS(text: text, languageCode: languageCode)
+        } else {
+            enqueueTTS(text: text, languageCode: languageCode)
+        }
+    }
+
+    @MainActor
+    private func dropNoisyTranscriptsIfNeeded(response: DialogueAgentResponse, anchorTranscriptID: UUID) {
+        guard response.audioRecovery.shouldReset else { return }
+
+        let actionTargetIDs = Set(response.actions.flatMap(\.targetIds))
+        let dropText = response.audioRecovery.dropTranscriptText
+        let indices = transcripts.enumerated().compactMap { index, transcript -> Int? in
+            if actionTargetIDs.contains(transcript.id.uuidString) { return index }
+            if transcript.id == anchorTranscriptID { return index }
+            if !dropText.isEmpty && (dropText.contains(transcript.text) || transcript.text.contains(dropText)) {
+                return index
+            }
+            return nil
+        }
+
+        for index in Array(Set(indices)).sorted().reversed() {
+            print("🧹 [Dialogue Agent] 移除疑似雜音 transcript: \"\(transcripts[index].text.prefix(30))...\"")
+            transcripts.remove(at: index)
+        }
+        updateStats()
+    }
+
+    @MainActor
+    private func resetSTTStreamFromDialogueAgent(recovery: DialogueAgentAudioRecovery) {
+        guard isRecording else { return }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastDialogueAgentResetAt) >= dialogueAgentResetCooldown else {
+            print("⏭️ [Dialogue Agent] 重置過於頻繁，跳過")
+            return
+        }
+        lastDialogueAgentResetAt = now
+
+        let replayAudio = agentAudioReplayBuffer.readLast(4.0)
+        resetPendingSTTEvents()
+        if !replayAudio.isEmpty {
+            queuePendingSTTAudio(replayAudio)
+            queuePendingEndUtterance()
+            print("🔁 [Dialogue Agent] 已暫存最近 \(String(format: "%.1f", agentAudioReplayBuffer.bufferedDuration)) 秒音訊，等待 STT 重連後重送")
+        }
+
+        print("🔄 [Dialogue Agent] 重置 STT 音訊流: \(recovery.reason)")
+        currentSTTService.disconnect()
+        sttReconnectInProgress = false
+        attemptSTTReconnectIfNeeded(reason: "Dialogue Agent 要求音訊流重置")
+    }
+
+    private func cancelDialogueAgentTasks() {
+        dialogueAgentTasks.values.forEach { $0.cancel() }
+        dialogueAgentTasks.removeAll()
+    }
+
+    private func looksLikeAgentNoise(text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if trimmed.range(of: #"(.)(\1){7,}"#, options: .regularExpression) != nil { return true }
+        if trimmed.contains("ーーー") || trimmed.contains("啊啊啊") || trimmed.contains("雜音") || trimmed.contains("噪音") {
+            return true
+        }
+        return false
     }
 
     // MARK: - Lock Screen Controls（鎖屏通話控制）
@@ -1498,6 +1777,7 @@ final class TranscriptionViewModel {
         sttReconnectInProgress = false
         lastSTTReconnectAttempt = .distantPast
         resetPendingSTTEvents()
+        agentAudioReplayBuffer.clear()
 
         // ⭐️ 根據選擇的 STT 提供商連接
         if isEconomyMode {
@@ -1628,6 +1908,8 @@ final class TranscriptionViewModel {
         sttReconnectInProgress = false
         lastSTTReconnectAttempt = .distantPast
         resetPendingSTTEvents()
+        cancelDialogueAgentTasks()
+        agentAudioReplayBuffer.clear()
         isPausedForBackground = false
         backgroundEntryTime = nil
 
@@ -2339,6 +2621,9 @@ final class TranscriptionViewModel {
             // ⭐️ 保存對話到 Session（判斷是否為來源語言）
             let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
             sessionService.addConversation(finalTranscript, isSource: isSource)
+
+            // ⭐️ 交給 Google ADK Agent 做跨句合併、混合語言拆分、TTS 計畫與音訊重置建議
+            scheduleDialogueAgentProcessing(for: finalTranscript)
 
             // Final 到了 → 如果沒有完整翻譯，對完整文字發翻譯
             // ElevenLabs 側已在 VAD commit 時觸發翻譯，這裡只補漏
