@@ -331,6 +331,7 @@ final class SessionService {
     private var cachedSessions: [SessionSummary] = []
     private var cacheUid: String?
     private var cacheFullyLoaded: Bool = false
+    private var cachedHistoryMergeMarker: Date?
 
     /// 取得全部歷史（快取優先 + 差量同步）
     ///
@@ -346,8 +347,15 @@ final class SessionService {
         uid: String,
         onBatchLoaded: @escaping ([SessionSummary], _ isComplete: Bool) -> Void
     ) async {
+        let remoteMergeMarker = await fetchMergedHistoryUpdatedAt(uid: uid)
+
         // ⭐️ 1) 記憶體快取命中
         if cacheUid == uid && !cachedSessions.isEmpty {
+            guard isHistoryCacheValid(localMarker: cachedHistoryMergeMarker, remoteMarker: remoteMergeMarker) else {
+                clearInMemoryHistoryCache()
+                print("🔄 [Session] 帳戶歷史已合併，丟棄記憶體快取並全量重載")
+                return await loadAllSessions(uid: uid, onBatchLoaded: onBatchLoaded)
+            }
             print("⚡️ [Session] 記憶體快取命中: \(cachedSessions.count) 筆（0 次 Firestore 讀取）")
             onBatchLoaded(cachedSessions, cacheFullyLoaded)
             await deltaSync(uid: uid, onBatchLoaded: onBatchLoaded)
@@ -355,9 +363,15 @@ final class SessionService {
         }
 
         // ⭐️ 2) 磁碟快取命中
-        if let diskSessions = loadFromDisk(uid: uid) {
-            cachedSessions = diskSessions
+        if let diskCache = loadFromDisk(uid: uid) {
+            guard isHistoryCacheValid(localMarker: diskCache.mergedHistoryUpdatedAt, remoteMarker: remoteMergeMarker) else {
+                removeDiskHistoryCache(uid: uid)
+                print("🔄 [Session] 帳戶歷史已合併，丟棄磁碟快取並全量重載")
+                return await loadAllSessions(uid: uid, onBatchLoaded: onBatchLoaded)
+            }
+            cachedSessions = diskCache.sessions
             cacheUid = uid
+            cachedHistoryMergeMarker = diskCache.mergedHistoryUpdatedAt
             cacheFullyLoaded = true  // 磁碟快取是上次全量載入的完整結果
             onBatchLoaded(cachedSessions, true)
             await deltaSync(uid: uid, onBatchLoaded: onBatchLoaded)
@@ -368,6 +382,7 @@ final class SessionService {
         print("📥 [Session] 無快取，全量載入...")
         cacheUid = uid
         cachedSessions = []
+        cachedHistoryMergeMarker = remoteMergeMarker
         cacheFullyLoaded = false
 
         var lastDocument: DocumentSnapshot?
@@ -423,6 +438,48 @@ final class SessionService {
         cacheFullyLoaded = false
     }
 
+    private func clearInMemoryHistoryCache() {
+        cachedSessions = []
+        cacheUid = nil
+        cacheFullyLoaded = false
+        cachedHistoryMergeMarker = nil
+    }
+
+    /// 啟動預熱只做本機 cache hydrate；沒有磁碟快取時不在啟動路徑全量打 Firestore。
+    /// 第一次安裝或清 cache 後，Firestore 全量讀取可能花數秒，會和鍵盤/音訊冷啟動搶 CPU 與 I/O。
+    func preloadLocalCachesIfAvailable(uid: String) async {
+        if !(cacheUid == uid && !cachedSessions.isEmpty),
+           let diskCache = loadFromDisk(uid: uid) {
+            cachedSessions = diskCache.sessions
+            cacheUid = uid
+            cachedHistoryMergeMarker = diskCache.mergedHistoryUpdatedAt
+            cacheFullyLoaded = true
+            print("⚡️ [Session] 啟動預熱命中磁碟快取: \(diskCache.sessions.count) 筆")
+        }
+
+        if !(favoritesCacheUid == uid && favoritesCacheLoaded),
+           let diskFavorites = loadFavoritesFromDisk(uid: uid) {
+            favoritesCache = diskFavorites
+            favoritesCacheUid = uid
+            favoritesCacheLoaded = true
+            print("⚡️ [Favorites] 啟動預熱命中磁碟快取: \(diskFavorites.count) 個")
+        }
+    }
+
+    /// 遠端同步保留，但只由啟動流程在 UI 閒置後呼叫；歷史頁主動開啟時仍會立即載入。
+    /// 若本機沒有歷史 cache，啟動階段不做 Firestore 全量歷史讀取，避免第一次安裝卡住互動。
+    func refreshRemoteCachesForWarmup(uid: String) async {
+        await loadFavorites(uid: uid)
+
+        if cacheUid == uid && !cachedSessions.isEmpty {
+            await loadAllSessions(uid: uid) { _, _ in }
+        } else {
+            print("⏳ [Session] 無本機歷史快取，啟動階段略過 Firestore 全量歷史預載")
+        }
+
+        print("🔄 [Preload] 遠端對話歷史 + 收藏同步完成")
+    }
+
     // MARK: - Disk Cache（持久化快取，app 重啟也不用重新讀取全部）
 
     /// 磁碟快取檔案路徑（Application Support — 永久保存，不會被系統清除）
@@ -433,10 +490,30 @@ final class SessionService {
         return dir.appendingPathComponent("session_history_\(uid).json")
     }
 
+    private func fetchMergedHistoryUpdatedAt(uid: String) async -> Date? {
+        do {
+            let document = try await db.collection("users").document(uid).getDocument()
+            return (document.data()?["mergedHistoryUpdatedAt"] as? Timestamp)?.dateValue()
+        } catch {
+            print("⚠️ [Session] 無法檢查歷史合併標記: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func isHistoryCacheValid(localMarker: Date?, remoteMarker: Date?) -> Bool {
+        guard let remoteMarker else { return true }
+        guard let localMarker else { return false }
+        return localMarker >= remoteMarker.addingTimeInterval(-1)
+    }
+
+    private func removeDiskHistoryCache(uid: String) {
+        try? FileManager.default.removeItem(at: diskCachePath(uid: uid))
+    }
+
     /// 儲存到磁碟（只存 metadata，不存對話內容）
     private func saveToDisk(uid: String) {
         let entries = cachedSessions.map { CachedSession(from: $0) }
-        let wrapper = CachedSessionFile(uid: uid, sessions: entries)
+        let wrapper = CachedSessionFile(uid: uid, sessions: entries, mergedHistoryUpdatedAt: cachedHistoryMergeMarker)
         do {
             let data = try JSONEncoder().encode(wrapper)
             try data.write(to: diskCachePath(uid: uid), options: .atomic)
@@ -447,7 +524,7 @@ final class SessionService {
     }
 
     /// 從磁碟讀取快取
-    private func loadFromDisk(uid: String) -> [SessionSummary]? {
+    private func loadFromDisk(uid: String) -> LoadedSessionCache? {
         let path = diskCachePath(uid: uid)
         guard FileManager.default.fileExists(atPath: path.path) else { return nil }
         do {
@@ -456,7 +533,7 @@ final class SessionService {
             guard wrapper.uid == uid else { return nil }
             let sessions = wrapper.sessions.map { SessionSummary(fromCache: $0) }
             print("⚡️ [Session] 磁碟快取載入: \(sessions.count) 筆 (\(data.count / 1024) KB)")
-            return sessions
+            return LoadedSessionCache(sessions: sessions, mergedHistoryUpdatedAt: wrapper.mergedHistoryUpdatedAt)
         } catch {
             print("⚠️ [Session] 磁碟快取讀取失敗: \(error.localizedDescription)")
             return nil
@@ -650,6 +727,11 @@ struct SessionSummary: Identifiable {
 
 // MARK: - Disk Cache Models
 
+private struct LoadedSessionCache {
+    let sessions: [SessionSummary]
+    let mergedHistoryUpdatedAt: Date?
+}
+
 /// 磁碟快取用的輕量 session（只有 metadata，不含對話內容）
 struct CachedSession: Codable {
     let id: String
@@ -675,6 +757,13 @@ struct CachedSession: Codable {
 struct CachedSessionFile: Codable {
     let uid: String
     let sessions: [CachedSession]
+    let mergedHistoryUpdatedAt: Date?
+
+    init(uid: String, sessions: [CachedSession], mergedHistoryUpdatedAt: Date? = nil) {
+        self.uid = uid
+        self.sessions = sessions
+        self.mergedHistoryUpdatedAt = mergedHistoryUpdatedAt
+    }
 }
 
 // MARK: - SessionSummary 從快取初始化
@@ -747,8 +836,8 @@ extension SessionService {
             for doc in snapshot.documents {
                 let data = doc.data()
                 if let name = data["name"] as? String {
-                    let dateKey = data["dateKey"] as? String
-                        ?? doc.documentID.replacingOccurrences(of: "-", with: "/")
+                    let rawDateKey = data["dateKey"] as? String ?? doc.documentID
+                    let dateKey = normalizeFavoriteDateKey(rawDateKey)
                     loaded[dateKey] = name
                 }
             }
@@ -769,21 +858,22 @@ extension SessionService {
 
     /// ⭐️ 儲存收藏（命名 = 收藏，寫入 Firestore 跨裝置同步）
     func saveFavorite(uid: String, dateKey: String, name: String) async {
+        let normalizedDateKey = normalizeFavoriteDateKey(dateKey)
         // 先更新本地（樂觀更新）
-        favoritesCache[dateKey] = name
+        favoritesCache[normalizedDateKey] = name
         saveFavoritesToDisk(uid: uid)
 
-        let docId = dateKey.replacingOccurrences(of: "/", with: "-")
+        let docId = normalizedDateKey.replacingOccurrences(of: "/", with: "-")
         let docRef = db.collection("users").document(uid)
             .collection("favorites").document(docId)
         do {
             try await docRef.setData([
                 "name": name,
-                "dateKey": dateKey,
+                "dateKey": normalizedDateKey,
                 "createdAt": FieldValue.serverTimestamp(),
                 "updatedAt": FieldValue.serverTimestamp()
             ], merge: true)
-            print("⭐️ [Favorites] 已收藏: \(dateKey) → \(name)")
+            print("⭐️ [Favorites] 已收藏: \(normalizedDateKey) → \(name)")
         } catch {
             print("❌ [Favorites] 儲存失敗: \(error.localizedDescription)")
         }
@@ -791,16 +881,17 @@ extension SessionService {
 
     /// ⭐️ 移除收藏
     func removeFavorite(uid: String, dateKey: String) async {
+        let normalizedDateKey = normalizeFavoriteDateKey(dateKey)
         // 先更新本地（樂觀更新）
-        favoritesCache.removeValue(forKey: dateKey)
+        favoritesCache.removeValue(forKey: normalizedDateKey)
         saveFavoritesToDisk(uid: uid)
 
-        let docId = dateKey.replacingOccurrences(of: "/", with: "-")
+        let docId = normalizedDateKey.replacingOccurrences(of: "/", with: "-")
         let docRef = db.collection("users").document(uid)
             .collection("favorites").document(docId)
         do {
             try await docRef.delete()
-            print("⭐️ [Favorites] 已移除收藏: \(dateKey)")
+            print("⭐️ [Favorites] 已移除收藏: \(normalizedDateKey)")
         } catch {
             print("❌ [Favorites] 移除失敗: \(error.localizedDescription)")
         }
@@ -835,12 +926,20 @@ extension SessionService {
             let data = try Data(contentsOf: path)
             let wrapper = try JSONDecoder().decode(CachedFavoritesFile.self, from: data)
             guard wrapper.uid == uid else { return nil }
-            print("⚡️ [Favorites] 磁碟快取讀取: \(wrapper.favorites.count) 個")
-            return wrapper.favorites
+            let normalized = Dictionary(
+                wrapper.favorites.map { (normalizeFavoriteDateKey($0.key), $0.value) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+            print("⚡️ [Favorites] 磁碟快取讀取: \(normalized.count) 個")
+            return normalized
         } catch {
             print("⚠️ [Favorites] 磁碟快取讀取失敗: \(error.localizedDescription)")
             return nil
         }
+    }
+
+    private func normalizeFavoriteDateKey(_ dateKey: String) -> String {
+        dateKey.replacingOccurrences(of: "-", with: "/")
     }
 }
 

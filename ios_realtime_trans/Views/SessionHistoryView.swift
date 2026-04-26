@@ -209,9 +209,13 @@ private struct SessionHistoryContent: View, Equatable {
 
     private var currentGroups: [DateGroup] {
         if showFavoritesOnly {
-            return state.groupedSessions.filter { state.favorites[$0.date] != nil }
+            return state.groupedSessions.filter { favoriteName(for: $0.date) != nil }
         }
         return state.groupedSessions
+    }
+
+    private func favoriteName(for date: String) -> String? {
+        state.favorites[date] ?? state.favorites[date.replacingOccurrences(of: "/", with: "-")]
     }
 
     // MARK: - Tab
@@ -276,8 +280,8 @@ private struct SessionHistoryContent: View, Equatable {
                 }
 
                 ForEach(groups) { group in
-                    let isFav = state.favorites[group.date] != nil
-                    let favName = state.favorites[group.date]
+                    let favName = favoriteName(for: group.date)
+                    let isFav = favName != nil
 
                     DateChipView(
                         dateString: group.date,

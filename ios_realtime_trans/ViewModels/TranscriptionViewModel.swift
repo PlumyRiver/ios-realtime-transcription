@@ -834,8 +834,7 @@ final class TranscriptionViewModel {
         print("✅ [ViewModel] 延遲初始化完成")
     }
 
-    /// ⭐️ 預熱 Apple TTS + 鍵盤（由 ContentView 在啟動風暴結束後呼叫）
-    /// 排程鏈：deferredSetup → 歷史預載 → +1秒 → warmUpTTS + warmUpKeyboard
+    /// ⭐️ 預熱 Apple TTS（由 ContentView 在 UI 穩定後呼叫）
     private var ttsWarmedUp = false
     func warmUpTTSIfNeeded() {
         guard !ttsWarmedUp else { return }
@@ -845,11 +844,14 @@ final class TranscriptionViewModel {
         let tgtLocale = targetLang.azureLocale
         appleTTSService.preWarmLanguages([srcLocale, tgtLocale])
         print("🔥 [TTS] 啟動風暴後預熱: \(srcLocale), \(tgtLocale)")
+    }
 
-        // ⭐️ 順便預熱鍵盤（含中文輸入法），避免用戶第一次打字卡頓
-        Task { @MainActor in
-            KeyboardPrewarmer.prewarm()
-        }
+    /// ⭐️ 低優先權預熱錄音管線；不在 init 搶 UI，真正開始錄音時仍會同步保底初始化。
+    private var audioPipelineWarmedUp = false
+    func warmUpAudioPipelineIfNeeded() {
+        guard !audioPipelineWarmedUp else { return }
+        audioPipelineWarmedUp = true
+        audioManager.prewarmRecordingPipeline()
     }
 
     /// ⭐️ 預取 ElevenLabs token（在 App 出現時調用一次）
@@ -1466,6 +1468,10 @@ final class TranscriptionViewModel {
         isManualInputActive = false
 
         // ⭐️ 讓出主線程，讓 UI 有機會更新
+        await Task.yield()
+
+        // 編輯第一句前就可能需要鍵盤；在連線/錄音真正開始前先觸發，避免首次編輯卡住。
+        KeyboardPrewarmer.prewarm()
         await Task.yield()
 
         // ⭐️ 檢查用戶額度（至少需要 100 額度才能開始）

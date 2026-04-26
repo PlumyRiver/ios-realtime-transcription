@@ -170,7 +170,9 @@ final class WebRTCAudioManager: NSObject {
     var isSpeakerMode: Bool = true {
         didSet {
             if oldValue != isSpeakerMode {
-                updateOutputRoute()
+                if recordingState == .recording {
+                    updateOutputRoute()
+                }
             }
         }
     }
@@ -374,9 +376,6 @@ final class WebRTCAudioManager: NSObject {
 
     private override init() {
         super.init()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            self?.setupWebRTC()
-        }
         // ⭐️ 監聽音訊會話中斷（電話、鬧鐘、Siri 等）
         NotificationCenter.default.addObserver(
             self,
@@ -524,6 +523,15 @@ final class WebRTCAudioManager: NSObject {
     private func ensureInitialized() {
         if !isWebRTCInitialized {
             setupWebRTC()
+        }
+    }
+
+    /// 啟動後低優先權預熱錄音管線；真正錄音時仍會用 ensureInitialized() 保底。
+    func prewarmRecordingPipeline() {
+        guard !isWebRTCInitialized else { return }
+
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.setupWebRTC()
         }
     }
 

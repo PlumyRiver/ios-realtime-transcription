@@ -11,7 +11,7 @@
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundlePackageType</key>
@@ -20,6 +20,10 @@
 	<string>需要使用麥克風來進行即時語音轉錄和翻譯功能</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>使用 Apple 內建語音識別進行即時轉錄，所有處理均在設備本地完成，不會上傳至雲端</string>
+	<key>NSCameraUsageDescription</key>
+	<string>此 App 不會使用相機。第三方語音通訊函式庫（WebRTC）內建相機 API 引用，但不會啟用。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>此 App 不會存取相簿。</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -54,13 +58,6 @@
 				<true/>
 			</dict>
 		</dict>
-	</dict>
-	<key>UIApplicationSceneManifest</key>
-	<dict>
-		<key>UIApplicationSupportsMultipleScenes</key>
-		<false/>
-		<key>UISceneConfigurations</key>
-		<dict/>
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>

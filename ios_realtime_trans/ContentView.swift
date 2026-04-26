@@ -18,14 +18,6 @@ struct ScrollOffsetPreferenceKey: PreferenceKey {
 }
 
 struct ContentView: View {
-    private static var bodyCount = 0
-    private static let launchTime = Date()
-    static func _printBodyEval() {
-        bodyCount += 1
-        let ms = Int(Date().timeIntervalSince(launchTime) * 1000)
-        print("⏱️ [ContentView.body] 第 \(bodyCount) 次 @ \(ms)ms")
-    }
-
     /// ⭐️ 從 RootView 傳入（@State 在 RootView，ContentView 重建不影響）
     @Bindable var viewModel: TranscriptionViewModel
     @State private var showSettings = false
@@ -38,7 +30,6 @@ struct ContentView: View {
     @State private var hasPreFetchedToken = false
 
     var body: some View {
-        let _ = Self._printBodyEval()  // ⏱️ 計時：ContentView.body 被呼叫
         NavigationStack {
             VStack(spacing: 0) {
                 ConversationListView(viewModel: viewModel).equatable()
@@ -106,30 +97,69 @@ struct ContentView: View {
                 // 1) ViewModel 延遲初始化（Combine 訂閱 + 服務同步，分段 yield 不阻塞 UI）
                 await viewModel.deferredSetup()
 
-                // 2) 背景工作鏈（等真實信號，不用猜秒數）
+                // 2) 保留預熱流程，但啟動時只做輕量 hydrate；遠端全量同步延後到 UI 閒置後
                 if !hasPreFetchedToken {
                     hasPreFetchedToken = true
-                    let uid = authService.currentUser?.uid
-                    Task.detached(priority: .utility) { [viewModel] in
-                        // Step A: 歷史+收藏預載（有登入）+ 等 Firebase 首次載入完成
-                        // 兩個並行，都完成才繼續
-                        async let preload: () = {
-                            if let uid = uid {
-                                async let f: () = SessionService.shared.loadFavorites(uid: uid)
-                                async let h: () = SessionService.shared.loadAllSessions(uid: uid) { _, _ in }
-                                _ = await (f, h)
-                                print("⚡️ [Preload] 對話歷史 + 收藏預載完成")
-                            }
-                        }()
-                        async let authReady: () = AuthService.shared.waitForInitialLoad()
 
-                        _ = await (preload, authReady)
+                    Task { @MainActor in
+                        await KeyboardPrewarmer.prewarmWhenIdle(
+                            maxAttempts: 12,
+                            initialDelay: 250_000_000,
+                            retryDelay: 250_000_000
+                        ) {
+                            !showSettings &&
+                            !showHistory &&
+                            !viewModel.showEditSheet &&
+                            !viewModel.isRecording
+                        }
+                    }
 
-                        // Step B: 啟動風暴真的結束 → 預熱 TTS + 鍵盤
-                        await viewModel.warmUpTTSIfNeeded()
+                    let preloadTask = Task.detached(priority: .utility) {
+                        await AuthService.shared.waitForInitialLoad(timeout: 4)
+                        let uid = await MainActor.run { AuthService.shared.currentUser?.uid }
+
+                        if let uid {
+                            await SessionService.shared.preloadLocalCachesIfAvailable(uid: uid)
+                            print("⚡️ [Preload] 本機對話歷史 + 收藏快取 hydrate 完成")
+                        }
+                    }
+
+                    Task { @MainActor in
+                        await preloadTask.value
+                        viewModel.warmUpAudioPipelineIfNeeded()
+                        viewModel.warmUpTTSIfNeeded()
+
+                        await KeyboardPrewarmer.prewarmWhenIdle {
+                            !showSettings &&
+                            !showHistory &&
+                            !viewModel.showEditSheet &&
+                            !viewModel.isRecording
+                        }
+                    }
+
+                    Task.detached(priority: .background) {
+                        await AuthService.shared.waitForInitialLoad(timeout: 8)
+                        guard let uid = await MainActor.run(body: { AuthService.shared.currentUser?.uid }) else { return }
+
+                        try? await Task.sleep(nanoseconds: 12_000_000_000)
+                        guard !Task.isCancelled else { return }
+
+                        let canRefresh = await MainActor.run {
+                            UIApplication.shared.applicationState == .active &&
+                            !showSettings &&
+                            !showHistory &&
+                            !viewModel.showEditSheet &&
+                            !viewModel.isRecording
+                        }
+
+                        guard canRefresh else {
+                            print("⏳ [Preload] UI 忙碌，略過啟動遠端同步，等使用者打開歷史時再載入")
+                            return
+                        }
+
+                        await SessionService.shared.refreshRemoteCachesForWarmup(uid: uid)
                     }
                 }
-                print("💰 [ContentView] currentUser = \(authService.currentUser?.email ?? "nil"), slowCredits = \(authService.currentUser?.slowCredits ?? -1)")
             }
             // ⭐️ 編輯對話 Sheet（狀態在 ViewModel 中，不觸發 ContentView 重繪）
             .sheet(isPresented: $viewModel.showEditSheet) {
@@ -165,7 +195,6 @@ struct ConversationListView: View, Equatable {
     private let bottomAnchorId = "bottomAnchor"
     private let bottomDetectionThreshold: CGFloat = 72
 
-    private static var bodyCount = 0
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.viewModel === rhs.viewModel
     }
@@ -189,7 +218,6 @@ struct ConversationListView: View, Equatable {
     }
 
     var body: some View {
-        let _ = { Self.bodyCount += 1; print("⏱️ [ConversationList.body] 第 \(Self.bodyCount) 次, transcripts=\(viewModel.transcripts.count)") }()
         GeometryReader { scrollGeometry in
             ScrollViewReader { proxy in
                 ScrollView {
@@ -560,7 +588,7 @@ struct EditTranscriptSheet: View {
     var onCancel: () -> Void
 
     @State private var text: String = ""
-    @FocusState private var isFocused: Bool
+    @State private var shouldFocusEditor = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -585,23 +613,105 @@ struct EditTranscriptSheet: View {
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 12)
 
-            // ⭐️ 用 TextEditor 固定高度，避免 TextField(axis:.vertical) 每字重新 layout
-            TextEditor(text: $text)
-                .font(.body)
-                .scrollContentBackground(.hidden)
+            SmoothTextEditor(text: $text, isFocused: $shouldFocusEditor)
                 .padding(8)
                 .background(Color(.systemGray6))
                 .cornerRadius(12)
-                .focused($isFocused)
                 .frame(minHeight: 120, maxHeight: 200)
                 .padding(.horizontal)
+                .transaction { transaction in
+                    transaction.animation = nil
+                }
 
             Spacer()
         }
         .onAppear {
             text = initialText
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                isFocused = true
+            shouldFocusEditor = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                shouldFocusEditor = true
+            }
+        }
+        .onDisappear {
+            shouldFocusEditor = false
+        }
+    }
+}
+
+struct SmoothTextEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.delegate = context.coordinator
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.adjustsFontForContentSizeCategory = true
+        textView.backgroundColor = .clear
+        textView.isScrollEnabled = true
+        textView.keyboardDismissMode = .interactive
+        textView.autocorrectionType = .no
+        textView.spellCheckingType = .no
+        textView.smartDashesType = .no
+        textView.smartQuotesType = .no
+        textView.smartInsertDeleteType = .no
+        textView.textContainerInset = UIEdgeInsets(top: 8, left: 6, bottom: 8, right: 6)
+        textView.textContainer.lineFragmentPadding = 0
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        context.coordinator.parent = self
+
+        if textView.text != text {
+            textView.text = text
+        }
+
+        if isFocused, !textView.isFirstResponder {
+            guard !context.coordinator.hasRequestedFocus else { return }
+            context.coordinator.hasRequestedFocus = true
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, textView.window != nil else { return }
+                textView.becomeFirstResponder()
+            }
+        } else if !isFocused, textView.isFirstResponder {
+            context.coordinator.hasRequestedFocus = false
+            DispatchQueue.main.async { [weak textView] in
+                textView?.resignFirstResponder()
+            }
+        } else if !isFocused {
+            context.coordinator.hasRequestedFocus = false
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: SmoothTextEditor
+        var hasRequestedFocus = false
+
+        init(parent: SmoothTextEditor) {
+            self.parent = parent
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            let newText = textView.text ?? ""
+            if parent.text != newText {
+                parent.text = newText
+            }
+        }
+
+        func textViewDidBeginEditing(_ textView: UITextView) {
+            if !parent.isFocused {
+                parent.isFocused = true
+            }
+        }
+
+        func textViewDidEndEditing(_ textView: UITextView) {
+            if parent.isFocused {
+                parent.isFocused = false
             }
         }
     }
@@ -778,11 +888,19 @@ struct BottomControlBar: View, Equatable {
         viewModel.isVADMode ? .green : .orange
     }
 
+    private var controlSpacing: CGFloat {
+        viewModel.isRecording ? 12 : 8
+    }
+
+    private var topPadding: CGFloat {
+        viewModel.isRecording ? 12 : 10
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Divider()
 
-            VStack(spacing: 12) {
+            VStack(spacing: controlSpacing) {
                 if viewModel.shouldShowRecordingWaveform {
                     LiveRecordingWaveformView(
                         volumePublisher: viewModel.micVolumePublisher,
@@ -805,10 +923,10 @@ struct BottomControlBar: View, Equatable {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.top, 12)
+            .padding(.top, topPadding)
             .animation(.easeOut(duration: 0.18), value: viewModel.shouldShowRecordingWaveform)
-            // ⭐️ 底部不加 padding，讓按鈕標籤貼近螢幕最下方
-            .background(Color(.systemBackground))
+            // ⭐️ 背景延伸到底部安全區，避免未通話時 home indicator 上方看起來像多留一排空白
+            .background(Color(.systemBackground).ignoresSafeArea(.container, edges: .bottom))
         }
     }
 }
@@ -1646,7 +1764,7 @@ struct CenteredCallButton: View {
     @State private var isDragging = false
 
     // 尺寸常數
-    private let containerHeight: CGFloat = 100  // ⭐️ 與通話中控制欄高度一致
+    private let containerHeight: CGFloat = 78  // 未通話時沒有按鈕標籤，壓低滑軌減少底部空白
     private let trackHeight: CGFloat = 70
     private let thumbSize: CGFloat = 60
     private let threshold: CGFloat = 0.6  // 滑動超過 60% 觸發
