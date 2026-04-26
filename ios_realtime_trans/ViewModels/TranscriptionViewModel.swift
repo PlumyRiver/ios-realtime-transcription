@@ -1266,9 +1266,10 @@ final class TranscriptionViewModel {
             resetSTTStreamFromDialogueAgent(recovery: response.audioRecovery)
         }
 
-        let usableTurns = response.normalizedTurns.filter { turn in
+        let rawUsableTurns = response.normalizedTurns.filter { turn in
             turn.status != "drop" && !turn.original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+        let usableTurns = coalesceDialogueAgentTurns(rawUsableTurns)
         guard !usableTurns.isEmpty else { return }
 
         let sourceIDs = Set(usableTurns.flatMap(\.sourceFragmentIds))
@@ -1346,9 +1347,137 @@ final class TranscriptionViewModel {
         )
     }
 
+    private func coalesceDialogueAgentTurns(_ turns: [DialogueAgentTurn]) -> [DialogueAgentTurn] {
+        var repairedTurns = turns
+        for index in repairedTurns.indices {
+            let turn = repairedTurns[index]
+            guard normalizedAgentLang(turn.detectedLang) == "zh",
+                  isHanOnlyDialogueText(turn.original) else {
+                continue
+            }
+
+            let previousLang = index > repairedTurns.startIndex
+                ? normalizedAgentLang(repairedTurns[repairedTurns.index(before: index)].detectedLang)
+                : ""
+            let nextIndex = repairedTurns.index(after: index)
+            let nextLang = nextIndex < repairedTurns.endIndex
+                ? normalizedAgentLang(repairedTurns[nextIndex].detectedLang)
+                : ""
+
+            if previousLang == "ja", nextLang == "ja" {
+                repairedTurns[index] = DialogueAgentTurn(
+                    id: turn.id,
+                    sourceFragmentIds: turn.sourceFragmentIds,
+                    original: turn.original,
+                    detectedLang: "ja",
+                    translateTo: "zh",
+                    translation: turn.translation,
+                    status: turn.status
+                )
+            }
+        }
+
+        var coalesced: [DialogueAgentTurn] = []
+        for turn in repairedTurns {
+            guard let previous = coalesced.last,
+                  previous.status != "drop",
+                  turn.status != "drop",
+                  normalizedAgentLang(previous.detectedLang) == normalizedAgentLang(turn.detectedLang),
+                  normalizedAgentLang(previous.translateTo) == normalizedAgentLang(turn.translateTo) else {
+                coalesced.append(turn)
+                continue
+            }
+
+            coalesced[coalesced.count - 1] = DialogueAgentTurn(
+                id: previous.id,
+                sourceFragmentIds: uniqueAgentSourceIDs(previous.sourceFragmentIds + turn.sourceFragmentIds),
+                original: joinAgentDialogueText(previous.original, turn.original),
+                detectedLang: previous.detectedLang,
+                translateTo: previous.translateTo,
+                translation: joinAgentDialogueText(previous.translation, turn.translation),
+                status: mergedAgentTurnStatus(previous.status, turn.status)
+            )
+        }
+
+        return coalesced
+    }
+
+    private func normalizedAgentLang(_ value: String) -> String {
+        let lang = value.lowercased()
+        if lang.hasPrefix("zh") || lang.contains("chinese") { return "zh" }
+        if lang.hasPrefix("ja") || lang.contains("japanese") { return "ja" }
+        if lang.hasPrefix("ko") || lang.contains("korean") { return "ko" }
+        if lang.hasPrefix("en") || lang.contains("english") { return "en" }
+        return lang
+    }
+
+    private func isHanOnlyDialogueText(_ text: String) -> Bool {
+        let meaningfulScalars = text.unicodeScalars.filter { scalar in
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) ||
+                CharacterSet.punctuationCharacters.contains(scalar) ||
+                CharacterSet.symbols.contains(scalar) ||
+                CharacterSet.decimalDigits.contains(scalar) {
+                return false
+            }
+            return true
+        }
+        guard !meaningfulScalars.isEmpty else { return false }
+        return meaningfulScalars.allSatisfy { scalar in
+            (0x4E00...0x9FFF).contains(Int(scalar.value))
+        }
+    }
+
+    private func uniqueAgentSourceIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for id in ids {
+            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            result.append(trimmed)
+        }
+        return result
+    }
+
+    private func joinAgentDialogueText(_ left: String, _ right: String) -> String {
+        let a = left.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = right.trimmingCharacters(in: .whitespacesAndNewlines)
+        if a.isEmpty { return b }
+        if b.isEmpty { return a }
+        if let last = a.last,
+           let first = b.first,
+           isAsciiLetterOrDigit(last),
+           isAsciiLetterOrDigit(first) {
+            return "\(a) \(b)"
+        }
+        return a + b
+    }
+
+    private func isAsciiLetterOrDigit(_ character: Character) -> Bool {
+        guard character.unicodeScalars.count == 1,
+              let value = character.unicodeScalars.first?.value else {
+            return false
+        }
+        return (48...57).contains(value) || (65...90).contains(value) || (97...122).contains(value)
+    }
+
+    private func mergedAgentTurnStatus(_ left: String, _ right: String) -> String {
+        if left == "drop" || right == "drop" { return "drop" }
+        if left == "needs_retry" || right == "needs_retry" { return "needs_retry" }
+        if left == "stable", right == "stable" { return "stable" }
+        return "provisional"
+    }
+
     @MainActor
     private func playDialogueAgentTTSPlan(_ response: DialogueAgentResponse, turns: [DialogueAgentTurn]) {
         let turnById = Dictionary(uniqueKeysWithValues: turns.map { ($0.id, $0) })
+        let ttsPlanMatchesTurns = response.ttsPlan.count == turns.count &&
+            response.ttsPlan.allSatisfy { turnById[$0.sourceTurnId] != nil }
+
+        if !ttsPlanMatchesTurns {
+            playCoalescedDialogueAgentTTS(turns)
+            return
+        }
 
         for item in response.ttsPlan {
             let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1377,6 +1506,28 @@ final class TranscriptionViewModel {
                 cancelTTSForMergedDialog(oldText: playableText)
             }
             enqueueDialogueAgentTTS(text: playableText, languageCode: item.languageCode, playNow: item.playPolicy == "play_now")
+        }
+    }
+
+    @MainActor
+    private func playCoalescedDialogueAgentTTS(_ turns: [DialogueAgentTurn]) {
+        for turn in turns {
+            let text = turn.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            guard shouldPlayTTSForMode(detectedLanguage: turn.detectedLang) else { continue }
+
+            let progressKey = agentTTSProgressKey(for: turn)
+            let playableText = nextAgentTTSPlayableText(
+                fullText: text,
+                progressKey: progressKey,
+                playPolicy: turn.status == "stable" ? "play_now" : "wait_for_stability"
+            )
+            guard !playableText.isEmpty else { continue }
+            enqueueDialogueAgentTTS(
+                text: playableText,
+                languageCode: languageCodeForAgentTTS(turn.translateTo),
+                playNow: turn.status == "stable"
+            )
         }
     }
 
@@ -1480,6 +1631,24 @@ final class TranscriptionViewModel {
             .map { String($0) }
         guard chars.count >= 2 else { return [] }
         return (0..<(chars.count - 1)).map { chars[$0] + chars[$0 + 1] }
+    }
+
+    private func agentTTSProgressKey(for turn: DialogueAgentTurn) -> String {
+        let sourceKey = turn.sourceFragmentIds.isEmpty ? turn.id : turn.sourceFragmentIds.joined(separator: "+")
+        return "\(sourceKey)->\(turn.translateTo)"
+    }
+
+    private func languageCodeForAgentTTS(_ lang: String) -> String {
+        switch normalizedAgentLang(lang) {
+        case "zh":
+            return "zh-TW"
+        case "ja":
+            return "ja-JP"
+        case "ko":
+            return "ko-KR"
+        default:
+            return "en-US"
+        }
     }
 
     private func agentTTSProgressKey(
