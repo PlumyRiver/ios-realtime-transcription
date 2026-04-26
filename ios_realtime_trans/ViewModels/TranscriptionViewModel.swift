@@ -574,6 +574,9 @@ final class TranscriptionViewModel {
     private var playedTranslations: Set<String> = []
     /// ⭐️ 最大記錄數量（避免記憶體無限增長）
     private let maxPlayedTranslationsCount = 50
+    /// ⭐️ Agent TTS 進度：每個 source turn 已經安排/播放到哪一段完整翻譯
+    private var agentTTSProgressByTurn: [String: String] = [:]
+    private let maxAgentTTSProgressCount = 80
 
     // MARK: - STT Connection Health
 
@@ -1214,7 +1217,7 @@ final class TranscriptionViewModel {
     private func makeDialogueAgentRequest(for transcript: TranscriptMessage, mode: DialogueAgentMode) -> DialogueAgentRequest {
         let previousTurns = transcripts
             .filter { $0.id != transcript.id && $0.isFinal }
-            .suffix(6)
+            .suffix(2)
             .map {
                 DialogueAgentPreviousTurn(
                     id: $0.id.uuidString,
@@ -1222,9 +1225,11 @@ final class TranscriptionViewModel {
                     translation: $0.translation
                 )
             }
-        let playedTTS = Array(playedTranslations)
+        let playedTTS = (
+            Array(playedTranslations).map { DialogueAgentPlayedTTS(text: $0) } +
+            Array(agentTTSProgressByTurn.values).suffix(8).map { DialogueAgentPlayedTTS(text: $0) }
+        )
             .suffix(8)
-            .map { DialogueAgentPlayedTTS(text: $0) }
         let isLikelyNoise = looksLikeAgentNoise(text: transcript.text) ||
             (transcript.confidence > 0 && transcript.confidence < 0.35)
 
@@ -1279,6 +1284,16 @@ final class TranscriptionViewModel {
 
         guard let insertIndex = affectedIndices.min() else { return }
         let sortedIndices = Array(Set(affectedIndices)).sorted()
+        if mode == .consolidate,
+           !isSafeDialogueAgentConsolidation(
+                usableTurns: usableTurns,
+                affectedIndices: sortedIndices,
+                anchorTranscriptID: anchorTranscriptID
+           ) {
+            print("🛡️ [Dialogue Agent] 拒絕不安全合併，保留原泡泡")
+            return
+        }
+
         let fallbackTranscript = transcripts[insertIndex]
         let shouldReplaceShape = usableTurns.count != sortedIndices.count || sortedIndices.count > 1
         let shouldApplyTranslation = usableTurns.contains { !$0.translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -1347,10 +1362,154 @@ final class TranscriptionViewModel {
             let detectedLanguage = turnById[item.sourceTurnId]?.detectedLang
             guard shouldPlayTTSForMode(detectedLanguage: detectedLanguage) else { continue }
 
-            if item.playPolicy == "replace_previous" {
-                cancelTTSForMergedDialog(oldText: text)
+            let progressKey = agentTTSProgressKey(for: item, turnById: turnById)
+            let playableText = nextAgentTTSPlayableText(
+                fullText: text,
+                progressKey: progressKey,
+                playPolicy: item.playPolicy
+            )
+            guard !playableText.isEmpty else {
+                print("⏭️ [Dialogue Agent TTS] 已播放到最新，跳過: \(progressKey)")
+                continue
             }
-            enqueueDialogueAgentTTS(text: text, languageCode: item.languageCode, playNow: item.playPolicy == "play_now")
+
+            if item.playPolicy == "replace_previous" {
+                cancelTTSForMergedDialog(oldText: playableText)
+            }
+            enqueueDialogueAgentTTS(text: playableText, languageCode: item.languageCode, playNow: item.playPolicy == "play_now")
+        }
+    }
+
+    @MainActor
+    private func isSafeDialogueAgentConsolidation(
+        usableTurns: [DialogueAgentTurn],
+        affectedIndices: [Int],
+        anchorTranscriptID: UUID
+    ) -> Bool {
+        guard !affectedIndices.isEmpty,
+              let anchorIndex = transcripts.firstIndex(where: { $0.id == anchorTranscriptID }) else {
+            return false
+        }
+
+        if affectedIndices == [anchorIndex] {
+            return true
+        }
+
+        // 只允許 Agent 改寫目前尾端的相鄰泡泡；舊回應不可回頭吞掉後面新出現的對話。
+        guard anchorIndex == transcripts.indices.last,
+              affectedIndices.last == anchorIndex,
+              affectedIndices.count <= 3,
+              affectedIndices == Array(affectedIndices[0]...anchorIndex) else {
+            return false
+        }
+
+        let mergedOriginal = normalizeTextForComparison(usableTurns.map(\.original).joined())
+        for index in affectedIndices {
+            let original = normalizeTextForComparison(transcripts[index].text)
+            if !original.isEmpty && !mergedOriginal.contains(original) {
+                return false
+            }
+        }
+
+        let affectedTexts = affectedIndices.map { transcripts[$0].text }
+        return canSafelyMergeAgentTexts(affectedTexts)
+    }
+
+    private func canSafelyMergeAgentTexts(_ texts: [String]) -> Bool {
+        guard let first = texts.first, !first.isEmpty else { return false }
+        var context = first
+
+        for next in texts.dropFirst() {
+            if shouldMergeTexts(newText: next, lastText: context) ||
+                isLocationContinuation(next) ||
+                isPureTrailingDetail(next) ||
+                (hasSharedMeaningfulToken(context, next) && hasDetailCue(next)) {
+                context += next
+                continue
+            }
+            return false
+        }
+
+        return true
+    }
+
+    private func isLocationContinuation(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("在") ||
+            trimmed.hasPrefix("到") ||
+            trimmed.hasPrefix("於") ||
+            trimmed.lowercased().hasPrefix("at ") ||
+            trimmed.lowercased().hasPrefix("in ")
+    }
+
+    private func isPureTrailingDetail(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 12 else { return false }
+        if trimmed.range(of: #"^[0-9０-９]+[元円塊個杯份分點時年月日公里kmKM%％]*$"#, options: .regularExpression) != nil {
+            return true
+        }
+        return trimmed.hasPrefix("共") ||
+            trimmed.hasPrefix("總共") ||
+            trimmed.hasPrefix("一共") ||
+            trimmed.hasPrefix("還有") ||
+            trimmed.hasPrefix("以及")
+    }
+
+    private func hasDetailCue(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isLocationContinuation(trimmed) ||
+            trimmed.range(of: #"[0-9０-９]"#, options: .regularExpression) != nil ||
+            trimmed.contains("元") ||
+            trimmed.contains("円") ||
+            trimmed.contains("點") ||
+            trimmed.contains("時")
+    }
+
+    private func hasSharedMeaningfulToken(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsTokens = Set(cjkBigrams(lhs))
+        guard !lhsTokens.isEmpty else { return false }
+        return cjkBigrams(rhs).contains { lhsTokens.contains($0) }
+    }
+
+    private func cjkBigrams(_ text: String) -> [String] {
+        let chars = text.unicodeScalars
+            .filter { scalar in
+                (0x4E00...0x9FFF).contains(Int(scalar.value)) ||
+                    (0x3040...0x30FF).contains(Int(scalar.value))
+            }
+            .map { String($0) }
+        guard chars.count >= 2 else { return [] }
+        return (0..<(chars.count - 1)).map { chars[$0] + chars[$0 + 1] }
+    }
+
+    private func agentTTSProgressKey(
+        for item: DialogueAgentTTSPlanItem,
+        turnById: [String: DialogueAgentTurn]
+    ) -> String {
+        guard let turn = turnById[item.sourceTurnId] else {
+            return item.sourceTurnId
+        }
+        let sourceKey = turn.sourceFragmentIds.isEmpty ? item.sourceTurnId : turn.sourceFragmentIds.joined(separator: "+")
+        return "\(sourceKey)->\(turn.translateTo)"
+    }
+
+    @MainActor
+    private func nextAgentTTSPlayableText(fullText: String, progressKey: String, playPolicy: String) -> String {
+        let previous = agentTTSProgressByTurn[progressKey] ?? ""
+        let delta = calculateNewTTSContent(playedText: previous, fullTranslation: fullText)
+
+        if fullText.count >= previous.count || playPolicy == "replace_previous" {
+            agentTTSProgressByTurn[progressKey] = fullText
+        }
+        trimAgentTTSProgressIfNeeded()
+        return delta
+    }
+
+    private func trimAgentTTSProgressIfNeeded() {
+        guard agentTTSProgressByTurn.count > maxAgentTTSProgressCount else { return }
+        let keysToRemove = Array(agentTTSProgressByTurn.keys.prefix(agentTTSProgressByTurn.count - maxAgentTTSProgressCount))
+        for key in keysToRemove {
+            agentTTSProgressByTurn.removeValue(forKey: key)
         }
     }
 
@@ -1946,6 +2105,7 @@ final class TranscriptionViewModel {
 
         // ⭐️ 清理已播放記錄（下一次通話重新開始）
         playedTranslations.removeAll()
+        agentTTSProgressByTurn.removeAll()
         print("🧹 [TTS] 停止錄音，清理已播放記錄")
 
         // ⭐️ 重置 Streaming TTS 狀態
@@ -3342,8 +3502,13 @@ final class TranscriptionViewModel {
     /// - Parameter fullTranslation: 完整的翻譯文本
     /// - Returns: 需要播放的新增部分
     private func calculateNewTTSContent(fullTranslation: String) -> String {
-        let playedText = streamingTTSState.playedTranslation
+        calculateNewTTSContent(
+            playedText: streamingTTSState.playedTranslation,
+            fullTranslation: fullTranslation
+        )
+    }
 
+    private func calculateNewTTSContent(playedText: String, fullTranslation: String) -> String {
         // 如果沒有已播放內容，返回全部
         if playedText.isEmpty {
             return fullTranslation
@@ -3376,10 +3541,9 @@ final class TranscriptionViewModel {
         }
 
         // ⭐️ 情況 4：完全不同的翻譯
-        // 這不應該發生（應該是新 utterance），但為了安全起見
-        print("⚠️ [Streaming TTS] 翻譯完全不同，重新開始")
-        streamingTTSState.playedTranslation = ""
-        return fullTranslation
+        // 這通常代表同一個 source 的翻譯被大幅改寫；為了避免重播已經說過的內容，等待下一個穩定片段。
+        print("⚠️ [Streaming TTS] 翻譯完全不同，避免重播整句")
+        return ""
     }
 
     /// 找出兩個字串的共同前綴長度
