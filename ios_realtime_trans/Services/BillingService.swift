@@ -22,11 +22,15 @@ struct BillingPricing {
     static let llmInputPricePerToken: Double = llmInputPricePerMToken / 1_000_000.0
     static let llmOutputPricePerToken: Double = llmOutputPricePerMToken / 1_000_000.0
 
-    // Agent (Gemini 2.5 Flash): Input $0.30 USD/M tokens, Output $2.50 USD/M tokens
-    static let agentInputPricePerMToken: Double = 0.30
-    static let agentOutputPricePerMToken: Double = 2.50
+    // Agent (Claude Sonnet): Input $3.00 USD/M tokens, Output $15.00 USD/M tokens
+    static let agentInputPricePerMToken: Double = 3.00
+    static let agentOutputPricePerMToken: Double = 15.00
+    static let agentCacheReadInputPricePerMToken: Double = 0.30
+    static let agentCacheCreationInputPricePerMToken: Double = 3.75
     static let agentInputPricePerToken: Double = agentInputPricePerMToken / 1_000_000.0
     static let agentOutputPricePerToken: Double = agentOutputPricePerMToken / 1_000_000.0
+    static let agentCacheReadInputPricePerToken: Double = agentCacheReadInputPricePerMToken / 1_000_000.0
+    static let agentCacheCreationInputPricePerToken: Double = agentCacheCreationInputPricePerMToken / 1_000_000.0
 
     // TTS (Azure): $16 USD per million characters (Neural voices)
     // 參考: https://azure.microsoft.com/pricing/details/cognitive-services/speech-services/
@@ -36,6 +40,38 @@ struct BillingPricing {
     // 額度換算: 1 USD = 100,000 額度 (1 額度 = $0.00001 USD)
     static let creditsPerUSD: Double = 100000.0
     static let usdPerCredit: Double = 1.0 / creditsPerUSD
+
+    static func agentCostUSD(
+        inputTokens: Int,
+        outputTokens: Int,
+        cacheReadInputTokens: Int,
+        cacheCreationInputTokens: Int,
+        model: String
+    ) -> Double {
+        let normalizedModel = model.lowercased()
+        let inputPrice: Double
+        let outputPrice: Double
+        let cacheReadPrice: Double
+        let cacheCreationPrice: Double
+
+        if normalizedModel.contains("claude-sonnet") {
+            inputPrice = agentInputPricePerToken
+            outputPrice = agentOutputPricePerToken
+            cacheReadPrice = agentCacheReadInputPricePerToken
+            cacheCreationPrice = agentCacheCreationInputPricePerToken
+        } else {
+            inputPrice = agentInputPricePerToken
+            outputPrice = agentOutputPricePerToken
+            cacheReadPrice = agentCacheReadInputPricePerToken
+            cacheCreationPrice = agentCacheCreationInputPricePerToken
+        }
+
+        let uncachedInputTokens = max(0, inputTokens - cacheReadInputTokens - cacheCreationInputTokens)
+        return Double(uncachedInputTokens) * inputPrice +
+            Double(cacheReadInputTokens) * cacheReadPrice +
+            Double(cacheCreationInputTokens) * cacheCreationPrice +
+            Double(outputTokens) * outputPrice
+    }
 }
 
 // MARK: - 用量追蹤結構
@@ -52,6 +88,9 @@ struct SessionUsage {
     // Agent 用量
     var agentInputTokens: Int = 0
     var agentOutputTokens: Int = 0
+    var agentCacheReadInputTokens: Int = 0
+    var agentCacheCreationInputTokens: Int = 0
+    var agentBilledCostUSD: Double = 0
 
     // TTS 用量（按字符數計算）
     var ttsCharCount: Int = 0
@@ -68,9 +107,7 @@ struct SessionUsage {
     }
 
     var agentCostUSD: Double {
-        let inputCost = Double(agentInputTokens) * BillingPricing.agentInputPricePerToken
-        let outputCost = Double(agentOutputTokens) * BillingPricing.agentOutputPricePerToken
-        return inputCost + outputCost
+        return agentBilledCostUSD
     }
 
     var ttsCostUSD: Double {
@@ -98,6 +135,8 @@ struct SessionUsage {
             "llmOutputTokens": llmOutputTokens,
             "agentInputTokens": agentInputTokens,
             "agentOutputTokens": agentOutputTokens,
+            "agentCacheReadInputTokens": agentCacheReadInputTokens,
+            "agentCacheCreationInputTokens": agentCacheCreationInputTokens,
             "ttsCharCount": ttsCharCount,
             "sttCostUSD": sttCostUSD,
             "llmCostUSD": llmCostUSD,
@@ -409,20 +448,35 @@ final class BillingService {
     }
 
     /// 記錄 Dialogue Agent 用量並即時扣款
-    func recordAgentUsage(inputTokens: Int, outputTokens: Int, model: String) {
+    func recordAgentUsage(
+        inputTokens: Int,
+        outputTokens: Int,
+        model: String,
+        cacheReadInputTokens: Int = 0,
+        cacheCreationInputTokens: Int = 0,
+        costUSD: Double? = nil
+    ) {
         guard isBilling else { return }
         guard inputTokens > 0 || outputTokens > 0 else { return }
 
         currentUsage.agentInputTokens += inputTokens
         currentUsage.agentOutputTokens += outputTokens
+        currentUsage.agentCacheReadInputTokens += cacheReadInputTokens
+        currentUsage.agentCacheCreationInputTokens += cacheCreationInputTokens
 
         sessionAgentInputTokens += inputTokens
         sessionAgentOutputTokens += outputTokens
         sessionAgentCallCount += 1
 
-        let inputCost = Double(inputTokens) * BillingPricing.agentInputPricePerToken
-        let outputCost = Double(outputTokens) * BillingPricing.agentOutputPricePerToken
-        let totalCostUSD = inputCost + outputCost
+        let calculatedCostUSD = BillingPricing.agentCostUSD(
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            cacheReadInputTokens: cacheReadInputTokens,
+            cacheCreationInputTokens: cacheCreationInputTokens,
+            model: model
+        )
+        let totalCostUSD = max(0, costUSD ?? calculatedCostUSD)
+        currentUsage.agentBilledCostUSD += totalCostUSD
         let credits = Int(ceil(totalCostUSD * BillingPricing.creditsPerUSD))
 
         if credits > 0 {
@@ -430,7 +484,7 @@ final class BillingService {
             deductCreditsImmediately(credits: credits, reason: "Agent[\(model)](\(inputTokens)+\(outputTokens))")
         }
 
-        print("💰 [Billing] Agent[\(model)] #\(sessionAgentCallCount): +\(inputTokens) input, +\(outputTokens) output, 扣\(credits)額度 (累計: \(currentUsage.agentInputTokens)/\(currentUsage.agentOutputTokens))")
+        print("💰 [Billing] Agent[\(model)] #\(sessionAgentCallCount): +\(inputTokens) input, +\(outputTokens) output, cache=\(cacheReadInputTokens)/\(cacheCreationInputTokens), $\(String(format: "%.6f", totalCostUSD)), 扣\(credits)額度 (累計: \(currentUsage.agentInputTokens)/\(currentUsage.agentOutputTokens))")
     }
 
     /// 估算文本的 token 數（簡易估算：中文約 1.5 字/token，英文約 4 字符/token）

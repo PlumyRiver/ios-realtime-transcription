@@ -601,7 +601,7 @@ final class TranscriptionViewModel {
     /// ⭐️ Session 服務（對話記錄儲存到 Firestore）
     private let sessionService = SessionService.shared
 
-    /// ⭐️ Google ADK 對話協調 Agent
+    /// ⭐️ Claude Agent SDK 對話協調 Agent
     private let dialogueAgentService = DialogueAgentService()
 
     /// TTS 服務（Azure）
@@ -1313,14 +1313,17 @@ final class TranscriptionViewModel {
     private func recordDialogueAgentBilling(_ agent: DialogueAgentInfo?) {
         guard let agent,
               agent.enabled == true,
-              agent.provider == "google-adk",
+              agent.provider == "claude-agent-sdk",
               let usage = agent.usage else {
             return
         }
         BillingService.shared.recordAgentUsage(
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,
-            model: agent.model ?? "gemini-2.5-flash"
+            model: agent.model ?? "claude-sonnet-4-6",
+            cacheReadInputTokens: usage.cacheReadInputTokens ?? 0,
+            cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+            costUSD: usage.costUSD
         )
     }
 
@@ -3075,7 +3078,7 @@ final class TranscriptionViewModel {
             let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
             sessionService.addConversation(finalTranscript, isSource: isSource)
 
-            // ⭐️ 交給 Google ADK Agent 做跨句合併、混合語言拆分、TTS 計畫與音訊重置建議
+            // ⭐️ 交給 Claude Agent SDK 做跨句合併、混合語言拆分、TTS 計畫與音訊重置建議
             scheduleDialogueAgentProcessing(for: finalTranscript)
 
             // Final 到了 → 如果沒有完整翻譯，對完整文字發翻譯

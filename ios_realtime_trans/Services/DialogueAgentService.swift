@@ -2,7 +2,7 @@
 //  DialogueAgentService.swift
 //  ios_realtime_trans
 //
-//  Google ADK dialogue agent client.
+//  Claude Agent SDK dialogue agent client.
 //
 
 import Foundation
@@ -97,6 +97,9 @@ struct DialogueAgentUsage: Codable, Equatable {
     let inputTokens: Int
     let outputTokens: Int
     let totalTokens: Int
+    let cacheReadInputTokens: Int?
+    let cacheCreationInputTokens: Int?
+    let costUSD: Double?
 }
 
 struct DialogueAgentInfo: Codable, Equatable {
