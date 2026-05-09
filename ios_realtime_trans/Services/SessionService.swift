@@ -38,6 +38,76 @@ struct ConversationItem: Codable {
     }
 }
 
+private func conversationString(_ value: Any?) -> String? {
+    if let string = value as? String {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    if let timestamp = value as? Timestamp {
+        return ISO8601DateFormatter().string(from: timestamp.dateValue())
+    }
+    if let date = value as? Date {
+        return ISO8601DateFormatter().string(from: date)
+    }
+    return nil
+}
+
+private func firstConversationString(in dict: [String: Any], keys: [String]) -> String {
+    for key in keys {
+        if let value = conversationString(dict[key]) {
+            return value
+        }
+    }
+    return ""
+}
+
+private func parseConversationItems(from rawValue: Any?) -> [ConversationItem] {
+    let rawArray: [Any]
+    if let array = rawValue as? [[String: Any]] {
+        rawArray = array
+    } else if let array = rawValue as? [Any] {
+        rawArray = array
+    } else {
+        return []
+    }
+
+    return rawArray.compactMap { item in
+        guard let dict = item as? [String: Any] else { return nil }
+
+        let original = firstConversationString(
+            in: dict,
+            keys: ["original", "originalText", "sourceText", "source", "text"]
+        )
+        let translated = firstConversationString(
+            in: dict,
+            keys: ["translated", "translation", "translatedText", "targetText", "target"]
+        )
+        guard !original.isEmpty || !translated.isEmpty else { return nil }
+
+        let timestamp = firstConversationString(
+            in: dict,
+            keys: ["timestamp", "createdAt", "updatedAt"]
+        )
+
+        let rawPosition = firstConversationString(in: dict, keys: ["position", "side"])
+        let position: String
+        if rawPosition == "left" || rawPosition == "right" {
+            position = rawPosition
+        } else if let isSource = dict["isSource"] as? Bool {
+            position = isSource ? "right" : "left"
+        } else {
+            position = "right"
+        }
+
+        return ConversationItem(
+            original: original,
+            translated: translated,
+            timestamp: timestamp,
+            position: position
+        )
+    }
+}
+
 // MARK: - Session Service
 
 @Observable
@@ -272,12 +342,12 @@ final class SessionService {
                 "updatedAt": FieldValue.serverTimestamp(),
                 // ⭐️ 保存計費數據
                 "billing": usage.toFirestoreData(),
-                "tokensUsed": usage.llmInputTokens + usage.llmOutputTokens,
+                "tokensUsed": usage.totalTokenCount,
                 "totalCost": usage.totalCostUSD
             ])
 
             print("✅ [Session] 結束 Session: \(sessionId), 持續: \(Int(duration))秒")
-            print("💰 [Session] 計費: STT \(String(format: "%.2f", usage.sttDurationSeconds))秒, LLM \(usage.llmInputTokens + usage.llmOutputTokens) tokens, TTS \(usage.ttsCharCount) chars")
+            print("💰 [Session] 計費: STT \(String(format: "%.2f", usage.sttDurationSeconds))秒, LLM \(usage.llmInputTokens + usage.llmOutputTokens) tokens, Agent \(usage.agentInputTokens + usage.agentOutputTokens) tokens, TTS \(usage.ttsCharCount) chars")
             print("💰 [Session] 總費用: $\(String(format: "%.6f", usage.totalCostUSD)), 額度: \(usage.totalCreditsUsed)")
 
             // 更新用戶統計
@@ -306,12 +376,12 @@ final class SessionService {
             // ⭐️ 使用 Firestore increment 確保原子性更新
             try await userRef.updateData([
                 "stats.totalSessions": FieldValue.increment(Int64(1)),
-                "stats.totalTokensUsed": FieldValue.increment(Int64(usage.llmInputTokens + usage.llmOutputTokens)),
+                "stats.totalTokensUsed": FieldValue.increment(Int64(usage.totalTokenCount)),
                 "stats.totalCost": FieldValue.increment(usage.totalCostUSD),
                 "updatedAt": FieldValue.serverTimestamp()
             ])
 
-            print("✅ [Session] 更新用戶統計: +1 session, +\(usage.llmInputTokens + usage.llmOutputTokens) tokens, +$\(String(format: "%.6f", usage.totalCostUSD))")
+            print("✅ [Session] 更新用戶統計: +1 session, +\(usage.totalTokenCount) tokens, +$\(String(format: "%.6f", usage.totalCostUSD))")
         } catch {
             print("⚠️ [Session] 更新用戶統計失敗: \(error.localizedDescription)")
         }
@@ -542,20 +612,27 @@ final class SessionService {
 
     /// 按需抓取單個 session 的對話內容（展開日期時呼叫）
     func fetchConversations(uid: String, sessionId: String) async throws -> [ConversationItem] {
-        let docRef = db.collection("users").document(uid).collection("sessions").document(sessionId)
+        let sessionsRef = db.collection("users").document(uid).collection("sessions")
+        let docRef = sessionsRef.document(sessionId)
         let doc = try await docRef.getDocument()
-        guard let data = doc.data(),
-              let convArray = data["conversations"] as? [[String: Any]] else {
-            return []
+        if let data = doc.data() {
+            let conversations = parseConversationItems(from: data["conversations"])
+            let count = data["conversationCount"] as? Int ?? conversations.count
+            if !conversations.isEmpty || count == 0 {
+                return conversations
+            }
         }
-        return convArray.map { dict in
-            ConversationItem(
-                original: dict["original"] as? String ?? "",
-                translated: dict["translated"] as? String ?? "",
-                timestamp: dict["timestamp"] as? String ?? "",
-                position: dict["position"] as? String ?? "right"
-            )
+
+        let snapshot = try await sessionsRef
+            .whereField("sessionId", isEqualTo: sessionId)
+            .limit(to: 1)
+            .getDocuments()
+
+        if let data = snapshot.documents.first?.data() {
+            return parseConversationItems(from: data["conversations"])
         }
+
+        return []
     }
 
     // MARK: - Private Fetch Methods
@@ -646,18 +723,11 @@ struct SessionSummary: Identifiable {
     let status: String
 
     // ⭐️ 對話內容延遲解析：列表只需要 metadata，展開時才呼叫 parseConversations()
-    private let rawConversations: [[String: Any]]
+    private let rawConversations: [Any]
 
     /// 解析對話內容（僅在展開時呼叫，避免首次載入時解析成千上萬的物件）
     func parseConversations() -> [ConversationItem] {
-        rawConversations.map { dict in
-            ConversationItem(
-                original: dict["original"] as? String ?? "",
-                translated: dict["translated"] as? String ?? "",
-                timestamp: dict["timestamp"] as? String ?? "",
-                position: dict["position"] as? String ?? "right"
-            )
-        }
+        parseConversationItems(from: rawConversations)
     }
 
     // ⭐️ 靜態 DateFormatter 快取（避免每個 session 都重新配置）
@@ -696,7 +766,7 @@ struct SessionSummary: Identifiable {
         self.status = data["status"] as? String ?? "unknown"
 
         // ⭐️ 只存原始字典，不解析 — 展開時才呼叫 parseConversations()
-        self.rawConversations = data["conversations"] as? [[String: Any]] ?? []
+        self.rawConversations = data["conversations"] as? [Any] ?? []
     }
 
     var formattedDuration: String {

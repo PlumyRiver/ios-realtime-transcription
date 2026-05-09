@@ -148,7 +148,7 @@ struct SessionHistoryView: View {
 
     var body: some View {
         NavigationStack {
-            SessionHistoryContent(state: state).equatable()
+            SessionHistoryContent(state: state)
                 .navigationTitle("對話紀錄")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -177,16 +177,14 @@ struct SessionHistoryView: View {
 
 // MARK: - 列表內容（只讀 sessions/favorites，不讀 rename 狀態）
 
-/// ⭐️ Equatable 確保父層 body 重算時，只要 state 是同一個引用就跳過子層 body
-private struct SessionHistoryContent: View, Equatable {
+private struct SessionHistoryContent: View {
     var state: SessionHistoryState
     @State private var expandedDate: String?
     @State private var conversationCache: [String: [ConversationItem]] = [:]
+    @State private var loadingConversationIds: Set<String> = []
+    @State private var failedConversationIds: Set<String> = []
     @State private var showFavoritesOnly = false
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.state === rhs.state
-    }
+    private static let conversationTimestampFormatter = ISO8601DateFormatter()
 
     var body: some View {
         // ⭐️ 計算一次，避免 filteredGroups 在 body 裡多次重算
@@ -296,14 +294,13 @@ private struct SessionHistoryContent: View, Equatable {
                         },
                         onStarLongPressed: {
                             if isFav { state.removeFavorite(dateKey: group.date) }
+                        },
+                        onExpandTapped: {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                expandedDate = expandedDate == group.date ? nil : group.date
+                            }
                         }
                     )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            expandedDate = expandedDate == group.date ? nil : group.date
-                        }
-                    }
 
                     if expandedDate == group.date {
                         expandedContent(for: group).transition(.opacity)
@@ -325,25 +322,13 @@ private struct SessionHistoryContent: View, Equatable {
 
     private func expandedContent(for group: DateGroup) -> some View {
         VStack(spacing: 0) {
-            ForEach(Array(group.sessions.enumerated()), id: \.element.id) { _, session in
+            ForEach(Array(sessionsOldestFirst(group.sessions).enumerated()), id: \.element.id) { _, session in
                 SessionDividerView(
                     text: session.sessionDividerText,
                     languagePair: session.languagePair,
                     time: session.formattedTime
                 )
-                let convs = cachedConversations(for: session)
-                if convs.isEmpty {
-                    Text("（無對話內容）")
-                        .font(.caption).foregroundStyle(.tertiary)
-                        .padding(.vertical, 8)
-                } else {
-                    VStack(spacing: 6) {
-                        ForEach(Array(convs.enumerated()), id: \.offset) { _, conv in
-                            ConversationBubble(conversation: conv)
-                        }
-                    }
-                    .padding(.horizontal, 16).padding(.vertical, 8)
-                }
+                conversationContent(for: session)
             }
         }
         .background(Color(.systemBackground))
@@ -351,25 +336,112 @@ private struct SessionHistoryContent: View, Equatable {
         .padding(.horizontal, 12).padding(.bottom, 4)
     }
 
-    private func cachedConversations(for session: SessionSummary) -> [ConversationItem] {
-        if let cached = conversationCache[session.id] { return cached }
+    @ViewBuilder
+    private func conversationContent(for session: SessionSummary) -> some View {
+        if let cached = conversationCache[session.id] {
+            if cached.isEmpty {
+                emptyConversationText(session.conversationCount > 0 ? "（找不到對話內容）" : "（無對話內容）")
+            } else {
+                conversationList(cached)
+            }
+        } else {
+            let parsed = session.parseConversations()
+            if !parsed.isEmpty {
+                conversationList(parsed)
+            } else if session.conversationCount > 0 {
+                if failedConversationIds.contains(session.id) {
+                    emptyConversationText("（載入對話內容失敗）")
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("載入對話內容…")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 8)
+                    .task(id: session.id) {
+                        await loadConversationsIfNeeded(for: session)
+                    }
+                }
+            } else {
+                emptyConversationText("（無對話內容）")
+            }
+        }
+    }
+
+    private func conversationList(_ conversations: [ConversationItem]) -> some View {
+        VStack(spacing: 6) {
+            ForEach(Array(conversationsOldestFirst(conversations).enumerated()), id: \.offset) { _, conv in
+                ConversationBubble(conversation: conv)
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
+    }
+
+    private func sessionsOldestFirst(_ sessions: [SessionSummary]) -> [SessionSummary] {
+        sessions.sorted { lhs, rhs in
+            if lhs.startTime == rhs.startTime { return lhs.id < rhs.id }
+            return lhs.startTime < rhs.startTime
+        }
+    }
+
+    private func conversationsOldestFirst(_ conversations: [ConversationItem]) -> [ConversationItem] {
+        conversations.enumerated().sorted { lhs, rhs in
+            let lhsDate = conversationDate(lhs.element.timestamp)
+            let rhsDate = conversationDate(rhs.element.timestamp)
+
+            switch (lhsDate, rhsDate) {
+            case let (lhsDate?, rhsDate?):
+                if lhsDate == rhsDate { return lhs.offset < rhs.offset }
+                return lhsDate < rhsDate
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            case (nil, nil):
+                return lhs.offset < rhs.offset
+            }
+        }.map(\.element)
+    }
+
+    private func conversationDate(_ timestamp: String) -> Date? {
+        let trimmed = timestamp.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return Self.conversationTimestampFormatter.date(from: trimmed)
+    }
+
+    private func emptyConversationText(_ text: String) -> some View {
+        Text(text)
+            .font(.caption).foregroundStyle(.tertiary)
+            .padding(.vertical, 8)
+    }
+
+    @MainActor
+    private func loadConversationsIfNeeded(for session: SessionSummary) async {
+        guard conversationCache[session.id] == nil,
+              !loadingConversationIds.contains(session.id) else {
+            return
+        }
+
         let parsed = session.parseConversations()
         if !parsed.isEmpty {
-            DispatchQueue.main.async { conversationCache[session.id] = parsed }
-            return parsed
+            conversationCache[session.id] = parsed
+            return
         }
-        if session.conversationCount > 0 {
-            let uid = state.uid
-            let sessionId = session.id
-            Task {
-                let convs = try? await SessionService.shared.fetchConversations(
-                    uid: uid, sessionId: sessionId
-                )
-                if let convs { conversationCache[sessionId] = convs }
-            }
-            return []
+
+        loadingConversationIds.insert(session.id)
+        failedConversationIds.remove(session.id)
+
+        do {
+            let convs = try await SessionService.shared.fetchConversations(
+                uid: state.uid,
+                sessionId: session.id
+            )
+            conversationCache[session.id] = convs
+        } catch {
+            failedConversationIds.insert(session.id)
         }
-        return []
+
+        loadingConversationIds.remove(session.id)
     }
 
     // MARK: - Empty States
@@ -470,32 +542,43 @@ private struct DateChipView: View {
     var favoriteName: String? = nil
     var onStarTapped: (() -> Void)? = nil
     var onStarLongPressed: (() -> Void)? = nil
+    var onExpandTapped: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(displayDate).font(.subheadline).fontWeight(.semibold)
-                    if let name = favoriteName {
-                        Text(name)
-                            .font(.caption2).fontWeight(.medium)
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.orange.opacity(0.12)).cornerRadius(6)
-                    }
-                }
-                Text("\(sessionCount)次通話 · \(messageCount)則訊息")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            Spacer()
             Image(systemName: isFavorited ? "star.fill" : "star")
                 .font(.system(size: 16))
                 .foregroundStyle(isFavorited ? .orange : .gray.opacity(0.5))
+                .frame(width: 36, height: 36)
+                .contentShape(Rectangle())
                 .onTapGesture { onStarTapped?() }
                 .onLongPressGesture { onStarLongPressed?() }
-            Image(systemName: "chevron.down")
-                .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
-                .rotationEffect(.degrees(isExpanded ? -180 : 0))
+
+            Button(action: { onExpandTapped?() }) {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(displayDate).font(.subheadline).fontWeight(.semibold)
+                            if let name = favoriteName {
+                                Text(name)
+                                    .font(.caption2).fontWeight(.medium)
+                                    .foregroundStyle(.orange)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.12)).cornerRadius(6)
+                            }
+                        }
+                        Text("\(sessionCount)次通話 · \(messageCount)則訊息")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.caption).fontWeight(.semibold).foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? -180 : 0))
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
         .background(

@@ -35,6 +35,20 @@ struct DialogueAgentAudioHealth: Codable, Equatable {
     var noValidSpeechMs: Int?
 }
 
+struct DialogueAgentFeatureFlags: Codable, Equatable {
+    var conversationMerge: Bool
+    var mixedLanguageSplit: Bool
+    var incrementalTTS: Bool
+    var audioRecovery: Bool
+
+    static let allEnabled = DialogueAgentFeatureFlags(
+        conversationMerge: true,
+        mixedLanguageSplit: true,
+        incrementalTTS: true,
+        audioRecovery: true
+    )
+}
+
 struct DialogueAgentRequest: Codable, Equatable {
     let agentMode: DialogueAgentMode
     let sourceLang: String
@@ -43,6 +57,7 @@ struct DialogueAgentRequest: Codable, Equatable {
     let previousTurns: [DialogueAgentPreviousTurn]
     let playedTTS: [DialogueAgentPlayedTTS]
     let audioHealth: DialogueAgentAudioHealth
+    let features: DialogueAgentFeatureFlags
 }
 
 struct DialogueAgentTurn: Codable, Equatable {
@@ -78,12 +93,19 @@ struct DialogueAgentAudioRecovery: Codable, Equatable {
     let dropTranscriptText: String
 }
 
+struct DialogueAgentUsage: Codable, Equatable {
+    let inputTokens: Int
+    let outputTokens: Int
+    let totalTokens: Int
+}
+
 struct DialogueAgentInfo: Codable, Equatable {
     let enabled: Bool?
     let provider: String?
     let model: String?
     let mode: String?
     let latencyMs: Int?
+    let usage: DialogueAgentUsage?
 }
 
 struct DialogueAgentResponse: Codable, Equatable {

@@ -76,6 +76,10 @@ private enum VMSettingsKey: String {
     case translationStyle
     case customStylePrompt
     case isLockScreenAutoEnd
+    case isDialogueAgentMergeEnabled
+    case isDialogueAgentMixedSplitEnabled
+    case isDialogueAgentTTSPreplayEnabled
+    case isDialogueAgentAudioRecoveryEnabled
 }
 
 @Observable
@@ -228,6 +232,69 @@ final class TranscriptionViewModel {
 
     /// 伺服器 URL（Cloud Run 部署的服務）
     var serverURL: String = "chirp3-ios-api-1027448899164.asia-east1.run.app"
+
+    // MARK: - Dialogue Agent Feature Flags
+
+    var isDialogueAgentMergeEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isDialogueAgentMergeEnabled, value: isDialogueAgentMergeEnabled)
+        }
+    }
+
+    var isDialogueAgentMixedSplitEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isDialogueAgentMixedSplitEnabled, value: isDialogueAgentMixedSplitEnabled)
+        }
+    }
+
+    var isDialogueAgentTTSPreplayEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isDialogueAgentTTSPreplayEnabled, value: isDialogueAgentTTSPreplayEnabled)
+        }
+    }
+
+    var isDialogueAgentAudioRecoveryEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isDialogueAgentAudioRecoveryEnabled, value: isDialogueAgentAudioRecoveryEnabled)
+        }
+    }
+
+    var isDialogueAgentEnabled: Bool {
+        get { isAnyDialogueAgentFeatureEnabled }
+        set {
+            setAllDialogueAgentFeatures(newValue)
+        }
+    }
+
+    var isAnyDialogueAgentFeatureEnabled: Bool {
+        isDialogueAgentMergeEnabled ||
+            isDialogueAgentMixedSplitEnabled ||
+            isDialogueAgentTTSPreplayEnabled ||
+            isDialogueAgentAudioRecoveryEnabled
+    }
+
+    var dialogueAgentFeatureFlags: DialogueAgentFeatureFlags {
+        DialogueAgentFeatureFlags(
+            conversationMerge: isDialogueAgentMergeEnabled,
+            mixedLanguageSplit: isDialogueAgentMixedSplitEnabled,
+            incrementalTTS: isDialogueAgentTTSPreplayEnabled,
+            audioRecovery: isDialogueAgentAudioRecoveryEnabled
+        )
+    }
+
+    private func setAllDialogueAgentFeatures(_ enabled: Bool) {
+        isDialogueAgentMergeEnabled = enabled
+        isDialogueAgentMixedSplitEnabled = enabled
+        isDialogueAgentTTSPreplayEnabled = enabled
+        isDialogueAgentAudioRecoveryEnabled = enabled
+        if !enabled {
+            cancelDialogueAgentTasks()
+        }
+    }
 
     // MARK: - ⭐️ 經濟模式
 
@@ -800,8 +867,20 @@ final class TranscriptionViewModel {
         if defaults.object(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue) != nil {
             isLockScreenAutoEnd = defaults.bool(forKey: VMSettingsKey.isLockScreenAutoEnd.rawValue)
         }
+        if defaults.object(forKey: VMSettingsKey.isDialogueAgentMergeEnabled.rawValue) != nil {
+            isDialogueAgentMergeEnabled = defaults.bool(forKey: VMSettingsKey.isDialogueAgentMergeEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isDialogueAgentMixedSplitEnabled.rawValue) != nil {
+            isDialogueAgentMixedSplitEnabled = defaults.bool(forKey: VMSettingsKey.isDialogueAgentMixedSplitEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isDialogueAgentTTSPreplayEnabled.rawValue) != nil {
+            isDialogueAgentTTSPreplayEnabled = defaults.bool(forKey: VMSettingsKey.isDialogueAgentTTSPreplayEnabled.rawValue)
+        }
+        if defaults.object(forKey: VMSettingsKey.isDialogueAgentAudioRecoveryEnabled.rawValue) != nil {
+            isDialogueAgentAudioRecoveryEnabled = defaults.bool(forKey: VMSettingsKey.isDialogueAgentAudioRecoveryEnabled.rawValue)
+        }
 
-        print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName)")
+        print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName), Agent=\(isAnyDialogueAgentFeatureEnabled)")
 
         // ⭐️ init 到此結束 — UI 可以立刻渲染
         // 重的工作（服務同步、Combine、生命週期）延遲到 deferredSetup()
@@ -1170,15 +1249,20 @@ final class TranscriptionViewModel {
 
     @MainActor
     private func scheduleDialogueAgentProcessing(for transcript: TranscriptMessage) {
-        scheduleDialogueAgent(for: transcript, mode: .realtime, delay: 0)
+        guard isAnyDialogueAgentFeatureEnabled else { return }
 
-        if transcripts.filter({ $0.isFinal }).count >= 2 {
+        if isDialogueAgentMixedSplitEnabled || isDialogueAgentTTSPreplayEnabled || isDialogueAgentAudioRecoveryEnabled {
+            scheduleDialogueAgent(for: transcript, mode: .realtime, delay: 0)
+        }
+
+        if isDialogueAgentMergeEnabled && transcripts.filter({ $0.isFinal }).count >= 2 {
             scheduleDialogueAgent(for: transcript, mode: .consolidate, delay: 0.8)
         }
     }
 
     @MainActor
     private func scheduleDialogueAgent(for transcript: TranscriptMessage, mode: DialogueAgentMode, delay: TimeInterval) {
+        guard isDialogueAgentModeEnabled(mode) else { return }
         let request = makeDialogueAgentRequest(for: transcript, mode: mode)
         let key = "\(transcript.id.uuidString)-\(mode.rawValue)"
         let service = dialogueAgentService
@@ -1202,6 +1286,8 @@ final class TranscriptionViewModel {
                 await MainActor.run {
                     guard let self else { return }
                     self.dialogueAgentTasks[key] = nil
+                    guard self.isDialogueAgentModeEnabled(mode) else { return }
+                    self.recordDialogueAgentBilling(response.agent)
                     self.applyDialogueAgentPlan(response, anchorTranscriptID: transcript.id, mode: mode)
                 }
             } catch {
@@ -1211,6 +1297,31 @@ final class TranscriptionViewModel {
                 }
             }
         }
+    }
+
+    private func isDialogueAgentModeEnabled(_ mode: DialogueAgentMode) -> Bool {
+        switch mode {
+        case .realtime:
+            return isDialogueAgentMixedSplitEnabled ||
+                isDialogueAgentTTSPreplayEnabled ||
+                isDialogueAgentAudioRecoveryEnabled
+        case .consolidate:
+            return isDialogueAgentMergeEnabled
+        }
+    }
+
+    private func recordDialogueAgentBilling(_ agent: DialogueAgentInfo?) {
+        guard let agent,
+              agent.enabled == true,
+              agent.provider == "google-adk",
+              let usage = agent.usage else {
+            return
+        }
+        BillingService.shared.recordAgentUsage(
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            model: agent.model ?? "gemini-2.5-flash"
+        )
     }
 
     @MainActor
@@ -1251,7 +1362,8 @@ final class TranscriptionViewModel {
             audioHealth: DialogueAgentAudioHealth(
                 repeatedNoiseCount: isLikelyNoise ? 4 : nil,
                 noValidSpeechMs: isLikelyNoise ? 9000 : nil
-            )
+            ),
+            features: dialogueAgentFeatureFlags
         )
     }
 
@@ -1261,7 +1373,7 @@ final class TranscriptionViewModel {
         anchorTranscriptID: UUID,
         mode: DialogueAgentMode
     ) {
-        if response.audioRecovery.shouldReset {
+        if isDialogueAgentAudioRecoveryEnabled && response.audioRecovery.shouldReset {
             dropNoisyTranscriptsIfNeeded(response: response, anchorTranscriptID: anchorTranscriptID)
             resetSTTStreamFromDialogueAgent(recovery: response.audioRecovery)
         }
@@ -1271,6 +1383,15 @@ final class TranscriptionViewModel {
         }
         let usableTurns = coalesceDialogueAgentTurns(rawUsableTurns)
         guard !usableTurns.isEmpty else { return }
+
+        let canModifyTranscriptShape = (mode == .realtime && isDialogueAgentMixedSplitEnabled) ||
+            (mode == .consolidate && isDialogueAgentMergeEnabled)
+        if !canModifyTranscriptShape {
+            if isDialogueAgentTTSPreplayEnabled {
+                playDialogueAgentTTSPlan(response, turns: usableTurns)
+            }
+            return
+        }
 
         let sourceIDs = Set(usableTurns.flatMap(\.sourceFragmentIds))
         var affectedIndices: [Int] = transcripts.enumerated().compactMap { index, transcript in
@@ -1320,7 +1441,9 @@ final class TranscriptionViewModel {
 
         lastFinalText = transcripts.last?.text ?? ""
         updateStats()
-        playDialogueAgentTTSPlan(response, turns: usableTurns)
+        if isDialogueAgentTTSPreplayEnabled {
+            playDialogueAgentTTSPlan(response, turns: usableTurns)
+        }
 
         print("🧠 [Dialogue Agent] 套用 \(mode.rawValue): turns=\(usableTurns.count), actions=\(response.actions.map(\.type).joined(separator: ","))")
     }
@@ -2293,6 +2416,7 @@ final class TranscriptionViewModel {
                 print("💰 [ViewModel] 本次會話總用量:")
                 print("   STT: \(String(format: "%.2f", usage.sttDurationSeconds))秒")
                 print("   LLM: \(usage.llmInputTokens)+\(usage.llmOutputTokens) tokens")
+                print("   Agent: \(usage.agentInputTokens)+\(usage.agentOutputTokens) tokens")
                 print("   TTS: \(usage.ttsCharCount) chars")
                 print("   總額度: \(usage.totalCreditsUsed)")
             }

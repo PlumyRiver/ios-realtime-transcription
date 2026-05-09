@@ -22,6 +22,12 @@ struct BillingPricing {
     static let llmInputPricePerToken: Double = llmInputPricePerMToken / 1_000_000.0
     static let llmOutputPricePerToken: Double = llmOutputPricePerMToken / 1_000_000.0
 
+    // Agent (Gemini 2.5 Flash): Input $0.30 USD/M tokens, Output $2.50 USD/M tokens
+    static let agentInputPricePerMToken: Double = 0.30
+    static let agentOutputPricePerMToken: Double = 2.50
+    static let agentInputPricePerToken: Double = agentInputPricePerMToken / 1_000_000.0
+    static let agentOutputPricePerToken: Double = agentOutputPricePerMToken / 1_000_000.0
+
     // TTS (Azure): $16 USD per million characters (Neural voices)
     // 參考: https://azure.microsoft.com/pricing/details/cognitive-services/speech-services/
     static let ttsPricePerMChar: Double = 16.0
@@ -43,6 +49,10 @@ struct SessionUsage {
     var llmInputTokens: Int = 0
     var llmOutputTokens: Int = 0
 
+    // Agent 用量
+    var agentInputTokens: Int = 0
+    var agentOutputTokens: Int = 0
+
     // TTS 用量（按字符數計算）
     var ttsCharCount: Int = 0
 
@@ -57,12 +67,22 @@ struct SessionUsage {
         return inputCost + outputCost
     }
 
+    var agentCostUSD: Double {
+        let inputCost = Double(agentInputTokens) * BillingPricing.agentInputPricePerToken
+        let outputCost = Double(agentOutputTokens) * BillingPricing.agentOutputPricePerToken
+        return inputCost + outputCost
+    }
+
     var ttsCostUSD: Double {
         return Double(ttsCharCount) * BillingPricing.ttsPricePerChar
     }
 
     var totalCostUSD: Double {
-        return sttCostUSD + llmCostUSD + ttsCostUSD
+        return sttCostUSD + llmCostUSD + agentCostUSD + ttsCostUSD
+    }
+
+    var totalTokenCount: Int {
+        return llmInputTokens + llmOutputTokens + agentInputTokens + agentOutputTokens
     }
 
     // 轉換為額度消耗
@@ -76,10 +96,14 @@ struct SessionUsage {
             "sttDurationSeconds": sttDurationSeconds,
             "llmInputTokens": llmInputTokens,
             "llmOutputTokens": llmOutputTokens,
+            "agentInputTokens": agentInputTokens,
+            "agentOutputTokens": agentOutputTokens,
             "ttsCharCount": ttsCharCount,
             "sttCostUSD": sttCostUSD,
             "llmCostUSD": llmCostUSD,
+            "agentCostUSD": agentCostUSD,
             "ttsCostUSD": ttsCostUSD,
+            "totalTokens": totalTokenCount,
             "totalCostUSD": totalCostUSD,
             "totalCreditsUsed": totalCreditsUsed
         ]
@@ -130,6 +154,7 @@ final class BillingService {
     /// ⭐️ 各項目累計消耗額度（用於顯示消耗組成）
     private(set) var sessionSTTCreditsUsed: Int = 0
     private(set) var sessionLLMCreditsUsed: Int = 0
+    private(set) var sessionAgentCreditsUsed: Int = 0
     private(set) var sessionTTSCreditsUsed: Int = 0
 
     /// ⭐️ 各項目累計用量（用於顯示詳細資訊）
@@ -137,6 +162,9 @@ final class BillingService {
     private(set) var sessionLLMInputTokens: Int = 0
     private(set) var sessionLLMOutputTokens: Int = 0
     private(set) var sessionLLMCallCount: Int = 0  // LLM 調用次數
+    private(set) var sessionAgentInputTokens: Int = 0
+    private(set) var sessionAgentOutputTokens: Int = 0
+    private(set) var sessionAgentCallCount: Int = 0
     private(set) var sessionTTSChars: Int = 0
 
     /// ⭐️ 音頻加速比（1.0 = 無加速，1.5 = 1.5x 加速）
@@ -163,6 +191,7 @@ final class BillingService {
         print("💰 [Billing] 結束計費會話")
         print("💰 [Billing] STT: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒, $\(String(format: "%.6f", currentUsage.sttCostUSD))")
         print("💰 [Billing] LLM: \(currentUsage.llmInputTokens) input + \(currentUsage.llmOutputTokens) output tokens, $\(String(format: "%.6f", currentUsage.llmCostUSD))")
+        print("💰 [Billing] Agent: \(currentUsage.agentInputTokens) input + \(currentUsage.agentOutputTokens) output tokens, $\(String(format: "%.6f", currentUsage.agentCostUSD))")
         print("💰 [Billing] TTS: \(currentUsage.ttsCharCount) chars, $\(String(format: "%.6f", currentUsage.ttsCostUSD))")
         print("💰 [Billing] 總計: $\(String(format: "%.6f", currentUsage.totalCostUSD)), 額度: \(currentUsage.totalCreditsUsed)")
 
@@ -379,6 +408,31 @@ final class BillingService {
         print("💰 [Billing] LLM[\(provider.rawValue)] #\(sessionLLMCallCount): +\(inputTokens) input, +\(outputTokens) output, 扣\(credits)額度 (累計: \(currentUsage.llmInputTokens)/\(currentUsage.llmOutputTokens))")
     }
 
+    /// 記錄 Dialogue Agent 用量並即時扣款
+    func recordAgentUsage(inputTokens: Int, outputTokens: Int, model: String) {
+        guard isBilling else { return }
+        guard inputTokens > 0 || outputTokens > 0 else { return }
+
+        currentUsage.agentInputTokens += inputTokens
+        currentUsage.agentOutputTokens += outputTokens
+
+        sessionAgentInputTokens += inputTokens
+        sessionAgentOutputTokens += outputTokens
+        sessionAgentCallCount += 1
+
+        let inputCost = Double(inputTokens) * BillingPricing.agentInputPricePerToken
+        let outputCost = Double(outputTokens) * BillingPricing.agentOutputPricePerToken
+        let totalCostUSD = inputCost + outputCost
+        let credits = Int(ceil(totalCostUSD * BillingPricing.creditsPerUSD))
+
+        if credits > 0 {
+            sessionAgentCreditsUsed += credits
+            deductCreditsImmediately(credits: credits, reason: "Agent[\(model)](\(inputTokens)+\(outputTokens))")
+        }
+
+        print("💰 [Billing] Agent[\(model)] #\(sessionAgentCallCount): +\(inputTokens) input, +\(outputTokens) output, 扣\(credits)額度 (累計: \(currentUsage.agentInputTokens)/\(currentUsage.agentOutputTokens))")
+    }
+
     /// 估算文本的 token 數（簡易估算：中文約 1.5 字/token，英文約 4 字符/token）
     static func estimateTokenCount(text: String) -> Int {
         // 計算中文字符數
@@ -514,7 +568,7 @@ final class BillingService {
         let userRef = db.collection("users").document(userId)
 
         try await userRef.updateData([
-            "stats.totalTokensUsed": FieldValue.increment(Int64(usage.llmInputTokens + usage.llmOutputTokens)),
+            "stats.totalTokensUsed": FieldValue.increment(Int64(usage.totalTokenCount)),
             "stats.totalCost": FieldValue.increment(usage.totalCostUSD),
             "updatedAt": FieldValue.serverTimestamp()
         ])

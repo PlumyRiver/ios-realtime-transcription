@@ -2546,6 +2546,46 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                Section {
+                    Toggle(isOn: $viewModel.isDialogueAgentEnabled) {
+                        HStack {
+                            Image(systemName: "wand.and.stars")
+                                .foregroundStyle(viewModel.isDialogueAgentEnabled ? .indigo : .secondary)
+                            VStack(alignment: .leading) {
+                                Text("啟用 Agent")
+                                Text(viewModel.isDialogueAgentEnabled ? "已啟用部分智慧處理" : "全部關閉，不呼叫 Agent")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .tint(.indigo)
+
+                    Toggle(isOn: $viewModel.isDialogueAgentMergeEnabled) {
+                        Label("對話式合併", systemImage: "arrow.triangle.merge")
+                    }
+                    .tint(.indigo)
+
+                    Toggle(isOn: $viewModel.isDialogueAgentMixedSplitEnabled) {
+                        Label("中日混合拆句", systemImage: "text.split")
+                    }
+                    .tint(.indigo)
+
+                    Toggle(isOn: $viewModel.isDialogueAgentTTSPreplayEnabled) {
+                        Label("提前語音播放", systemImage: "speaker.wave.2.bubble")
+                    }
+                    .tint(.indigo)
+
+                    Toggle(isOn: $viewModel.isDialogueAgentAudioRecoveryEnabled) {
+                        Label("雜音自動恢復", systemImage: "waveform.badge.magnifyingglass")
+                    }
+                    .tint(.indigo)
+                } header: {
+                    Text("Agent 智慧功能")
+                } footer: {
+                    Text("全部關閉時不會呼叫 Agent，也不產生 Agent token 成本。")
+                }
+
                 // ⭐️ 翻譯風格設定
                 Section("翻譯風格") {
                     Picker(selection: $viewModel.translationStyle) {
@@ -2941,6 +2981,7 @@ struct UsageDetailPopover: View {
     private var totalCredits: Int { billingService.sessionTotalCreditsUsed }
     private var sttCredits: Int { billingService.sessionSTTCreditsUsed }
     private var llmCredits: Int { billingService.sessionLLMCreditsUsed }
+    private var agentCredits: Int { billingService.sessionAgentCreditsUsed }
     private var ttsCredits: Int { billingService.sessionTTSCreditsUsed }
 
     /// 計算百分比
@@ -3001,6 +3042,19 @@ struct UsageDetailPopover: View {
                         ("調用", "\(billingService.sessionLLMCallCount) 次"),
                         ("Input", "\(billingService.sessionLLMInputTokens)"),
                         ("Output", "\(billingService.sessionLLMOutputTokens)")
+                    ]
+                )
+
+                UsageItemView(
+                    icon: "wand.and.stars",
+                    iconColor: .indigo,
+                    title: "Agent 智慧處理",
+                    credits: agentCredits,
+                    percentage: percentage(of: agentCredits),
+                    details: [
+                        ("調用", "\(billingService.sessionAgentCallCount) 次"),
+                        ("Input", "\(billingService.sessionAgentInputTokens)"),
+                        ("Output", "\(billingService.sessionAgentOutputTokens)")
                     ]
                 )
 
