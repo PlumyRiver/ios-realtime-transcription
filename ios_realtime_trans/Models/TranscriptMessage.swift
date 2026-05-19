@@ -419,13 +419,14 @@ enum TTSPlaybackMode: Int, CaseIterable {
 
 /// 語言選項
 /// 支援 ElevenLabs Scribe v2 (STT) 和 Azure TTS 共同支援的語言
-/// 共 74 種語言（含自動檢測）
+/// 共 75 種語言（含自動檢測）
 /// 排序：台灣常用 > 東南亞 > 東亞 > 南亞 > 中東 > 歐洲 > 非洲
 enum Language: String, CaseIterable, Identifiable {
     case auto = "auto"
 
     // ===== 🔥 台灣人最常用 TOP 20 =====
     case zh = "zh"      // 中文
+    case yue = "yue"    // 廣東話/粵語
     case en = "en"      // 英文
     case ja = "ja"      // 日文
     case ko = "ko"      // 韓文
@@ -526,6 +527,7 @@ enum Language: String, CaseIterable, Identifiable {
         // 常用語言
         case .auto: return "🌐 自動檢測"
         case .zh: return "🇹🇼 中文"
+        case .yue: return "🇭🇰 廣東話"
         case .en: return "🇺🇸 英文"
         case .ja: return "🇯🇵 日文"
         case .ko: return "🇰🇷 韓文"
@@ -608,6 +610,7 @@ enum Language: String, CaseIterable, Identifiable {
         // 常用語言
         case .auto: return "🌐"
         case .zh: return "🇹🇼"
+        case .yue: return "🇭🇰"
         case .en: return "🇺🇸"
         case .ja: return "🇯🇵"
         case .ko: return "🇰🇷"
@@ -691,6 +694,7 @@ enum Language: String, CaseIterable, Identifiable {
         // 常用語言
         case .auto: return "自動"
         case .zh: return "中文"
+        case .yue: return "廣東話"
         case .en: return "英文"
         case .ja: return "日文"
         case .ko: return "韓文"
@@ -775,6 +779,7 @@ enum Language: String, CaseIterable, Identifiable {
         // 🔥 台灣常用 TOP 20
         case .auto: return "zh-TW"      // 預設台灣中文
         case .zh: return "zh-TW"        // 繁體中文-台灣
+        case .yue: return "zh-HK"        // 廣東話/粵語-香港
         case .en: return "en-US"        // 英文-美國
         case .ja: return "ja-JP"        // 日文-日本
         case .ko: return "ko-KR"        // 韓文-韓國
