@@ -177,6 +177,9 @@ final class WebRTCAudioManager: NSObject {
         }
     }
 
+    /// 背景演講使用遠場收音，不套用近場通話用的 AEC／降噪。
+    var isLectureCaptureMode: Bool = false
+
     // MARK: - 麥克風增益設定
 
     /// ⭐️ 麥克風增益（1.0 = 原始音量，2.0 = 兩倍，最大 4.0）
@@ -261,6 +264,11 @@ final class WebRTCAudioManager: NSObject {
 
     /// 是否正在進行 Apple TTS 緩衝播放（用來判斷是否屬於 Apple 路徑）
     private var isAppleTTSBufferedPlayback: Bool = false
+
+    /// GPT Live 2 需要用實際播完的 frame 數回報 truncate 位置。
+    private var isGPTRealtimeBufferedPlayback: Bool = false
+    private var bufferedPlaybackPlayedFrames: AVAudioFramePosition = 0
+    private var bufferedPlaybackSampleRate: Double = 0
 
     // MARK: - Audio Buffer
 
@@ -596,7 +604,7 @@ final class WebRTCAudioManager: NSObject {
         rtcAudioSession.lockForConfiguration()
         do {
             try rtcAudioSession.setCategory(AVAudioSession.Category.playAndRecord)
-            try rtcAudioSession.setMode(AVAudioSession.Mode.voiceChat)
+            try rtcAudioSession.setMode(isLectureCaptureMode ? .measurement : .voiceChat)
             try rtcAudioSession.setActive(true)
         } catch {
             print("❌ [WebRTC] 音頻會話配置失敗: \(error)")
@@ -609,10 +617,10 @@ final class WebRTCAudioManager: NSObject {
         let audioConstraints = RTCMediaConstraints(
             mandatoryConstraints: nil,
             optionalConstraints: [
-                "googEchoCancellation": "true",
+                "googEchoCancellation": isLectureCaptureMode ? "false" : "true",
                 "googAutoGainControl": "false",
-                "googNoiseSuppression": "true",
-                "googHighpassFilter": "true"
+                "googNoiseSuppression": isLectureCaptureMode ? "false" : "true",
+                "googHighpassFilter": isLectureCaptureMode ? "false" : "true"
             ]
         )
 
@@ -994,6 +1002,12 @@ final class WebRTCAudioManager: NSObject {
 
     // MARK: - Push-to-Talk
 
+    /// PTT 閒置時輸入 buffer 仍可能累積喇叭回音；開始新一輪前丟棄。
+    func discardPendingInputAudio() {
+        audioBufferCollector.removeAll(keepingCapacity: true)
+        preBuffer.removeAll(keepingCapacity: true)
+    }
+
     func startSending() {
         // ⭐️ 取消尾音緩衝計時器（如果正在運行）
         pttTrailingTimer?.invalidate()
@@ -1190,10 +1204,13 @@ final class WebRTCAudioManager: NSObject {
         // ⭐️ 同時清掉 Apple TTS 緩衝播放的狀態（避免殘留 callback / counters）
         if isAppleTTSBufferedPlayback {
             isAppleTTSBufferedPlayback = false
+            isGPTRealtimeBufferedPlayback = false
             appleTTSCompletionCallback = nil
             appleTTSConverter = nil
             appleTTSScheduledBufferCount = 0
             appleTTSPlayedBufferCount = 0
+            bufferedPlaybackPlayedFrames = 0
+            bufferedPlaybackSampleRate = 0
             appleTTSSynthesisFinished = false
             ttsPlayerNode?.reset()
         }
@@ -1268,6 +1285,9 @@ final class WebRTCAudioManager: NSObject {
         appleTTSSynthesisFinished = false
         appleTTSCompletionCallback = completion
         isAppleTTSBufferedPlayback = true
+        isGPTRealtimeBufferedPlayback = false
+        bufferedPlaybackPlayedFrames = 0
+        bufferedPlaybackSampleRate = 0
 
         // 確保 player node 在播放中（scheduleBuffer 才會立刻消費）
         if !player.isPlaying {
@@ -1280,6 +1300,47 @@ final class WebRTCAudioManager: NSObject {
         //   完成判定改用 (synthesisFinished && playedCount == scheduledCount)。
 
         print("🔊 [WebRTC] Apple TTS 緩衝播放開始: \(text?.prefix(30) ?? "unknown")...")
+    }
+
+    func beginGPTRealtimePlayback(completion: @escaping () -> Void) throws {
+        try beginAppleTTSPlayback(text: "GPT Live 2", completion: completion)
+        isGPTRealtimeBufferedPlayback = true
+    }
+
+    var currentGPTRealtimePlaybackDurationMs: Int {
+        guard isGPTRealtimeBufferedPlayback, bufferedPlaybackSampleRate > 0 else { return 0 }
+        return max(0, Int((Double(bufferedPlaybackPlayedFrames) / bufferedPlaybackSampleRate) * 1_000))
+    }
+
+    func scheduleGPTRealtimePCM24k(_ data: Data) {
+        guard !data.isEmpty,
+              data.count.isMultiple(of: 2),
+              let format = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: 24_000,
+                channels: 1,
+                interleaved: true
+              ),
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: AVAudioFrameCount(data.count / 2)
+              ),
+              let channel = buffer.int16ChannelData?.pointee else { return }
+
+        buffer.frameLength = AVAudioFrameCount(data.count / 2)
+        data.withUnsafeBytes { raw in
+            guard let baseAddress = raw.baseAddress else { return }
+            memcpy(channel, baseAddress, data.count)
+        }
+        scheduleAppleTTSBuffer(buffer)
+    }
+
+    func finishGPTRealtimePlayback() {
+        markAppleTTSSynthesisFinished()
+    }
+
+    func stopGPTRealtimePlayback() {
+        stopAppleTTSPlayback()
     }
 
     /// 排程一個來自 AVSpeechSynthesizer.write 的 PCM buffer 到 EQ 鏈播放
@@ -1350,11 +1411,18 @@ final class WebRTCAudioManager: NSObject {
         }
 
         appleTTSScheduledBufferCount += 1
+        bufferedPlaybackSampleRate = targetFormat.sampleRate
+        let scheduledFrames = AVAudioFramePosition(outputBuffer.frameLength)
 
         player.scheduleBuffer(outputBuffer, at: nil, options: []) { [weak self] in
             DispatchQueue.main.async {
-                self?.onAppleTTSBufferPlayed()
+                self?.onAppleTTSBufferPlayed(frameCount: scheduledFrames)
             }
+        }
+        // The network stream can briefly underflow. A newly scheduled buffer
+        // does not reliably restart AVAudioPlayerNode on every iOS version.
+        if !player.isPlaying {
+            player.play()
         }
     }
 
@@ -1371,16 +1439,19 @@ final class WebRTCAudioManager: NSObject {
 
     /// 立即停止 Apple TTS 緩衝播放（用於 stop / skip）
     func stopAppleTTSPlayback() {
-        DispatchQueue.main.async { [weak self] in
+        let stop = { [weak self] in
             guard let self = self else { return }
             guard self.isAppleTTSBufferedPlayback else { return }
 
             self.isAppleTTSBufferedPlayback = false
+            self.isGPTRealtimeBufferedPlayback = false
             self.ttsPlayerNode?.stop()
             self.ttsPlayerNode?.reset()
             self.appleTTSConverter = nil
             self.appleTTSScheduledBufferCount = 0
             self.appleTTSPlayedBufferCount = 0
+            self.bufferedPlaybackPlayedFrames = 0
+            self.bufferedPlaybackSampleRate = 0
             self.appleTTSSynthesisFinished = false
 
             self.isPlayingTTS = false
@@ -1393,11 +1464,17 @@ final class WebRTCAudioManager: NSObject {
 
             print("⏹️ [WebRTC] Apple TTS 緩衝播放已停止")
         }
+        if Thread.isMainThread {
+            stop()
+        } else {
+            DispatchQueue.main.async(execute: stop)
+        }
     }
 
-    private func onAppleTTSBufferPlayed() {
+    private func onAppleTTSBufferPlayed(frameCount: AVAudioFramePosition) {
         guard isAppleTTSBufferedPlayback else { return }
         appleTTSPlayedBufferCount += 1
+        bufferedPlaybackPlayedFrames += max(0, frameCount)
         checkAppleTTSCompletion()
     }
 
@@ -1411,6 +1488,7 @@ final class WebRTCAudioManager: NSObject {
         print("✅ [WebRTC] Apple TTS 緩衝播放完成（\(appleTTSPlayedBufferCount) buffers）")
 
         isAppleTTSBufferedPlayback = false
+        isGPTRealtimeBufferedPlayback = false
         isPlayingTTS = false
         currentTTSText = nil
         playbackTimer?.invalidate()
@@ -1421,6 +1499,8 @@ final class WebRTCAudioManager: NSObject {
         appleTTSConverter = nil
         appleTTSScheduledBufferCount = 0
         appleTTSPlayedBufferCount = 0
+        bufferedPlaybackPlayedFrames = 0
+        bufferedPlaybackSampleRate = 0
         appleTTSSynthesisFinished = false
 
         cb?()
@@ -1603,13 +1683,17 @@ extension WebRTCAudioManager: RTCAudioDeviceModuleDelegate {
             return 0
         }
 
-        // ⭐️ 啟用 Voice Processing（支援系統 Voice Isolation）
+        // 即時口譯保留 AEC；背景演講停用近場通話處理，避免遠處聲音被當成噪音。
         let inputNode = engine.inputNode
         do {
-            try inputNode.setVoiceProcessingEnabled(true)
-            inputNode.isVoiceProcessingAGCEnabled = true
-            inputNode.isVoiceProcessingBypassed = false
-            print("✅ [WebRTC Delegate] Voice Processing 已啟用（支援 Voice Isolation）")
+            try inputNode.setVoiceProcessingEnabled(!isLectureCaptureMode)
+            if isLectureCaptureMode {
+                print("✅ [WebRTC Delegate] 演講收音：Voice Processing 已停用")
+            } else {
+                inputNode.isVoiceProcessingAGCEnabled = true
+                inputNode.isVoiceProcessingBypassed = false
+                print("✅ [WebRTC Delegate] Voice Processing 已啟用（支援 Voice Isolation）")
+            }
         } catch {
             print("⚠️ [WebRTC Delegate] Voice Processing 啟用失敗: \(error)")
         }

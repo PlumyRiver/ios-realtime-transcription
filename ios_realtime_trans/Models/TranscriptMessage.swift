@@ -54,6 +54,7 @@ enum STTLanguageDetectionMode: String, CaseIterable, Identifiable {
 enum STTProvider: String, CaseIterable, Identifiable {
     case chirp3 = "chirp3"           // Google Cloud Chirp 3
     case elevenLabs = "elevenlabs"   // ElevenLabs Scribe v2 Realtime
+    case gptRealtime2 = "gpt-realtime-2" // OpenAI GPT Live 2 voice + transcripts
     case apple = "apple"             // Apple 內建（設備端雙語言並行）
 
     var id: String { rawValue }
@@ -62,6 +63,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "Google Chirp 3"
         case .elevenLabs: return "ElevenLabs Scribe"
+        case .gptRealtime2: return "GPT Live 2"
         case .apple: return "Apple 內建"
         }
     }
@@ -70,6 +72,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "Chirp3"
         case .elevenLabs: return "ElevenLabs"
+        case .gptRealtime2: return "GPTLive2"
         case .apple: return "Apple"
         }
     }
@@ -78,6 +81,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "waveform"
         case .elevenLabs: return "waveform.circle.fill"
+        case .gptRealtime2: return "waveform.and.mic"
         case .apple: return "apple.logo"
         }
     }
@@ -87,6 +91,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "~300-500ms"
         case .elevenLabs: return "~150ms"
+        case .gptRealtime2: return "~200-500ms"
         case .apple: return "~100ms (本地)"
         }
     }
@@ -96,6 +101,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return 100
         case .elevenLabs: return 92
+        case .gptRealtime2: return 100
         case .apple: return 60  // 設備端支援約 60 種語言
         }
     }
@@ -115,6 +121,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "高準確度，100+ 語言"
         case .elevenLabs: return "低延遲，自動 VAD"
+        case .gptRealtime2: return "語音翻譯，同步顯示原文與譯文"
         case .apple: return "免費離線，雙語並行"
         }
     }
@@ -124,6 +131,7 @@ enum STTProvider: String, CaseIterable, Identifiable {
         switch self {
         case .chirp3: return "串流識別，雲端處理"
         case .elevenLabs: return "串流識別 + VAD"
+        case .gptRealtime2: return "原生語音理解 + 雙向 transcript"
         case .apple: return "雙語並行，信心度選擇"
         }
     }

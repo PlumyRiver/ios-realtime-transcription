@@ -81,6 +81,18 @@ struct SessionUsage {
     // STT 用量
     var sttDurationSeconds: Double = 0
 
+    // GPT Live 2 combines realtime reasoning, audio generation, and the
+    // separately billed GPT Transcribe input transcript.
+    var gptRealtimeInputTokens: Int = 0
+    var gptRealtimeOutputTokens: Int = 0
+    var gptRealtimeTextInputTokens: Int = 0
+    var gptRealtimeAudioInputTokens: Int = 0
+    var gptRealtimeCachedInputTokens: Int = 0
+    var gptRealtimeTextOutputTokens: Int = 0
+    var gptRealtimeAudioOutputTokens: Int = 0
+    var gptTranscribeDurationSeconds: Double = 0
+    var gptRealtimeCostUSD: Double = 0
+
     // LLM 翻譯用量
     var llmInputTokens: Int = 0
     var llmOutputTokens: Int = 0
@@ -115,11 +127,12 @@ struct SessionUsage {
     }
 
     var totalCostUSD: Double {
-        return sttCostUSD + llmCostUSD + agentCostUSD + ttsCostUSD
+        return sttCostUSD + gptRealtimeCostUSD + llmCostUSD + agentCostUSD + ttsCostUSD
     }
 
     var totalTokenCount: Int {
-        return llmInputTokens + llmOutputTokens + agentInputTokens + agentOutputTokens
+        return gptRealtimeInputTokens + gptRealtimeOutputTokens +
+            llmInputTokens + llmOutputTokens + agentInputTokens + agentOutputTokens
     }
 
     // 轉換為額度消耗
@@ -131,6 +144,15 @@ struct SessionUsage {
     func toFirestoreData() -> [String: Any] {
         return [
             "sttDurationSeconds": sttDurationSeconds,
+            "gptRealtimeInputTokens": gptRealtimeInputTokens,
+            "gptRealtimeOutputTokens": gptRealtimeOutputTokens,
+            "gptRealtimeTextInputTokens": gptRealtimeTextInputTokens,
+            "gptRealtimeAudioInputTokens": gptRealtimeAudioInputTokens,
+            "gptRealtimeCachedInputTokens": gptRealtimeCachedInputTokens,
+            "gptRealtimeTextOutputTokens": gptRealtimeTextOutputTokens,
+            "gptRealtimeAudioOutputTokens": gptRealtimeAudioOutputTokens,
+            "gptTranscribeDurationSeconds": gptTranscribeDurationSeconds,
+            "gptRealtimeCostUSD": gptRealtimeCostUSD,
             "llmInputTokens": llmInputTokens,
             "llmOutputTokens": llmOutputTokens,
             "agentInputTokens": agentInputTokens,
@@ -192,12 +214,21 @@ final class BillingService {
 
     /// ⭐️ 各項目累計消耗額度（用於顯示消耗組成）
     private(set) var sessionSTTCreditsUsed: Int = 0
+    private(set) var sessionGPTRealtimeCreditsUsed: Int = 0
+    private var currentSessionGPTRealtimeCreditsDeducted: Int = 0
     private(set) var sessionLLMCreditsUsed: Int = 0
     private(set) var sessionAgentCreditsUsed: Int = 0
     private(set) var sessionTTSCreditsUsed: Int = 0
 
     /// ⭐️ 各項目累計用量（用於顯示詳細資訊）
     private(set) var sessionSTTSeconds: Double = 0
+    private(set) var sessionGPTRealtimeInputTokens: Int = 0
+    private(set) var sessionGPTRealtimeOutputTokens: Int = 0
+    private(set) var sessionGPTRealtimeAudioInputTokens: Int = 0
+    private(set) var sessionGPTRealtimeAudioOutputTokens: Int = 0
+    private(set) var sessionGPTRealtimeCallCount: Int = 0
+    private(set) var sessionGPTTranscribeSeconds: Double = 0
+    private(set) var sessionGPTTranscribeSegmentCount: Int = 0
     private(set) var sessionLLMInputTokens: Int = 0
     private(set) var sessionLLMOutputTokens: Int = 0
     private(set) var sessionLLMCallCount: Int = 0  // LLM 調用次數
@@ -222,6 +253,7 @@ final class BillingService {
     func startSession() {
         print("💰 [Billing] 開始計費會話")
         currentUsage = SessionUsage()
+        currentSessionGPTRealtimeCreditsDeducted = 0
         isBilling = true
     }
 
@@ -229,6 +261,7 @@ final class BillingService {
     func endSession() -> SessionUsage {
         print("💰 [Billing] 結束計費會話")
         print("💰 [Billing] STT: \(String(format: "%.2f", currentUsage.sttDurationSeconds))秒, $\(String(format: "%.6f", currentUsage.sttCostUSD))")
+        print("💰 [Billing] GPT Live 2: \(currentUsage.gptRealtimeInputTokens)+\(currentUsage.gptRealtimeOutputTokens) tokens, STT \(String(format: "%.2f", currentUsage.gptTranscribeDurationSeconds))秒, $\(String(format: "%.6f", currentUsage.gptRealtimeCostUSD))")
         print("💰 [Billing] LLM: \(currentUsage.llmInputTokens) input + \(currentUsage.llmOutputTokens) output tokens, $\(String(format: "%.6f", currentUsage.llmCostUSD))")
         print("💰 [Billing] Agent: \(currentUsage.agentInputTokens) input + \(currentUsage.agentOutputTokens) output tokens, $\(String(format: "%.6f", currentUsage.agentCostUSD))")
         print("💰 [Billing] TTS: \(currentUsage.ttsCharCount) chars, $\(String(format: "%.6f", currentUsage.ttsCostUSD))")
@@ -445,6 +478,45 @@ final class BillingService {
         }
 
         print("💰 [Billing] LLM[\(provider.rawValue)] #\(sessionLLMCallCount): +\(inputTokens) input, +\(outputTokens) output, 扣\(credits)額度 (累計: \(currentUsage.llmInputTokens)/\(currentUsage.llmOutputTokens))")
+    }
+
+    /// Records backend-priced GPT Live 2 usage. The backend applies the exact
+    /// OpenAI text/audio/cached token rates and GPT Transcribe per-minute rate.
+    func recordGPTRealtimeUsage(_ usage: GPTRealtime2Usage) {
+        guard isBilling else { return }
+        guard usage.costUSD > 0 || usage.inputTokens > 0 || usage.outputTokens > 0 else { return }
+
+        currentUsage.gptRealtimeInputTokens += usage.inputTokens
+        currentUsage.gptRealtimeOutputTokens += usage.outputTokens
+        currentUsage.gptRealtimeTextInputTokens += usage.textInputTokens
+        currentUsage.gptRealtimeAudioInputTokens += usage.audioInputTokens
+        currentUsage.gptRealtimeCachedInputTokens += usage.cachedInputTokens
+        currentUsage.gptRealtimeTextOutputTokens += usage.textOutputTokens
+        currentUsage.gptRealtimeAudioOutputTokens += usage.audioOutputTokens
+        currentUsage.gptTranscribeDurationSeconds += Double(usage.audioDurationMs) / 1_000
+        currentUsage.gptRealtimeCostUSD += usage.costUSD
+
+        sessionGPTRealtimeInputTokens += usage.inputTokens
+        sessionGPTRealtimeOutputTokens += usage.outputTokens
+        sessionGPTRealtimeAudioInputTokens += usage.audioInputTokens
+        sessionGPTRealtimeAudioOutputTokens += usage.audioOutputTokens
+        if usage.category == "gpt-transcribe" {
+            sessionGPTTranscribeSeconds += Double(usage.audioDurationMs) / 1_000
+            sessionGPTTranscribeSegmentCount += 1
+        } else {
+            sessionGPTRealtimeCallCount += 1
+        }
+
+        let targetCredits = Int(ceil(currentUsage.gptRealtimeCostUSD * BillingPricing.creditsPerUSD))
+        let credits = max(0, targetCredits - currentSessionGPTRealtimeCreditsDeducted)
+        if credits > 0 {
+            currentSessionGPTRealtimeCreditsDeducted += credits
+            sessionGPTRealtimeCreditsUsed += credits
+            deductCreditsImmediately(
+                credits: credits,
+                reason: "GPT Live 2[\(usage.category)]($\(String(format: "%.6f", usage.costUSD)))"
+            )
+        }
     }
 
     /// 記錄 Dialogue Agent 用量並即時扣款

@@ -885,7 +885,10 @@ struct BottomControlBar: View, Equatable {
     }
 
     private var waveformTint: Color {
-        viewModel.isVADMode ? .green : .orange
+        if viewModel.isBackgroundLectureModeEnabled {
+            return .teal
+        }
+        return viewModel.isVADMode ? .green : .orange
     }
 
     private var controlSpacing: CGFloat {
@@ -961,8 +964,15 @@ struct InCallControlRow: View {
             ZStack {
                 // 正常狀態：TTS + 錄音 真正居中，結束通話用 overlay 放右側
                 if !isEndCallPressed {
-                    // ⭐️ 根據經濟模式切換 UI
-                    if viewModel.isEconomyMode {
+                    if viewModel.isBackgroundLectureModeEnabled {
+                        lectureListeningButton
+                            .frame(maxWidth: .infinity)
+                            .overlay(alignment: .trailing) {
+                                endCallButton
+                                    .padding(.trailing, 4)
+                            }
+                            .transition(.opacity)
+                    } else if viewModel.isEconomyMode {
                         // 經濟模式：TTS + 單麥克風（按住錄音，放開比較兩種語言）
                         HStack(spacing: 40) {
                             ttsButton
@@ -998,6 +1008,28 @@ struct InCallControlRow: View {
         .frame(height: 100)  // ⭐️ 給標籤留空間
         .onAppear {
             hapticGenerator.prepare()
+        }
+    }
+
+    private var lectureListeningButton: some View {
+        VStack(spacing: 5) {
+            ZStack {
+                Circle()
+                    .fill(Color.teal.opacity(0.14))
+                    .frame(width: buttonSize, height: buttonSize)
+                Circle()
+                    .fill(Color.teal)
+                    .frame(width: buttonSize - 10, height: buttonSize - 10)
+                    .shadow(color: Color.teal.opacity(0.35), radius: 8)
+                Image(systemName: viewModel.isBackgroundLectureBatchProcessing ? "ellipsis.bubble.fill" : "waveform")
+                    .font(.system(size: iconSize, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+
+            Text(viewModel.isBackgroundLectureBatchProcessing ? "轉錄處理中" : "背景收音中")
+                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundStyle(.teal)
         }
     }
 
@@ -1402,11 +1434,11 @@ struct LanguageSelectorRow: View {
                 }
                 .disabled(viewModel.isRecording)
 
-                Image(systemName: "arrow.right")
+                Image(systemName: viewModel.isBackgroundLectureModeEnabled ? "arrow.left.arrow.right" : "arrow.right")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                // 目標語言按鈕
+                // 目標語言按鈕；背景演講模式會把兩側都當作 STT 語言提示。
                 Button {
                     showTargetPicker = true
                 } label: {
@@ -1429,8 +1461,19 @@ struct LanguageSelectorRow: View {
 
             Spacer()
 
-            // ⭐️ 模式切換開關（仿開講AI設計）
-            InputModeToggle(viewModel: viewModel)
+            if viewModel.isBackgroundLectureModeEnabled {
+                Label("雙語", systemImage: "person.wave.2.fill")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.teal)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.teal.opacity(0.12))
+                    .clipShape(Capsule())
+            } else {
+                // ⭐️ 模式切換開關（仿開講AI設計）
+                InputModeToggle(viewModel: viewModel)
+            }
         }
         // 來源語言全螢幕選擇器
         .fullScreenCover(isPresented: $showSourcePicker) {
@@ -1772,7 +1815,9 @@ struct CenteredCallButton: View {
     // 按鈕顏色
     private var thumbGradient: LinearGradient {
         LinearGradient(
-            colors: [Color.green, Color.mint],
+            colors: viewModel.isBackgroundLectureModeEnabled
+                ? [Color.teal, Color.cyan]
+                : [Color.green, Color.mint],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )
@@ -1786,18 +1831,18 @@ struct CenteredCallButton: View {
             ZStack {
                 // 背景軌道
                 RoundedRectangle(cornerRadius: trackHeight / 2)
-                    .fill(Color.green.opacity(0.15))
+                    .fill((viewModel.isBackgroundLectureModeEnabled ? Color.teal : Color.green).opacity(0.15))
                     .frame(height: trackHeight)
                     .overlay(
                         RoundedRectangle(cornerRadius: trackHeight / 2)
-                            .stroke(Color.green.opacity(0.3), lineWidth: 1)
+                            .stroke((viewModel.isBackgroundLectureModeEnabled ? Color.teal : Color.green).opacity(0.3), lineWidth: 1)
                     )
 
                 // 左邊圖標（麥克風）
                 HStack {
-                    Image(systemName: "mic.fill")
+                    Image(systemName: viewModel.isBackgroundLectureModeEnabled ? "person.wave.2.fill" : "mic.fill")
                         .font(.title2)
-                        .foregroundStyle(.green.opacity(0.5))
+                        .foregroundStyle((viewModel.isBackgroundLectureModeEnabled ? Color.teal : Color.green).opacity(0.5))
                         .padding(.leading, 20)
                     Spacer()
                 }
@@ -1805,14 +1850,14 @@ struct CenteredCallButton: View {
                 // 右邊圖標（開始通話）
                 HStack {
                     Spacer()
-                    Image(systemName: "phone.fill")
+                    Image(systemName: viewModel.isBackgroundLectureModeEnabled ? "waveform.badge.mic" : "phone.fill")
                         .font(.title2)
-                        .foregroundStyle(.green.opacity(0.8))
+                        .foregroundStyle((viewModel.isBackgroundLectureModeEnabled ? Color.teal : Color.green).opacity(0.8))
                         .padding(.trailing, 20)
                 }
 
                 // 中間提示文字
-                Text("滑動開始通話 →")
+                Text(viewModel.isBackgroundLectureModeEnabled ? "滑動開始聽演講 →" : "滑動開始通話 →")
                     .font(.subheadline)
                     .fontWeight(.medium)
                     .foregroundStyle(.secondary)
@@ -1821,9 +1866,9 @@ struct CenteredCallButton: View {
                 Circle()
                     .fill(thumbGradient)
                     .frame(width: thumbSize, height: thumbSize)
-                    .shadow(color: .green.opacity(0.4), radius: 8, y: 4)
+                    .shadow(color: (viewModel.isBackgroundLectureModeEnabled ? Color.teal : Color.green).opacity(0.4), radius: 8, y: 4)
                     .overlay(
-                        Image(systemName: "mic.fill")
+                        Image(systemName: viewModel.isBackgroundLectureModeEnabled ? "waveform.badge.mic" : "mic.fill")
                             .font(.title2)
                             .foregroundStyle(.white)
                     )
@@ -2096,6 +2141,72 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Toggle(isOn: $viewModel.isBackgroundLectureModeEnabled) {
+                        Label("背景聽演講", systemImage: "person.wave.2")
+                    }
+                    .tint(.teal)
+                    .disabled(viewModel.isRecording || viewModel.isBackgroundLectureFinalizing)
+
+                    if viewModel.isBackgroundLectureModeEnabled {
+                        Picker("批次引擎", selection: $viewModel.backgroundLectureSTTProvider) {
+                            ForEach(BackgroundLectureSTTProvider.allCases) { provider in
+                                Text(provider.displayName).tag(provider)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        Label(
+                            viewModel.backgroundLectureSTTProvider.detail,
+                            systemImage: viewModel.backgroundLectureSTTProvider == .gpt4oBatch ? "brain.head.profile" : "waveform.badge.magnifyingglass"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                        Picker("批次長度", selection: $viewModel.backgroundLectureBatchDurationSeconds) {
+                            Text("8 秒").tag(8)
+                            Text("12 秒").tag(12)
+                            Text("20 秒").tag(20)
+                        }
+                        .pickerStyle(.segmented)
+
+                        TextField("演講主題、講者或專有領域", text: $viewModel.backgroundLectureTopic, axis: .vertical)
+                            .lineLimit(2...4)
+
+                        Button {
+                            viewModel.researchBackgroundLecturePrompt()
+                        } label: {
+                            HStack {
+                                Image(systemName: "sparkles")
+                                Text("智慧產生 STT 提示詞")
+                                Spacer()
+                                if viewModel.isBackgroundLecturePromptResearching {
+                                    ProgressView()
+                                }
+                            }
+                        }
+                        .disabled(
+                            viewModel.backgroundLectureTopic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                            viewModel.isBackgroundLecturePromptResearching
+                        )
+
+                        TextField("STT 提示詞", text: $viewModel.backgroundLectureSTTPrompt, axis: .vertical)
+                            .lineLimit(4...10)
+
+                        if let status = viewModel.backgroundLecturePromptStatus {
+                            Label(status, systemImage: viewModel.isBackgroundLecturePromptResearching ? "magnifyingglass" : "checkmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("使用模式")
+                } footer: {
+                    if viewModel.isBackgroundLectureModeEnabled {
+                        Text("GPT 以提示詞指定雙語；ElevenLabs 自動偵測語言並使用重點詞。兩者都只轉錄，不執行翻譯或語音播放。")
+                    }
+                }
+
                 // ⭐️ 經濟模式開關
                 Section {
                     Toggle(isOn: $viewModel.isEconomyMode) {
@@ -2355,6 +2466,17 @@ struct SettingsView: View {
                                 Image(systemName: "globe")
                                     .foregroundStyle(.purple)
                                 Text("支援 92 語言，需外部翻譯")
+                            }
+                        case .gptRealtime2:
+                            HStack {
+                                Image(systemName: "waveform.and.mic")
+                                    .foregroundStyle(.cyan)
+                                Text("GPT-Realtime-2：模型原生語音雙向口譯")
+                            }
+                            HStack {
+                                Image(systemName: "captions.bubble.fill")
+                                    .foregroundStyle(.indigo)
+                                Text("同步顯示輸入 STT 與模型輸出 transcript")
                             }
                         case .apple:
                             HStack {
@@ -2845,6 +2967,8 @@ struct SettingsView: View {
             return .green
         case .elevenLabs:
             return .blue
+        case .gptRealtime2:
+            return .cyan
         case .apple:
             return .gray
         }
@@ -2980,6 +3104,7 @@ struct UsageDetailPopover: View {
 
     private var totalCredits: Int { billingService.sessionTotalCreditsUsed }
     private var sttCredits: Int { billingService.sessionSTTCreditsUsed }
+    private var gptRealtimeCredits: Int { billingService.sessionGPTRealtimeCreditsUsed }
     private var llmCredits: Int { billingService.sessionLLMCreditsUsed }
     private var agentCredits: Int { billingService.sessionAgentCreditsUsed }
     private var ttsCredits: Int { billingService.sessionTTSCreditsUsed }
@@ -3030,6 +3155,22 @@ struct UsageDetailPopover: View {
                         ("時長", formatDuration(billingService.sessionSTTSeconds))
                     ]
                 )
+
+                if gptRealtimeCredits > 0 {
+                    UsageItemView(
+                        icon: "waveform.and.mic",
+                        iconColor: .cyan,
+                        title: "GPT Live 2 語音模型",
+                        credits: gptRealtimeCredits,
+                        percentage: percentage(of: gptRealtimeCredits),
+                        details: [
+                            ("回覆", "\(billingService.sessionGPTRealtimeCallCount) 次"),
+                            ("Input", "\(billingService.sessionGPTRealtimeInputTokens)（音訊 \(billingService.sessionGPTRealtimeAudioInputTokens)）"),
+                            ("Output", "\(billingService.sessionGPTRealtimeOutputTokens)（音訊 \(billingService.sessionGPTRealtimeAudioOutputTokens)）"),
+                            ("轉錄", "\(billingService.sessionGPTTranscribeSegmentCount) 段 / \(formatDuration(billingService.sessionGPTTranscribeSeconds))")
+                        ]
+                    )
+                }
 
                 // LLM 翻譯
                 UsageItemView(

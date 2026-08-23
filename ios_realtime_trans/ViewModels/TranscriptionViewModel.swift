@@ -80,6 +80,11 @@ private enum VMSettingsKey: String {
     case isDialogueAgentMixedSplitEnabled
     case isDialogueAgentTTSPreplayEnabled
     case isDialogueAgentAudioRecoveryEnabled
+    case isBackgroundLectureModeEnabled
+    case backgroundLectureTopic
+    case backgroundLectureSTTPrompt
+    case backgroundLectureBatchDurationSeconds
+    case backgroundLectureSTTProvider
 }
 
 @Observable
@@ -159,6 +164,10 @@ final class TranscriptionViewModel {
         didSet {
             guard !isInitializing else { return }
             saveSetting(.ttsPlaybackMode, value: ttsPlaybackMode.rawValue)
+            if ttsPlaybackMode == .muted && sttProvider == .gptRealtime2 {
+                audioManager.stopGPTRealtimePlayback()
+                isGPTRealtimeAudioPlaying = false
+            }
         }
     }
 
@@ -232,6 +241,54 @@ final class TranscriptionViewModel {
 
     /// 伺服器 URL（Cloud Run 部署的服務）
     var serverURL: String = "chirp3-ios-api-1027448899164.asia-east1.run.app"
+
+    // MARK: - Background Lecture Mode
+
+    var isBackgroundLectureModeEnabled: Bool = false {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.isBackgroundLectureModeEnabled, value: isBackgroundLectureModeEnabled)
+        }
+    }
+
+    var backgroundLectureTopic: String = "" {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.backgroundLectureTopic, value: backgroundLectureTopic)
+        }
+    }
+
+    var backgroundLectureSTTPrompt: String = "" {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.backgroundLectureSTTPrompt, value: backgroundLectureSTTPrompt)
+        }
+    }
+
+    var backgroundLectureBatchDurationSeconds: Int = 12 {
+        didSet {
+            guard !isInitializing else { return }
+            let clamped = min(max(backgroundLectureBatchDurationSeconds, 5), 30)
+            if clamped != backgroundLectureBatchDurationSeconds {
+                backgroundLectureBatchDurationSeconds = clamped
+                return
+            }
+            saveSetting(.backgroundLectureBatchDurationSeconds, value: backgroundLectureBatchDurationSeconds)
+        }
+    }
+
+    var backgroundLectureSTTProvider: BackgroundLectureSTTProvider = .gpt4oBatch {
+        didSet {
+            guard !isInitializing else { return }
+            saveSetting(.backgroundLectureSTTProvider, value: backgroundLectureSTTProvider.rawValue)
+        }
+    }
+
+    private(set) var isBackgroundLectureModeRunning = false
+    private(set) var isBackgroundLectureFinalizing = false
+    private(set) var isBackgroundLectureBatchProcessing = false
+    private(set) var isBackgroundLecturePromptResearching = false
+    private(set) var backgroundLecturePromptStatus: String?
 
     // MARK: - Dialogue Agent Feature Flags
 
@@ -361,6 +418,9 @@ final class TranscriptionViewModel {
             guard !isInitializing else { return }
             if oldValue != sttProvider {
                 print("🔄 [STT] 切換提供商: \(oldValue.displayName) → \(sttProvider.displayName)")
+                BillingService.shared.setSTTSpeedRatio(
+                    isAudioSpeedUpEnabled && sttProvider != .gptRealtime2 ? 1.5 : 1.0
+                )
                 if isRecording {
                     Task { @MainActor in
                         stopRecording()
@@ -471,7 +531,7 @@ final class TranscriptionViewModel {
     var isLocalVADEnabled: Bool = true {
         didSet {
             guard !isInitializing else { return }
-            audioManager.isVADEnabled = isLocalVADEnabled
+            audioManager.isVADEnabled = sttProvider == .gptRealtime2 ? false : isLocalVADEnabled
             saveSetting(.isLocalVADEnabled, value: isLocalVADEnabled)
             print("🎙️ [本地 VAD] \(isLocalVADEnabled ? "已啟用" : "已停用")")
         }
@@ -513,7 +573,9 @@ final class TranscriptionViewModel {
         didSet {
             guard !isInitializing else { return }
             audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
-            BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
+            BillingService.shared.setSTTSpeedRatio(
+                isAudioSpeedUpEnabled && sttProvider != .gptRealtime2 ? 1.5 : 1.0
+            )
             saveSetting(.isAudioSpeedUpEnabled, value: isAudioSpeedUpEnabled)
             if isAudioSpeedUpEnabled {
                 print("🚀 [STT] 音頻加速已啟用（1.5x，節省 33% 成本，+300ms 延遲）")
@@ -525,7 +587,7 @@ final class TranscriptionViewModel {
 
     /// 是否顯示音頻加速選項（Apple STT 免費不需要）
     var shouldShowSpeedUpOption: Bool {
-        sttProvider != .apple
+        sttProvider != .apple && sttProvider != .gptRealtime2
     }
 
     /// ⭐️ 麥克風增益（1.0 ~ 4.0）
@@ -572,6 +634,10 @@ final class TranscriptionViewModel {
     var isRecordingWaveformActive: Bool {
         guard case .recording = status else { return false }
 
+        if isBackgroundLectureModeRunning {
+            return true
+        }
+
         if !isEconomyMode && inputMode == .vad {
             return true
         }
@@ -581,16 +647,19 @@ final class TranscriptionViewModel {
 
     // MARK: - Private Properties
 
-    /// ⭐️ 三種 STT 服務
+    /// ⭐️ STT 服務
     private let chirp3Service = WebSocketService()
     private let elevenLabsService = ElevenLabsSTTService()
+    private let gptRealtime2Service = GPTRealtime2Service()
     private let appleSTTService = AppleSTTService()
+    private let backgroundLectureService = BackgroundLectureSTTService()
 
     /// 當前使用的 STT 服務
     private var currentSTTService: WebSocketServiceProtocol {
         switch sttProvider {
         case .chirp3: return chirp3Service
         case .elevenLabs: return elevenLabsService
+        case .gptRealtime2: return gptRealtime2Service
         case .apple: return appleSTTService
         }
     }
@@ -613,6 +682,12 @@ final class TranscriptionViewModel {
     /// TTS 播放隊列
     private var ttsQueue: [(text: String, lang: String)] = []
     private var isProcessingTTS = false
+    private var isGPTRealtimeAudioPlaying = false
+    private var pendingGPTRealtimeTranscriptIds: Set<UUID> = []
+    private var completedGPTRealtimeTranscriptIds: Set<UUID> = []
+    private var savedGPTRealtimeTranscriptIds: Set<UUID> = []
+    private var pendingGPTRealtimeOutputs: [String: GPTRealtime2OutputTranscript] = [:]
+    private var gptRealtimeTurnRouter = GPTRealtimeTurnRouter()
     /// ⭐️ 當前正在合成的文本（用於去重）
     private var currentSynthesizingText: String?
 
@@ -879,6 +954,25 @@ final class TranscriptionViewModel {
         if defaults.object(forKey: VMSettingsKey.isDialogueAgentAudioRecoveryEnabled.rawValue) != nil {
             isDialogueAgentAudioRecoveryEnabled = defaults.bool(forKey: VMSettingsKey.isDialogueAgentAudioRecoveryEnabled.rawValue)
         }
+        if defaults.object(forKey: VMSettingsKey.isBackgroundLectureModeEnabled.rawValue) != nil {
+            isBackgroundLectureModeEnabled = defaults.bool(forKey: VMSettingsKey.isBackgroundLectureModeEnabled.rawValue)
+        }
+        if let saved = defaults.string(forKey: VMSettingsKey.backgroundLectureTopic.rawValue) {
+            backgroundLectureTopic = saved
+        }
+        if let saved = defaults.string(forKey: VMSettingsKey.backgroundLectureSTTPrompt.rawValue) {
+            backgroundLectureSTTPrompt = saved
+        }
+        if defaults.object(forKey: VMSettingsKey.backgroundLectureBatchDurationSeconds.rawValue) != nil {
+            backgroundLectureBatchDurationSeconds = min(
+                max(defaults.integer(forKey: VMSettingsKey.backgroundLectureBatchDurationSeconds.rawValue), 5),
+                30
+            )
+        }
+        if let raw = defaults.string(forKey: VMSettingsKey.backgroundLectureSTTProvider.rawValue),
+           let provider = BackgroundLectureSTTProvider(rawValue: raw) {
+            backgroundLectureSTTProvider = provider
+        }
 
         print("💾 [設定] 已載入: \(sourceLang.shortName)→\(targetLang.shortName), STT=\(sttProvider.shortName), 翻譯=\(translationProvider.shortName), 經濟=\(isEconomyMode), 語言偵測=\(sttLanguageDetectionMode.shortName), 風格=\(translationStyle.displayName), Agent=\(isAnyDialogueAgentFeatureEnabled)")
 
@@ -899,7 +993,9 @@ final class TranscriptionViewModel {
 
         // 同步設定到各服務（快速，只是屬性賦值）
         audioTimeStretcher.setEnabled(isAudioSpeedUpEnabled)
-        BillingService.shared.setSTTSpeedRatio(isAudioSpeedUpEnabled ? 1.5 : 1.0)
+        BillingService.shared.setSTTSpeedRatio(
+            isAudioSpeedUpEnabled && sttProvider != .gptRealtime2 ? 1.5 : 1.0
+        )
         elevenLabsService.translationProvider = translationProvider
         appleSTTService.translationProvider = translationProvider
         elevenLabsService.translationStyle = translationStyle
@@ -1080,7 +1176,20 @@ final class TranscriptionViewModel {
 
     @MainActor
     private func processOutgoingAudioForSTT(_ data: Data) {
-        if isAudioSpeedUpEnabled && sttProvider != .apple {
+        if isBackgroundLectureModeRunning || isBackgroundLectureFinalizing {
+            backgroundLectureService.appendPCM(data)
+            return
+        }
+
+        // Residual speaker echo can still survive system AEC. Do not feed model
+        // playback back into GPT Live 2, where server VAD could treat it as a
+        // new speaker turn and damage the response.
+        if sttProvider == .gptRealtime2 &&
+            (isGPTRealtimeAudioPlaying || gptRealtime2Service.hasActiveResponse) {
+            return
+        }
+
+        if isAudioSpeedUpEnabled && sttProvider != .apple && sttProvider != .gptRealtime2 {
             if let processedData = audioTimeStretcher.process(data: data) {
                 sendOrQueueSTTAudio(processedData)
             }
@@ -1110,6 +1219,11 @@ final class TranscriptionViewModel {
     private func handleEndUtterance() {
         guard isRecording else { return }
 
+        if isBackgroundLectureModeRunning {
+            backgroundLectureService.finishUtterance()
+            return
+        }
+
         flushAudioSpeedupForUtteranceEnd()
 
         switch currentSTTService.connectionState {
@@ -1126,7 +1240,7 @@ final class TranscriptionViewModel {
 
     @MainActor
     private func flushAudioSpeedupForUtteranceEnd() {
-        guard isAudioSpeedUpEnabled, sttProvider != .apple else { return }
+        guard isAudioSpeedUpEnabled, sttProvider != .apple, sttProvider != .gptRealtime2 else { return }
 
         if let remainingData = audioTimeStretcher.flush(), !remainingData.isEmpty {
             sendOrQueueSTTAudio(remainingData)
@@ -1897,8 +2011,10 @@ final class TranscriptionViewModel {
 
         // 顯示資訊
         var info: [String: Any] = [
-            MPMediaItemPropertyTitle: "通話中 In Call",
-            MPMediaItemPropertyArtist: "\(sourceLang.shortName) → \(targetLang.shortName)",
+            MPMediaItemPropertyTitle: isBackgroundLectureModeRunning ? "背景聽演講" : "通話中 In Call",
+            MPMediaItemPropertyArtist: isBackgroundLectureModeRunning
+                ? "\(sourceLang.shortName) · GPT Transcribe"
+                : "\(sourceLang.shortName) → \(targetLang.shortName)",
             MPNowPlayingInfoPropertyPlaybackRate: 1.0,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0,
             MPMediaItemPropertyPlaybackDuration: 0.0  // 0 = 不顯示進度條
@@ -1962,7 +2078,7 @@ final class TranscriptionViewModel {
     /// ⭐️ 開始通話（同步方法，立即更新 UI）
     @MainActor
     func beginCall() {
-        guard !isProcessing else {
+        guard !isProcessing, !isBackgroundLectureFinalizing else {
             print("⚠️ 正在處理中，忽略重複觸發")
             return
         }
@@ -2195,6 +2311,13 @@ final class TranscriptionViewModel {
     /// 開始錄音
     @MainActor
     private func startRecording() async {
+        if isBackgroundLectureModeEnabled {
+            await startBackgroundLectureRecording()
+            return
+        }
+
+        audioManager.isLectureCaptureMode = false
+
         // ⭐️ 立即設置連接狀態，讓 UI 先切換（順暢體驗）
         status = .connecting
         currentMicVolume = 0
@@ -2232,6 +2355,13 @@ final class TranscriptionViewModel {
         lastSTTReconnectAttempt = .distantPast
         resetPendingSTTEvents()
         agentAudioReplayBuffer.clear()
+        if sttProvider == .gptRealtime2 {
+            pendingGPTRealtimeTranscriptIds.removeAll()
+            completedGPTRealtimeTranscriptIds.removeAll()
+            savedGPTRealtimeTranscriptIds.removeAll()
+            pendingGPTRealtimeOutputs.removeAll()
+            gptRealtimeTurnRouter.reset()
+        }
 
         // ⭐️ 根據選擇的 STT 提供商連接
         if isEconomyMode {
@@ -2253,7 +2383,7 @@ final class TranscriptionViewModel {
         }
 
         // 等待連接成功（ElevenLabs 需要較長時間：token + WebSocket）
-        let timeout: TimeInterval = (sttProvider == .elevenLabs) ? 20.0 : 10.0
+        let timeout: TimeInterval = (sttProvider == .elevenLabs || sttProvider == .gptRealtime2) ? 20.0 : 10.0
         print("⏳ 等待連接...（超時: \(Int(timeout))秒）")
         let connectionResult = await waitForConnection(timeout: timeout)
         print("📡 連接結果: \(connectionResult), 狀態: \(currentSTTService.connectionState)")
@@ -2276,6 +2406,7 @@ final class TranscriptionViewModel {
         do {
             // 設置擴音模式
             audioManager.isSpeakerMode = isSpeakerMode
+            audioManager.isVADEnabled = sttProvider == .gptRealtime2 ? false : isLocalVADEnabled
 
             try audioManager.startRecording()
 
@@ -2290,12 +2421,16 @@ final class TranscriptionViewModel {
             startSTTConnectionWatchdog()
 
             // ⭐️ 顯示雙語介紹提示（從 Firestore 讀取）
-            Task {
-                await showLanguageIntroduction()
+            if sttProvider != .gptRealtime2 {
+                Task {
+                    await showLanguageIntroduction()
+                }
             }
 
             // ⭐️ 預熱 TTS 引擎（避免第一次播放卡頓）
-            if ttsProvider == .apple {
+            if sttProvider == .gptRealtime2 {
+                print("🔊 [GPT Live 2] 使用模型原生語音，不啟動外部 TTS")
+            } else if ttsProvider == .apple {
                 // 預熱來源和目標語言（preWarm 內部會跳過已預熱的語言）
                 appleTTSService.preWarmLanguages([
                     sourceLang.azureLocale,
@@ -2316,8 +2451,10 @@ final class TranscriptionViewModel {
             }
 
             // ⭐️ Apple STT 是免費的，不需要計費
-            if sttProvider != .apple {
+            if sttProvider != .apple && sttProvider != .gptRealtime2 {
                 BillingService.shared.startSTTTimer()
+            } else if sttProvider == .gptRealtime2 {
+                print("💰 [GPT Live 2] 依 response usage 與 GPT Transcribe 時長計費，不啟動舊 STT 計時")
             } else {
                 print("💰 [ViewModel] Apple STT 免費，不計費")
             }
@@ -2341,12 +2478,105 @@ final class TranscriptionViewModel {
         } catch {
             status = .error(error.localizedDescription)
             currentSTTService.disconnect()
+            audioManager.isVADEnabled = isLocalVADEnabled
+        }
+    }
+
+    @MainActor
+    private func startBackgroundLectureRecording() async {
+        guard !isBackgroundLectureFinalizing else {
+            status = .error("正在處理上一段演講的最後錄音")
+            return
+        }
+
+        status = .connecting
+        currentMicVolume = 0
+        isManualInputActive = false
+        backgroundLecturePromptStatus = nil
+        await Task.yield()
+
+        guard AuthService.shared.hasEnoughCredits(100) else {
+            status = .disconnected
+            showCreditsExhaustedAlert = true
+            return
+        }
+
+        let granted = await audioManager.requestPermission()
+        guard granted else {
+            status = .error("請允許使用麥克風")
+            return
+        }
+
+        if let uid = AuthService.shared.currentUser?.uid {
+            do {
+                let sessionId = try await sessionService.createSession(
+                    uid: uid,
+                    sourceLang: sourceLang.rawValue,
+                    targetLang: targetLang.rawValue,
+                    provider: backgroundLectureSTTProvider.rawValue
+                )
+                print("✅ [背景演講] 創建 Session: \(sessionId)")
+            } catch {
+                print("⚠️ [背景演講] 創建 Session 失敗: \(error.localizedDescription)")
+            }
+        }
+
+        backgroundLectureService.start(
+            serverURL: serverURL,
+            provider: backgroundLectureSTTProvider,
+            sourceLanguages: [sourceLang.rawValue, targetLang.rawValue],
+            prompt: backgroundLectureSTTPrompt,
+            batchDurationSeconds: backgroundLectureBatchDurationSeconds
+        )
+        isBackgroundLectureModeRunning = true
+        isBackgroundLectureFinalizing = false
+
+        do {
+            // Lecture mode always uses local Silero. Only detected speech reaches GPT Transcribe.
+            audioManager.isLectureCaptureMode = true
+            audioManager.isVADEnabled = true
+            audioManager.vadSpeechThreshold = min(localVADSpeechThreshold, 0.30)
+            audioManager.vadSilenceThreshold = max(localVADSilenceThreshold, 3.0)
+            audioManager.vadPreBufferDuration = 1.0
+            audioManager.isSpeakerMode = false
+            try audioManager.startRecording()
+
+            status = .recording
+            startDurationTimer()
+            setupNowPlaying()
+            startIdleTimer()
+            BillingService.shared.startSession()
+            audioManager.startSending()
+            BillingService.shared.startSTTTimer()
+
+            print("🎙️ [背景演講] 已開始，\(backgroundLectureSTTProvider.displayName)，批次 \(backgroundLectureBatchDurationSeconds)s，Silero VAD 啟用")
+        } catch {
+            isBackgroundLectureModeRunning = false
+            backgroundLectureService.stopAndFlush { }
+            status = .error(error.localizedDescription)
+            audioManager.isLectureCaptureMode = false
+            audioManager.isVADEnabled = isLocalVADEnabled
+            audioManager.vadSpeechThreshold = localVADSpeechThreshold
+            audioManager.vadSilenceThreshold = localVADSilenceThreshold
+            audioManager.vadPreBufferDuration = 0.5
+            audioManager.isSpeakerMode = isSpeakerMode
         }
     }
 
     /// 停止錄音
     @MainActor
     private func stopRecording() {
+        if isBackgroundLectureModeRunning {
+            stopBackgroundLectureRecording()
+            return
+        }
+
+        let shouldAwaitGPTRealtimeUsage = sttProvider == .gptRealtime2 &&
+            gptRealtime2Service.hasActiveResponse
+        if shouldAwaitGPTRealtimeUsage {
+            gptRealtime2Service.cancelResponse()
+        }
+
         // ⭐️ 立即設置狀態，讓 UI 先切換（順暢體驗）
         status = .disconnected
         currentMicVolume = 0
@@ -2373,16 +2603,26 @@ final class TranscriptionViewModel {
         // ⭐️ 使用統一的 AudioManager
         audioManager.stopRecording()
         audioManager.stopTTS()
+        if sttProvider == .gptRealtime2 {
+            audioManager.stopGPTRealtimePlayback()
+            isGPTRealtimeAudioPlaying = false
+        }
+        audioManager.isVADEnabled = isLocalVADEnabled
 
         // 🚀 Flush 音頻加速器剩餘的緩衝音頻
-        if isAudioSpeedUpEnabled, let remainingData = audioTimeStretcher.flush() {
+        if isAudioSpeedUpEnabled,
+           sttProvider != .gptRealtime2,
+           let remainingData = audioTimeStretcher.flush() {
             currentSTTService.sendAudio(data: remainingData)
             audioTimeStretcher.printStats()  // 打印統計信息
         }
         audioTimeStretcher.reset()
 
-        // ⭐️ 斷開當前 STT 服務
-        currentSTTService.disconnect()
+        // GPT Live 2 bills from response.done. When ending during generation,
+        // keep the socket briefly so the cancelled response's final usage is not lost.
+        if !shouldAwaitGPTRealtimeUsage {
+            currentSTTService.disconnect()
+        }
 
         // 清除 interim
         interimTranscript = nil
@@ -2401,6 +2641,11 @@ final class TranscriptionViewModel {
         // ⭐️ 清理已播放記錄（下一次通話重新開始）
         playedTranslations.removeAll()
         agentTTSProgressByTurn.removeAll()
+        pendingGPTRealtimeTranscriptIds.removeAll()
+        completedGPTRealtimeTranscriptIds.removeAll()
+        savedGPTRealtimeTranscriptIds.removeAll()
+        pendingGPTRealtimeOutputs.removeAll()
+        gptRealtimeTurnRouter.reset()
         print("🧹 [TTS] 停止錄音，清理已播放記錄")
 
         // ⭐️ 重置 Streaming TTS 狀態
@@ -2409,6 +2654,15 @@ final class TranscriptionViewModel {
         // ⭐️ 結束 Session（保存對話記錄）
         // 注意：扣款已改為即時扣款（在 BillingService 中處理），這裡不再扣款
         Task {
+            if shouldAwaitGPTRealtimeUsage {
+                for _ in 0..<20 where gptRealtime2Service.hasActiveResponse {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                // usagePublisher delivers on main; let that final callback apply
+                // before ending BillingService's session.
+                try? await Task.sleep(for: .milliseconds(100))
+                gptRealtime2Service.disconnect()
+            }
             // 結束 Session 並獲取用量統計（僅用於記錄）
             let usage = await sessionService.endSession()
             sessionService.invalidateHistoryCache()
@@ -2423,6 +2677,100 @@ final class TranscriptionViewModel {
                 print("   TTS: \(usage.ttsCharCount) chars")
                 print("   總額度: \(usage.totalCreditsUsed)")
             }
+        }
+    }
+
+    @MainActor
+    private func stopBackgroundLectureRecording() {
+        isBackgroundLectureModeRunning = false
+        isBackgroundLectureFinalizing = true
+        status = .disconnected
+        currentMicVolume = 0
+        isManualInputActive = false
+        stopDurationTimer()
+        clearNowPlaying()
+        idleTimer?.invalidate()
+        idleTimer = nil
+        BillingService.shared.stopSTTTimer()
+
+        // Keep the lecture service open briefly so AudioManager's final synchronous
+        // flush and already-enqueued Combine events are included in the last batch.
+        audioManager.stopRecording()
+        audioManager.stopTTS()
+        interimTranscript = nil
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self else { return }
+            self.backgroundLectureService.stopAndFlush { [weak self] in
+                guard let self else { return }
+                self.isBackgroundLectureFinalizing = false
+                self.isBackgroundLectureBatchProcessing = false
+                self.audioManager.isLectureCaptureMode = false
+                self.audioManager.isVADEnabled = self.isLocalVADEnabled
+                self.audioManager.vadSpeechThreshold = self.localVADSpeechThreshold
+                self.audioManager.vadSilenceThreshold = self.localVADSilenceThreshold
+                self.audioManager.vadPreBufferDuration = 0.5
+                self.audioManager.isSpeakerMode = self.isSpeakerMode
+                self.backgroundLecturePromptStatus = "最後一段已完成"
+
+                Task {
+                    let usage = await self.sessionService.endSession()
+                    self.sessionService.invalidateHistoryCache()
+                    if let usage {
+                        print("✅ [背景演講] Session 已保存，STT \(String(format: "%.2f", usage.sttDurationSeconds))秒")
+                    }
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func handleBackgroundLectureTranscript(_ transcript: BackgroundLectureTranscript) {
+        guard isBackgroundLectureModeRunning || isBackgroundLectureFinalizing else { return }
+        let message = TranscriptMessage(
+            text: transcript.text,
+            isFinal: true,
+            confidence: 1,
+            language: transcript.language
+        )
+        transcripts.append(message)
+        updateStats()
+        resetIdleTimer()
+        sessionService.addConversation(message, isSource: true)
+        backgroundLecturePromptStatus = "已轉錄 \(transcript.audioDurationMs / 1000) 秒音訊"
+        print("📝 [背景演講] \(transcript.text.prefix(80)) (\(transcript.latencyMs)ms)")
+    }
+
+    @MainActor
+    func researchBackgroundLecturePrompt() {
+        let topic = backgroundLectureTopic.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !topic.isEmpty, !isBackgroundLecturePromptResearching else {
+            if topic.isEmpty {
+                backgroundLecturePromptStatus = "請先輸入演講主題"
+            }
+            return
+        }
+
+        isBackgroundLecturePromptResearching = true
+        backgroundLecturePromptStatus = "正在搜尋專有名詞..."
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let context = try await self.backgroundLectureService.researchPrompt(
+                    serverURL: self.serverURL,
+                    topic: topic,
+                    sourceLanguage: self.sourceLang.rawValue,
+                    existingPrompt: self.backgroundLectureSTTPrompt
+                )
+                let keywordLine = context.keywords.isEmpty
+                    ? ""
+                    : "\n\n重點詞：\(context.keywords.joined(separator: "、"))"
+                self.backgroundLectureSTTPrompt = context.prompt + keywordLine
+                self.backgroundLecturePromptStatus = context.cacheHit ? "已載入先前研究結果" : "提示詞已更新"
+            } catch {
+                self.backgroundLecturePromptStatus = error.localizedDescription
+            }
+            self.isBackgroundLecturePromptResearching = false
         }
     }
 
@@ -2547,7 +2895,7 @@ final class TranscriptionViewModel {
         if inputMode == .vad {
             // VAD 模式：同步 VAD 旗標 + 開始持續監聽
             isManualInputActive = false
-            audioManager.isVADEnabled = isLocalVADEnabled
+            audioManager.isVADEnabled = sttProvider == .gptRealtime2 ? false : isLocalVADEnabled
             if isRecording {
                 audioManager.startSending()
             }
@@ -2565,6 +2913,16 @@ final class TranscriptionViewModel {
     func startTalking() {
         guard isRecording else { return }
         guard inputMode == .ptt else { return }  // VAD 模式不需要手動控制
+        if sttProvider == .gptRealtime2 {
+            if isGPTRealtimeAudioPlaying || gptRealtime2Service.hasActiveResponse {
+                let playedMs = audioManager.currentGPTRealtimePlaybackDurationMs
+                gptRealtime2Service.interruptCurrentResponse(audioEndMs: playedMs)
+                audioManager.stopGPTRealtimePlayback()
+                isGPTRealtimeAudioPlaying = false
+                print("✋ [GPT Live 2] PTT 明確打斷，truncate at \(playedMs)ms")
+            }
+            audioManager.discardPendingInputAudio()
+        }
         isManualInputActive = true
         audioManager.startSending()
     }
@@ -2578,6 +2936,18 @@ final class TranscriptionViewModel {
 
     /// 設定 Combine 訂閱
     private func setupSubscriptions() {
+        backgroundLectureService.onTranscript = { [weak self] transcript in
+            self?.handleBackgroundLectureTranscript(transcript)
+        }
+        backgroundLectureService.onError = { [weak self] message in
+            guard let self else { return }
+            self.backgroundLecturePromptStatus = message
+            print("❌ [背景演講] \(message)")
+        }
+        backgroundLectureService.onProcessingChanged = { [weak self] processing in
+            self?.isBackgroundLectureBatchProcessing = processing
+        }
+
         // ⭐️ 訂閱音頻數據（來自統一的 AudioManager）
         // 根據當前選擇的 STT 提供商發送到對應服務
         // 🚀 如果啟用加速，先通過 AudioTimeStretcher 處理
@@ -2585,7 +2955,10 @@ final class TranscriptionViewModel {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] data in
                 // ⭐️ 檢查是否正在錄音，避免停止後的殘留音頻被處理
-                guard let self, self.isRecording else { return }
+                guard let self,
+                      self.isRecording ||
+                      self.isBackgroundLectureModeRunning ||
+                      self.isBackgroundLectureFinalizing else { return }
                 self.processOutgoingAudioForSTT(data)
             }
             .store(in: &cancellables)
@@ -2616,6 +2989,62 @@ final class TranscriptionViewModel {
                     self.attemptSTTReconnectIfNeeded(reason: "Chirp3 錯誤: \(errorMessage)")
                 } else {
                     self.status = .error(errorMessage)
+                }
+            }
+            .store(in: &cancellables)
+
+        // GPT-Realtime-2 input STT is displayed as the source bubble.
+        gptRealtime2Service.transcriptPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transcript in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                self.handleGPTRealtimeInputTranscript(transcript)
+                self.applyPendingGPTRealtimeOutputs()
+            }
+            .store(in: &cancellables)
+
+        // Model output audio transcript is the translated text in the same bubble.
+        gptRealtime2Service.outputTranscriptPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] output in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                self.handleGPTRealtimeOutputTranscript(output)
+            }
+            .store(in: &cancellables)
+
+        gptRealtime2Service.outputAudioPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] audio in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                self.handleGPTRealtimeAudio(audio)
+            }
+            .store(in: &cancellables)
+
+        gptRealtime2Service.outputAudioCompletedPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] responseId in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                self.finishGPTRealtimeAudio(responseId: responseId)
+            }
+            .store(in: &cancellables)
+
+        gptRealtime2Service.usagePublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] usage in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                self.recordGPTRealtimeUsage(usage)
+            }
+            .store(in: &cancellables)
+
+        gptRealtime2Service.errorPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] message in
+                guard let self, self.sttProvider == .gptRealtime2 else { return }
+                print("❌ [GPT Live 2] \(message)")
+                if self.isRecording {
+                    self.attemptSTTReconnectIfNeeded(reason: "GPT Live 2 錯誤: \(message)")
+                } else {
+                    self.status = .error(message)
                 }
             }
             .store(in: &cancellables)
@@ -2831,6 +3260,8 @@ final class TranscriptionViewModel {
         case .chirp3:
             sttProvider = .elevenLabs
         case .elevenLabs:
+            sttProvider = .gptRealtime2
+        case .gptRealtime2:
             sttProvider = .apple
         case .apple:
             sttProvider = .chirp3
@@ -3047,7 +3478,9 @@ final class TranscriptionViewModel {
                     print("   final: \"\(finalTranscript.text.prefix(45))...\"")
                 }
 
-                if finalNeedsFullRetranslation {
+                if sttProvider == .gptRealtime2 {
+                    print("🔊 [GPT Live 2] 模型原生語音已包含翻譯，不使用外部 TTS")
+                } else if finalNeedsFullRetranslation {
                     print("⏸️ [TTS 保障] 暫不播放舊翻譯，等待完整補翻")
                 } else {
                     // ⭐️ TTS 保障：檢查這個翻譯是否已經在等待播放
@@ -3074,20 +3507,26 @@ final class TranscriptionViewModel {
             interimTranscript = nil
             updateStats()
 
-            // ⭐️ 保存對話到 Session（判斷是否為來源語言）
-            let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
-            sessionService.addConversation(finalTranscript, isSource: isSource)
+            if sttProvider == .gptRealtime2 {
+                pendingGPTRealtimeTranscriptIds.insert(finalTranscript.id)
+                if completedGPTRealtimeTranscriptIds.contains(finalTranscript.id) {
+                    saveGPTRealtimeTranscriptIfReady(id: finalTranscript.id)
+                }
+            } else {
+                // ⭐️ 保存對話到 Session（判斷是否為來源語言）
+                let isSource = isSourceLanguage(detectedLanguage: finalTranscript.language)
+                sessionService.addConversation(finalTranscript, isSource: isSource)
 
-            // ⭐️ 交給 Claude Agent SDK 做跨句合併、混合語言拆分、TTS 計畫與音訊重置建議
-            scheduleDialogueAgentProcessing(for: finalTranscript)
+                // ⭐️ 交給 Claude Agent SDK 做跨句合併、混合語言拆分、TTS 計畫與音訊重置建議
+                scheduleDialogueAgentProcessing(for: finalTranscript)
 
-            // Final 到了 → 如果沒有完整翻譯，對完整文字發翻譯
-            // ElevenLabs 側已在 VAD commit 時觸發翻譯，這裡只補漏
-            if finalTranscript.translation?.isEmpty != false {
-                let finalText = finalTranscript.text
-                requestFullRetranslationIfNeeded(for: finalText, reason: "final 無翻譯")
-            } else if finalNeedsFullRetranslation {
-                requestFullRetranslationIfNeeded(for: finalTranscript.text, reason: "final 翻譯未覆蓋最後文字")
+                // Final 到了 → 如果沒有完整翻譯，對完整文字發翻譯
+                if finalTranscript.translation?.isEmpty != false {
+                    let finalText = finalTranscript.text
+                    requestFullRetranslationIfNeeded(for: finalText, reason: "final 無翻譯")
+                } else if finalNeedsFullRetranslation {
+                    requestFullRetranslationIfNeeded(for: finalTranscript.text, reason: "final 翻譯未覆蓋最後文字")
+                }
             }
         } else {
             // ⭐️ 中間結果：檢查是否為新的語句
@@ -3250,7 +3689,177 @@ final class TranscriptionViewModel {
 
         // ⭐️ 每次收到新 transcript（final 或 interim），重置閒置翻譯計時器
         // 5 秒沒有新 STT 文字 → 掃描未翻譯的對話並重試
-        resetTranslationIdleTimer()
+        if sttProvider != .gptRealtime2 {
+            resetTranslationIdleTimer()
+        }
+    }
+
+    private func handleGPTRealtimeInputTranscript(_ transcript: TranscriptMessage) {
+        lastTranscriptTime = Date()
+        resetIdleTimer()
+
+        if let index = transcripts.firstIndex(where: { $0.id == transcript.id }) {
+            let existing = transcripts[index]
+            transcripts[index] = TranscriptMessage(
+                id: existing.id,
+                text: transcript.text,
+                isFinal: existing.isFinal || transcript.isFinal,
+                confidence: transcript.confidence,
+                language: transcript.language ?? existing.language,
+                converted: transcript.converted,
+                originalText: transcript.originalText,
+                speakerTag: transcript.speakerTag,
+                timestamp: existing.timestamp,
+                translation: existing.translation,
+                translationSegments: existing.translationSegments
+            )
+            if transcript.isFinal {
+                lastFinalText = transcript.text
+                pendingGPTRealtimeTranscriptIds.insert(transcript.id)
+                saveGPTRealtimeTranscriptIfReady(id: transcript.id)
+            }
+            updateStats()
+            return
+        }
+
+        if transcript.isFinal {
+            let matchingInterim = interimTranscript?.id == transcript.id ? interimTranscript : nil
+            let finalTranscript = TranscriptMessage(
+                id: transcript.id,
+                text: transcript.text,
+                isFinal: true,
+                confidence: transcript.confidence,
+                language: transcript.language ?? matchingInterim?.language,
+                converted: transcript.converted,
+                originalText: transcript.originalText,
+                speakerTag: transcript.speakerTag,
+                timestamp: matchingInterim?.timestamp ?? transcript.timestamp,
+                translation: matchingInterim?.translation,
+                translationSegments: matchingInterim?.translationSegments
+            )
+            transcripts.append(finalTranscript)
+            if interimTranscript?.id == transcript.id {
+                interimTranscript = nil
+            }
+            lastFinalText = transcript.text
+            pendingGPTRealtimeTranscriptIds.insert(transcript.id)
+            updateStats()
+            saveGPTRealtimeTranscriptIfReady(id: transcript.id)
+            return
+        }
+
+        if let existing = interimTranscript, existing.id == transcript.id {
+            interimTranscript = TranscriptMessage(
+                id: existing.id,
+                text: transcript.text,
+                isFinal: false,
+                confidence: transcript.confidence,
+                language: transcript.language ?? existing.language,
+                converted: transcript.converted,
+                originalText: transcript.originalText,
+                speakerTag: transcript.speakerTag,
+                timestamp: existing.timestamp,
+                translation: existing.translation,
+                translationSegments: existing.translationSegments
+            )
+        } else {
+            // A different item is a different utterance. Never carry the previous
+            // interim bubble's translation into the new GPT Live turn.
+            interimTranscript = transcript
+        }
+    }
+
+    private func handleGPTRealtimeOutputTranscript(_ output: GPTRealtime2OutputTranscript) {
+        guard let sourceMessageId = gptRealtimeTurnRouter.resolve(
+            responseId: output.responseId,
+            sourceMessageId: output.sourceMessageId
+        ) else {
+            pendingGPTRealtimeOutputs[output.responseId] = output
+            return
+        }
+
+        if let transcriptIndex = transcripts.firstIndex(where: { $0.id == sourceMessageId }) {
+            transcripts[transcriptIndex].translation = output.text
+            let id = transcripts[transcriptIndex].id
+            if output.isFinal {
+                completedGPTRealtimeTranscriptIds.insert(id)
+                saveGPTRealtimeTranscriptIfReady(id: id)
+            }
+            pendingGPTRealtimeOutputs.removeValue(forKey: output.responseId)
+            return
+        }
+
+        if let interim = interimTranscript, interim.id == sourceMessageId {
+            interimTranscript?.translation = output.text
+            if output.isFinal {
+                completedGPTRealtimeTranscriptIds.insert(interim.id)
+            }
+            pendingGPTRealtimeOutputs.removeValue(forKey: output.responseId)
+            return
+        }
+
+        pendingGPTRealtimeOutputs[output.responseId] = output
+    }
+
+    private func applyPendingGPTRealtimeOutputs() {
+        guard sttProvider == .gptRealtime2, !pendingGPTRealtimeOutputs.isEmpty else { return }
+        let outputs = pendingGPTRealtimeOutputs.values.sorted { lhs, rhs in
+            if lhs.isFinal != rhs.isFinal { return !lhs.isFinal }
+            return lhs.responseId < rhs.responseId
+        }
+        for output in outputs {
+            handleGPTRealtimeOutputTranscript(output)
+        }
+    }
+
+    private func saveGPTRealtimeTranscriptIfReady(id: UUID) {
+        guard !savedGPTRealtimeTranscriptIds.contains(id),
+              completedGPTRealtimeTranscriptIds.contains(id),
+              let index = transcripts.firstIndex(where: { $0.id == id }),
+              transcripts[index].isFinal,
+              transcripts[index].translation?.isEmpty == false else { return }
+
+        let transcript = transcripts[index]
+        savedGPTRealtimeTranscriptIds.insert(id)
+        pendingGPTRealtimeTranscriptIds.remove(id)
+        let isSource = isSourceLanguage(detectedLanguage: transcript.language)
+        sessionService.addConversation(transcript, isSource: isSource)
+        print("💾 [GPT Live 2] 已保存原文與模型 transcript")
+    }
+
+    private func handleGPTRealtimeAudio(_ data: Data) {
+        guard isRecording, !data.isEmpty, ttsPlaybackMode != .muted else { return }
+        if !isGPTRealtimeAudioPlaying {
+            do {
+                try audioManager.beginGPTRealtimePlayback { [weak self] in
+                    self?.isGPTRealtimeAudioPlaying = false
+                }
+                isGPTRealtimeAudioPlaying = true
+            } catch {
+                print("❌ [GPT Live 2] 無法開始 PCM 播放: \(error.localizedDescription)")
+                return
+            }
+        }
+        audioManager.scheduleGPTRealtimePCM24k(data)
+    }
+
+    private func finishGPTRealtimeAudio(responseId: String) {
+        if responseId == "interrupted" {
+            audioManager.stopGPTRealtimePlayback()
+            isGPTRealtimeAudioPlaying = false
+        } else if isGPTRealtimeAudioPlaying {
+            audioManager.finishGPTRealtimePlayback()
+        }
+    }
+
+    private func recordGPTRealtimeUsage(_ usage: GPTRealtime2Usage) {
+        BillingService.shared.recordGPTRealtimeUsage(usage)
+        print(
+            "💰 [GPT Live 2] \(usage.category)=\(usage.id) " +
+            "input=\(usage.inputTokens) output=\(usage.outputTokens) " +
+            "audio=\(usage.audioInputTokens)/\(usage.audioOutputTokens) " +
+            "$\(String(format: "%.6f", usage.costUSD))"
+        )
     }
 
     /// 處理翻譯結果
